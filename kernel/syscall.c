@@ -131,8 +131,12 @@ struct file *file_alloc(void)
 }
 void file_put(struct file *f)
 {
-	if (--f->refs == 0)
-		f->type = FILE_NONE;
+	if (--f->refs)
+		return;
+	if (f->type == FILE_PIPE_R || f->type == FILE_PIPE_W)
+		pipe_close(f->pipe, f->type == FILE_PIPE_W);
+	f->type = FILE_NONE;
+	f->pipe = NULL;
 }
 static struct file *getfd(int fd)
 {
@@ -217,6 +221,8 @@ static long sys_read(int fd, u64 buf, u64 n)
 	}
 	case FILE_DIR:
 		return -EISDIR;
+	case FILE_PIPE_R:
+		return pipe_read(f->pipe, (char *)buf, n);
 	}
 	return -EBADF;
 }
@@ -227,6 +233,8 @@ static long sys_write(int fd, u64 buf, u64 n)
 		return -EBADF;
 	if (!user_ok(buf, n))
 		return -EFAULT;
+	if (f->type == FILE_PIPE_W)
+		return pipe_write(f->pipe, (const char *)buf, n);
 	if (f->type != FILE_CONSOLE)
 		return f->type == FILE_DIR ? -EISDIR : -EBADF;
 	for (u64 i = 0; i < n; i++)
@@ -319,6 +327,42 @@ static long sys_dup(int old)
 		f->refs++;
 	return fd;
 }
+static long sys_pipe(u64 ufds)
+{
+	if (!user_ok(ufds, 2 * sizeof(int)))
+		return -EFAULT;
+	struct pipe *p = pipe_alloc();
+	if (!p)
+		return -ENFILE;
+	/* once both files own the pipe, file_put() handles all cleanup */
+	struct file *r = file_alloc();
+	if (!r) {
+		pipe_close(p, 0);
+		pipe_close(p, 1);
+		return -ENFILE;
+	}
+	r->type = FILE_PIPE_R;
+	r->pipe = p;
+	struct file *w = file_alloc();
+	if (!w) {
+		file_put(r);
+		pipe_close(p, 1);
+		return -ENFILE;
+	}
+	w->type = FILE_PIPE_W;
+	w->pipe = p;
+	int rfd = fd_install(r), wfd = rfd < 0 ? rfd : fd_install(w);
+	if (wfd < 0) {
+		if (rfd >= 0)
+			cur->fd[rfd] = NULL;
+		file_put(r);
+		file_put(w);
+		return wfd;
+	}
+	((int *)ufds)[0] = rfd;
+	((int *)ufds)[1] = wfd;
+	return 0;
+}
 static long sys_getdents64(int fd, u64 ubuf, u64 count)
 {
 	struct file *f = getfd(fd);
@@ -374,6 +418,9 @@ void syscall_dispatch(struct regs *r)
 		break;
 	case 12:
 		ret = sys_brk(r->rdi);
+		break;
+	case 22:
+		ret = sys_pipe(r->rdi);
 		break;
 	case 24:
 		yield();

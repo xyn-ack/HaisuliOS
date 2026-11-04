@@ -14,6 +14,7 @@ typedef long i64;
 #define NPROC 32
 #define NFD 16
 #define NFILE 128
+#define NPIPE 32
 #define MAXARG 16
 #define PTE_ADDR(e) ((e) & 0x000FFFFFFFFFF000UL)
 
@@ -35,6 +36,7 @@ typedef long i64;
 #define EMFILE 24
 #define ESPIPE 29
 #define EROFS 30
+#define EPIPE 32
 #define ENAMETOOLONG 36
 #define ENOSYS 38
 
@@ -50,16 +52,18 @@ struct trapframe {
 	u64 vec, err, rip, cs, rflags, rsp, ss;
 };
 
-enum { FILE_NONE, FILE_CONSOLE, FILE_RAM, FILE_DIR };
+enum { FILE_NONE, FILE_CONSOLE, FILE_RAM, FILE_DIR, FILE_PIPE_R, FILE_PIPE_W };
 struct tent {
 	char name[104];
 	const u8 *data;
 	u64 size;
 	int isdir;
 };
+struct pipe;
 struct file {
 	int type, refs;
 	const struct tent *ent;
+	struct pipe *pipe; /* FILE_PIPE_R / FILE_PIPE_W */
 	u64 off;
 	char prefix[104];
 };
@@ -108,6 +112,12 @@ void syscall_init(void);
 const struct tent *fs_lookup(const char *path);
 struct file *file_alloc(void);
 void file_put(struct file *f);
+
+/* pipe.c */
+struct pipe *pipe_alloc(void);
+void pipe_close(struct pipe *p, int write_end);
+long pipe_read(struct pipe *p, char *dst, u64 n);
+long pipe_write(struct pipe *p, const char *src, u64 n);
 
 static inline void write_cr3(u64 v)
 {
