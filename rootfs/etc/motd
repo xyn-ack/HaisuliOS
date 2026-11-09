@@ -1,1 +1,13 @@
-Welcome to HaisuliOS: a tiny POSIX-flavoured kernel for x86_64.
+
+  _   _       _           _ _  ___  ____
+ | | | | __ _(_)___ _   _| (_)/ _ \/ ___|
+ | |_| |/ _` | / __| | | | | | | | \___ \
+ |  _  | (_| | \__ \ |_| | | | |_| |___) |
+ |_| |_|\__,_|_|___/\__,_|_|_|\___/|____/
+
+ Welcome to HaisuliOS, a tiny x86_64 microkernel written in Rust.
+
+ This console is served by a user-space driver (the console server);
+ the kernel only forwards interrupts and messages. Type 'help' for the
+ list of commands. This message comes from /etc/motd.
+
