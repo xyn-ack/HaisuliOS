@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# The Linux kernel's rustfmt configuration: default style (4-space indent,
+# 100 columns), Unix newlines. See Documentation/rust/coding-guidelines.rst.
+edition = "2021"
+newline_style = "Unix"

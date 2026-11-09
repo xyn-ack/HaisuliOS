@@ -1,41 +1,73 @@
-CC      ?= gcc
-PROGS   := init sh ls cat echo hello crash
-COMMON  := -m64 -ffreestanding -fno-pic -fno-pie -fno-stack-protector -mno-red-zone \
-           -mno-sse -mno-sse2 -mno-mmx -mno-avx -fno-tree-loop-distribute-patterns \
-           -fcf-protection=none -fno-asynchronous-unwind-tables -O2 -Wall -Wextra
-LD      := ld -m elf_x86_64 -nostdlib -z max-page-size=0x1000 -z noexecstack --no-warn-rwx-segments
-KOBJ    := $(addprefix build/kernel/,boot.o entry.o main.o proc.o syscall.o initrd.o)
-UELF    := $(addprefix build/user/,$(addsuffix .elf,$(PROGS)))
+# SPDX-License-Identifier: GPL-2.0
+#
+# HaisuliOS build: the kernel, the user programs, the boot ramdisk, and
+# targets to run and test the system in QEMU.
 
-all: build/kernel32.elf
+TARGET  := x86_64-unknown-none
+REL     := target/$(TARGET)/release
+ELF     := $(REL)/haisulios
+IMG     := build/haisulios.elf32
+OBJCOPY ?= objcopy
+QEMU    ?= qemu-system-x86_64
 
-# QEMU's -kernel multiboot loader only accepts 32-bit ELF, so repackage the image.
-build/kernel32.elf: build/kernel.elf
-	objcopy -O elf32-i386 $< $@
-build/kernel.elf: $(KOBJ) kernel/kernel.ld
-	$(LD) -T kernel/kernel.ld -o $@ $(KOBJ)
+# Boot modules, in order: the first program is init (pid 1). The ramdisk is
+# a ustar archive of rootfs/ (it provides /etc/motd) and is handed to init.
+PROGRAMS := build/init build/console
+RAMDISK  := build/initrd.tar
+MODULES  := build/init,build/console,$(RAMDISK)
 
-build/kernel/%.o: kernel/%.c kernel/kernel.h
-	@mkdir -p $(@D); $(CC) $(COMMON) -c $< -o $@
-build/kernel/%.o: kernel/%.S
-	@mkdir -p $(@D); $(CC) -m64 -c $< -o $@
-build/kernel/initrd.o: kernel/initrd.S build/initrd.tar
-	@mkdir -p $(@D); $(CC) -m64 -Ibuild -c $< -o $@
+# COM1 on the terminal, multiplexed with the QEMU monitor: Ctrl-C and other
+# keys go to HaisuliOS, Ctrl-A X quits QEMU, Ctrl-A C toggles the monitor.
+SERIAL := -chardev stdio,id=con,mux=on,signal=off -serial chardev:con -mon chardev=con
 
-build/user/%.o: user/%.c user/ulib.h
-	@mkdir -p $(@D); $(CC) $(COMMON) -Iuser -c $< -o $@
-build/user/%.elf: build/user/%.o build/user/ulib.o user/user.ld
-	$(LD) -T user/user.ld -o $@ $< build/user/ulib.o
+QEMU_FLAGS := -kernel $(IMG) -initrd "$(MODULES)" -m 128M $(SERIAL) \
+              -display none -no-reboot
 
-build/initrd.tar: $(UELF) $(wildcard rootfs/etc/*)
-	rm -rf build/rootfs && mkdir -p build/rootfs/bin
-	cp -r rootfs/etc build/rootfs/etc
-	for p in $(PROGS); do cp build/user/$$p.elf build/rootfs/bin/$$p; done
-	strip build/rootfs/bin/*
-	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner -cf $@ -C build/rootfs bin etc
+PYTHON ?= python3
 
+.PHONY: all build run debug check rustfmt rustfmtcheck clean
+
+all: $(IMG) $(PROGRAMS) $(RAMDISK)
+
+# One cargo invocation builds the kernel and every user program.
+build:
+	cargo build --release --workspace --target $(TARGET)
+
+# QEMU's -kernel (Multiboot v1) only accepts 32-bit ELF files, so re-wrap the
+# 64-bit kernel. The kernel enters long mode itself.
+$(IMG): build
+	mkdir -p build
+	$(OBJCOPY) -I elf64-x86-64 -O elf32-i386 $(ELF) $(IMG)
+
+# User programs are loaded by the kernel's own ELF loader: copied as-is.
+build/%: build
+	mkdir -p build
+	cp $(REL)/$* $@
+
+$(RAMDISK): $(shell find rootfs)
+	mkdir -p build
+	tar --format=ustar -C rootfs -cf $@ .
+
+# Interactive console on stdio. The kernel powers QEMU off via isa-debug-exit
+# when init exits (QEMU's exit status is then 1; that's normal).
 run: all
-	qemu-system-x86_64 -kernel build/kernel32.elf -m 128M -nographic -no-reboot
+	$(QEMU) $(QEMU_FLAGS) -device isa-debug-exit,iobase=0xf4,iosize=0x04
+
+debug: all
+	$(QEMU) $(QEMU_FLAGS) -d int,cpu_reset -s -S
+
+# Boots a fresh QEMU per test and drives the shell over the serial console.
+# Pass runner options with TEST_ARGS, e.g. make check TEST_ARGS="-v echo".
+check: all
+	$(PYTHON) test/run_tests.py --qemu $(QEMU) --kernel $(IMG) --modules "$(MODULES)" $(TEST_ARGS)
+
+# Formatting, as in the Linux kernel (Documentation/rust/coding-guidelines.rst).
+rustfmt:
+	cargo fmt --all
+
+rustfmtcheck:
+	cargo fmt --all -- --check
+
 clean:
+	cargo clean
 	rm -rf build
-.PHONY: all run clean

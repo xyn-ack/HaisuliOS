@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0
+
+[package]
+name = "haisuli-rt"
+version = "0.1.0"
+edition = "2021"
+description = "HaisuliOS user-space runtime: entry point, syscalls, console output, panics"
+license = "GPL-2.0"
+
+[dependencies]
+haisuli-abi = { path = "../../abi" }
+
+[lints]
+workspace = true

@@ -1,0 +1,193 @@
+# SPDX-License-Identifier: GPL-2.0
+"""HaisuliOS test harness.
+
+Boots HaisuliOS in QEMU and drives its serial console like a user at a terminal.
+
+The serial console is connected to pipes, so tests can type at the shell (Enter sends CR, as a
+real terminal does) and wait for what appears on the screen. Only the Python standard library is
+used.
+"""
+import codecs
+import os
+import re
+import subprocess
+import threading
+import time
+
+PROMPT = "haisuli# "
+
+# Text that must never appear on the console in a healthy run.
+FAILURE_MARKERS = (
+    "KERNEL PANIC",  # The kernel panic handler.
+    "[KERNEL]",  # A CPU exception in kernel mode.
+    "[user] #",  # A CPU exception in a user process.
+    "deadlock",  # The scheduler found nothing runnable.
+    "panic:",  # The user-space panic handler.
+)
+
+
+ROOTFS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rootfs")
+
+
+def read_rootfs(path):
+    """Contents of a file that the build packs into the boot ramdisk."""
+    with open(os.path.join(ROOTFS, path), encoding="utf-8") as f:
+        return f.read()
+
+
+class Timeout(AssertionError):
+    pass
+
+
+class Config:
+    """How to start QEMU. Filled in by the runner from its command line."""
+
+    qemu = "qemu-system-x86_64"
+    kernel = "build/haisulios.elf32"
+    modules = "build/init,build/console,build/initrd.tar"
+    timeout = 15.0  # Seconds to wait for any expected output.
+
+
+class Machine:
+    """One QEMU instance running HaisuliOS, booted to the first prompt."""
+
+    def __init__(self, config=Config):
+        self.config = config
+        # Everything the console printed so far, decoded, with the terminal's
+        # CR LF line ends turned into LF.
+        self._text = ""
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._held_cr = ""  # A trailing CR whose LF may still be on its way.
+        self._mark = 0  # The start of the output not yet consumed by a test.
+        self._cond = threading.Condition()
+        self._eof = False
+        cmd = [
+            config.qemu,
+            "-kernel", config.kernel,
+            "-initrd", config.modules,
+            "-m", "128M",
+            "-serial", "stdio",
+            "-monitor", "none",
+            "-display", "none",
+            "-nic", "none",
+            "-no-reboot",
+            "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        ]
+        self.proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        self._reader = threading.Thread(target=self._read_stdout, daemon=True)
+        self._reader.start()
+        self._stderr = b""
+        self._err_reader = threading.Thread(target=self._read_stderr, daemon=True)
+        self._err_reader.start()
+        # Everything up to and including the first prompt.
+        self.boot_output = self.expect(PROMPT)
+
+    # ---- plumbing ---------------------------------------------------------
+
+    def _read_stdout(self):
+        fd = self.proc.stdout.fileno()
+        while True:
+            data = os.read(fd, 4096)
+            with self._cond:
+                if not data:
+                    self._text += self._held_cr + self._decoder.decode(b"", final=True)
+                    self._held_cr = ""
+                    self._eof = True
+                    self._cond.notify_all()
+                    return
+                chunk = self._held_cr + self._decoder.decode(data)
+                self._held_cr = ""
+                if chunk.endswith("\r"):
+                    chunk, self._held_cr = chunk[:-1], "\r"
+                self._text += chunk.replace("\r\n", "\n")
+                self._cond.notify_all()
+
+    def _read_stderr(self):
+        self._stderr = self.proc.stderr.read()
+
+    @property
+    def transcript(self):
+        """Everything the console printed so far (CR LF normalised to LF)."""
+        with self._cond:
+            return self._text
+
+    @property
+    def stderr(self):
+        return self._stderr.decode("utf-8", "replace")
+
+    # ---- interaction ------------------------------------------------------
+
+    def send(self, keys):
+        """Type `keys` (str or bytes) without pressing Enter."""
+        if isinstance(keys, str):
+            keys = keys.encode("utf-8")
+        self.proc.stdin.write(keys)
+        self.proc.stdin.flush()
+
+    def expect(self, pattern, timeout=None):
+        """Wait until the unconsumed output contains `pattern` (a string, or a
+        compiled regular expression). Consumes and returns the output up to
+        and including the match."""
+        timeout = self.config.timeout if timeout is None else timeout
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while True:
+                text = self._text[self._mark:]
+                if isinstance(pattern, re.Pattern):
+                    m = pattern.search(text)
+                    end = m.end() if m else -1
+                else:
+                    i = text.find(pattern)
+                    end = i + len(pattern) if i >= 0 else -1
+                if end >= 0:
+                    self._mark += end
+                    return text[:end]
+                left = deadline - time.monotonic()
+                if left <= 0 or self._eof:
+                    why = "console closed" if self._eof else f"timed out after {timeout}s"
+                    raise Timeout(f"{why} waiting for {pattern!r}; unconsumed output: {text!r}")
+                self._cond.wait(left)
+
+    def run(self, line):
+        """Type a command line and press Enter; wait for the next prompt.
+        Returns the command's output (without the echoed input line and
+        without the new prompt)."""
+        echo, output = self.run_raw(line + "\r")
+        return output
+
+    def run_raw(self, keys):
+        """Type `keys` (which must end the line, e.g. with CR) and wait for the
+        next prompt. Returns (echo, output): the echoed input line, as drawn
+        on the terminal, and the command's output."""
+        self.send(keys)
+        chunk = self.expect(PROMPT)[: -len(PROMPT)]
+        echo, _, output = chunk.partition("\n")
+        return echo, output
+
+    def wait_exit(self, timeout=None):
+        """Wait for QEMU to terminate; returns its exit status."""
+        timeout = self.config.timeout if timeout is None else timeout
+        try:
+            return self.proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            raise Timeout(f"QEMU still running after {timeout}s")
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        self._reader.join(2)
+        self._err_reader.join(2)
+        for f in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+            try:
+                f.close()
+            except OSError:
+                pass
+
+    def check_healthy(self):
+        """Fail if the kernel or a process reported a crash."""
+        text = self.transcript
+        for marker in FAILURE_MARKERS:
+            assert marker not in text, f"console shows {marker!r}"
