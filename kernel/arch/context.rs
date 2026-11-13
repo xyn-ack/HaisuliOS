@@ -17,6 +17,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const KSTACK_SIZE: usize = 16 * 1024;
 const KSTACK_WORDS: usize = KSTACK_SIZE / 8;
+/// Registers that `switch_context` saves on the stack: rbp, rbx and r12 to r15.
+const CALLEE_SAVED: usize = 6;
+/// A suspended context on its stack: the callee-saved registers, then the
+/// address `switch_context` returns to.
+const SWITCH_FRAME_WORDS: usize = CALLEE_SAVED + 1;
 
 /// Kernel stack of one process slot.
 ///
@@ -86,12 +91,15 @@ pub(crate) fn init(slot: usize, frame: &TrapFrame) {
     let stack = &STACKS[slot].0;
     // [r15 r14 r13 r12 rbx rbp][return address = trap_return][TrapFrame] <- top
     let frame_words = frame.words();
-    let first = KSTACK_WORDS - TrapFrame::WORDS - 7;
-    for w in &stack[first..first + 6] {
+    let first = KSTACK_WORDS - TrapFrame::WORDS - SWITCH_FRAME_WORDS;
+    for w in &stack[first..first + CALLEE_SAVED] {
         w.store(0, Ordering::Relaxed);
     }
-    stack[first + 6].store(trap_return as *const () as u64, Ordering::Relaxed);
-    for (w, &v) in stack[first + 7..].iter().zip(frame_words.iter()) {
+    stack[first + CALLEE_SAVED].store(trap_return as *const () as u64, Ordering::Relaxed);
+    for (w, &v) in stack[first + SWITCH_FRAME_WORDS..]
+        .iter()
+        .zip(frame_words.iter())
+    {
         w.store(v, Ordering::Relaxed);
     }
     SAVED_RSP[slot].store(stack[first..].as_ptr() as u64, Ordering::Relaxed);

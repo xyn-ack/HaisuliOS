@@ -14,21 +14,59 @@
 
 use crate::arch::cpu::Device::{self, Pic1, Pic2, PostCode};
 use crate::arch::entry::{stub_address, IRQ_STUBS};
+use crate::arch::x86::Exception;
 use crate::{idt, process};
 use core::sync::atomic::{AtomicU64, Ordering};
 use haisuli_abi::errno::{EBUSY, EINVAL, EPERM};
 
-pub(crate) const LINES: usize = 16;
-/// IDT vector of IRQ line 0; lines 0..15 use vectors 32..47.
-const VECTOR_BASE: usize = 32;
-/// Line 2 chains the slave PIC to the master; it is never a device.
-const CASCADE: u64 = 2;
+/// Lines of each 8259.
+const LINES_PER_PIC: u64 = 8;
+/// Lines of the master and slave PIC together.
+pub(crate) const LINES: usize = 2 * LINES_PER_PIC as usize;
+/// IDT vector of IRQ line 0: the first after the CPU's exception vectors, so
+/// lines 0..15 use vectors 32..47.
+const VECTOR_BASE: usize = Exception::VECTORS;
 
-/// PIC registers (port offsets).
-const CMD: u16 = 0;
-const DATA: u16 = 1;
-const EOI: u8 = 0x20;
-const READ_ISR: u8 = 0x0B;
+/// IRQ lines with a fixed role in the master/slave pair of 8259s.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+enum Line {
+    /// The master's line 2, which the slave is wired to: never a device.
+    Cascade = 2,
+    /// The master's lowest-priority line, which it also raises for a
+    /// spurious interrupt (one that went away before it was acknowledged).
+    MasterSpurious = 7,
+    /// The slave's lowest-priority line, which it raises for its spurious ones.
+    SlaveSpurious = 15,
+}
+
+/// The two registers (I/O ports) of an 8259.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+enum Register {
+    /// Command (ICW1, OCW2, OCW3) and status.
+    Command = 0,
+    /// Data: the other initialisation words, and the mask of disabled lines.
+    Data = 1,
+}
+
+/// Commands written to [`Register::Command`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Command {
+    /// ICW1: start initialisation (bit 4), with an ICW4 to follow (bit 0).
+    Initialize = 0x11,
+    /// OCW2: non-specific end of interrupt, for the highest line in service.
+    EndOfInterrupt = 0x20,
+    /// OCW3: make the next read of [`Register::Command`] return the
+    /// in-service register (bit 3: OCW3; bit 1: read; bit 0: ISR, not IRR).
+    ReadInService = 0x0B,
+}
+
+/// ICW4: 8086 mode (not the MCS-80/85 of the original PC design).
+const ICW4_8086: u8 = 0x01;
+/// A mask that disables every line of a PIC.
+const ALL_MASKED: u8 = 0xFF;
 
 /// The pid owning each line (0 = unbound).
 static OWNER: [AtomicU64; LINES] = [const { AtomicU64::new(0) }; LINES];
@@ -41,66 +79,79 @@ fn io_wait() {
 /// Remap the PICs to vectors 32..47 (by default IRQ 0-7 would alias CPU
 /// exceptions 8-15), mask every device line and install the IDT gates.
 pub(crate) fn init() {
+    let cascade = Line::Cascade as u64;
     for (pic, offset, wiring) in [
-        (Pic1, VECTOR_BASE as u8, 1 << CASCADE),
-        (Pic2, VECTOR_BASE as u8 + 8, CASCADE as u8),
+        (Pic1, VECTOR_BASE as u8, 1 << cascade),
+        (
+            Pic2,
+            (VECTOR_BASE as u64 + LINES_PER_PIC) as u8,
+            cascade as u8,
+        ),
     ] {
-        pic.write8(CMD, 0x11); // ICW1: initialise, ICW4 follows.
+        pic.write8(Register::Command as u16, Command::Initialize as u8);
         io_wait();
-        pic.write8(DATA, offset); // ICW2: vector offset.
+        pic.write8(Register::Data as u16, offset); // ICW2: vector of its line 0.
         io_wait();
-        pic.write8(DATA, wiring); // ICW3: master: slave on line 2; slave: its id.
+        // ICW3: the master gets a bit mask of the lines with a slave on them;
+        // the slave gets the number of the master's line it is wired to.
+        pic.write8(Register::Data as u16, wiring);
         io_wait();
-        pic.write8(DATA, 0x01); // ICW4: 8086 mode.
+        pic.write8(Register::Data as u16, ICW4_8086);
         io_wait();
     }
-    Pic1.write8(DATA, !(1u8 << CASCADE)); // Everything masked but the cascade.
-    Pic2.write8(DATA, 0xFF);
+    // Everything masked but the cascade.
+    Pic1.write8(Register::Data as u16, ALL_MASKED & !(1u8 << cascade));
+    Pic2.write8(Register::Data as u16, ALL_MASKED);
     for (line, &stub) in IRQ_STUBS.iter().enumerate() {
         idt::set_handler(VECTOR_BASE + line, stub_address(stub));
     }
 }
 
+/// The PIC that `line` belongs to, and its bit in that PIC's registers.
+fn pic_of(line: u64) -> (Device, u8) {
+    let pic = if line < LINES_PER_PIC { Pic1 } else { Pic2 };
+    (pic, 1 << (line % LINES_PER_PIC))
+}
+
 fn set_masked(line: u64, masked: bool) {
-    let (pic, bit) = if line < 8 {
-        (Pic1, line)
-    } else {
-        (Pic2, line - 8)
-    };
-    let m = pic.read8(DATA);
+    let (pic, bit) = pic_of(line);
+    let m = pic.read8(Register::Data as u16);
     pic.write8(
-        DATA,
-        if masked {
-            m | 1 << bit
-        } else {
-            m & !(1 << bit)
-        },
+        Register::Data as u16,
+        if masked { m | bit } else { m & !bit },
     );
 }
 
-/// In-service register of one PIC.
-fn in_service(pic: Device) -> u8 {
-    pic.write8(CMD, READ_ISR);
-    pic.read8(CMD)
+/// Whether `line` is really being serviced (according to its PIC's
+/// in-service register), rather than a spurious interrupt.
+fn in_service(line: Line) -> bool {
+    let (pic, bit) = pic_of(line as u64);
+    pic.write8(Register::Command as u16, Command::ReadInService as u8);
+    pic.read8(Register::Command as u16) & bit != 0
+}
+
+/// Acknowledges the interrupt on `pic`.
+fn end_of_interrupt(pic: Device) {
+    pic.write8(Register::Command as u16, Command::EndOfInterrupt as u8);
 }
 
 /// Called (with interrupts disabled) by the IRQ stubs in `arch::entry`.
 pub(crate) extern "C" fn irq_dispatch(line: u64) {
-    // Spurious interrupts (line 7/15 raised without being in service) must
-    // not be acknowledged on their own PIC.
-    if line == 7 && in_service(Pic1) & 0x80 == 0 {
+    // Spurious interrupts (raised without being in service) must not be
+    // acknowledged on their own PIC.
+    if line == Line::MasterSpurious as u64 && !in_service(Line::MasterSpurious) {
         return;
     }
-    if line == 15 && in_service(Pic2) & 0x80 == 0 {
-        Pic1.write8(CMD, EOI); // The master did see the cascade.
+    if line == Line::SlaveSpurious as u64 && !in_service(Line::SlaveSpurious) {
+        end_of_interrupt(Pic1); // The master did see the cascade.
         return;
     }
     // Keep the line quiet until its driver has serviced the device.
     set_masked(line, true);
-    if line >= 8 {
-        Pic2.write8(CMD, EOI);
+    if line >= LINES_PER_PIC {
+        end_of_interrupt(Pic2);
     }
-    Pic1.write8(CMD, EOI);
+    end_of_interrupt(Pic1);
     let owner = OWNER[line as usize].load(Ordering::Relaxed);
     if owner != 0 {
         process::irq_notify(owner, line);
@@ -114,7 +165,7 @@ pub(crate) fn owner(line: usize) -> u64 {
 
 /// Routes IRQ `line` to the calling, privileged process (the `irq_bind` system call).
 pub(crate) fn bind(line: u64) -> i64 {
-    if line >= LINES as u64 || line == CASCADE {
+    if line >= LINES as u64 || line == Line::Cascade as u64 {
         return -EINVAL;
     }
     if !process::current_privileged() {

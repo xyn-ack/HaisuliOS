@@ -4,8 +4,10 @@
 //!
 //! Privileged x86_64 instructions, each behind a safe interface whose restrictions make it safe.
 
+use super::x86::Msr;
 use core::arch::asm;
 use core::sync::atomic::AtomicU64;
+use haisuli_abi::uart;
 
 // ---- Port I/O ---------------------------------------------------------------
 
@@ -30,10 +32,12 @@ pub(crate) enum Device {
 impl Device {
     const fn ports(self) -> (u16, u16) {
         match self {
-            Device::Com1 => (0x3F8, 8),
+            // The standard PC I/O ports of each device.
+            Device::Com1 => (uart::COM1, uart::PORTS),
             Device::Pic1 => (0x20, 2),
             Device::Pic2 => (0xA0, 2),
             Device::PostCode => (0x80, 1),
+            // QEMU: `-device isa-debug-exit,iobase=0xf4,iosize=0x04`.
             Device::DebugExit => (0xF4, 4),
         }
     }
@@ -146,7 +150,7 @@ struct DescriptorPointer {
 /// Every segment register is reloaded. The table lives forever (`'static`).
 pub(crate) fn load_gdt(gdt: &'static [AtomicU64], code: u16, data: u16, tss: u16) {
     let ptr = DescriptorPointer {
-        limit: (gdt.len() * 8 - 1) as u16,
+        limit: (size_of_val(gdt) - 1) as u16,
         base: gdt.as_ptr() as u64,
     };
     // SAFETY: The table outlives the CPU's use of it, and the selectors
@@ -176,10 +180,10 @@ pub(crate) fn load_gdt(gdt: &'static [AtomicU64], code: u16, data: u16, tss: u16
     }
 }
 
-/// Load the interrupt descriptor table (256 gates of 16 bytes).
-pub(crate) fn load_idt(idt: &'static [AtomicU64; 512]) {
+/// Loads the interrupt descriptor table (16-byte gates, two words each).
+pub(crate) fn load_idt(idt: &'static [AtomicU64]) {
     let ptr = DescriptorPointer {
-        limit: (256 * 16 - 1) as u16,
+        limit: (size_of_val(idt) - 1) as u16,
         base: idt.as_ptr() as u64,
     };
     // SAFETY: The table lives forever; gates are filled in by `idt` with
@@ -189,18 +193,14 @@ pub(crate) fn load_idt(idt: &'static [AtomicU64; 512]) {
 
 // ---- Model-specific registers --------------------------------------------------
 
-pub(crate) const MSR_EFER: u32 = 0xC000_0080;
-pub(crate) const MSR_STAR: u32 = 0xC000_0081;
-pub(crate) const MSR_LSTAR: u32 = 0xC000_0082;
-pub(crate) const MSR_SFMASK: u32 = 0xC000_0084;
-
-pub(crate) fn rdmsr(msr: u32) -> u64 {
+/// Reads a model-specific register.
+pub(crate) fn rdmsr(msr: Msr) -> u64 {
     let (lo, hi): (u32, u32);
-    // SAFETY: Reading the MSRs above has no side effects.
+    // SAFETY: Reading the MSRs in `Msr` has no side effects.
     unsafe {
         asm!(
             "rdmsr",
-            in("ecx") msr,
+            in("ecx") msr as u32,
             out("eax") lo,
             out("edx") hi,
             options(nomem, nostack, preserves_flags),
@@ -209,20 +209,15 @@ pub(crate) fn rdmsr(msr: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
-/// Writes one of the system call MSRs.
+/// Writes one of the system call MSRs (every [`Msr`] is one).
 ///
-/// Only these can be written, and only by [`super::entry`], which points them
-/// at its own entry stub.
-///
-/// # Panics
-///
-/// Panics if `msr` is not one of the system call MSRs.
-pub(super) fn wrmsr(msr: u32, v: u64) {
-    assert!(matches!(msr, MSR_EFER | MSR_STAR | MSR_LSTAR | MSR_SFMASK));
+/// Only [`super::entry`] may write them, and it points them at its own entry
+/// stub.
+pub(super) fn wrmsr(msr: Msr, v: u64) {
     // SAFETY: See above; callers write values that describe the kernel's
     // GDT layout and syscall entry point.
     unsafe {
-        asm!("wrmsr", in("ecx") msr, in("eax") v as u32, in("edx") (v >> 32) as u32,
+        asm!("wrmsr", in("ecx") msr as u32, in("eax") v as u32, in("edx") (v >> 32) as u32,
              options(nomem, nostack, preserves_flags))
     };
 }

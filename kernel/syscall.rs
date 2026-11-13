@@ -16,7 +16,7 @@ use crate::{irq, serial, vmm};
 use haisuli_abi::console::{OP_READ, OP_WRITE};
 use haisuli_abi::errno::{EBADF, EFAULT, ENAMETOOLONG, ENOSYS};
 use haisuli_abi::fcntl::PATH_MAX;
-use haisuli_abi::{nr, wait_status_exited};
+use haisuli_abi::{nr, Termination};
 
 pub(crate) fn init() {
     entry::init_syscalls();
@@ -49,7 +49,7 @@ pub(crate) extern "C" fn syscall_dispatch(f: &mut TrapFrame) {
         nr::GETPID => process::getpid(),
         nr::GETPPID => process::getppid(),
         nr::FORK => process::fork(f),
-        nr::EXIT => process::exit_current(wait_status_exited(a0 as i32)),
+        nr::EXIT => process::exit_current(Termination::exit(a0 as i32).wait_status()),
         nr::WAIT4 => process::wait4(a0 as i64, a1, a2),
         nr::PAUSE => process::pause(),
         nr::KILL => process::kill(a0 as i64, a1),
@@ -168,7 +168,9 @@ fn user_string(ptr: u64, buf: &mut [u8]) -> Result<usize, i64> {
 ///
 /// It never blocks, so servers and panic handlers can always report problems.
 fn sys_debug_log(buf: u64, len: u64) -> i64 {
-    let len = len.min(4096);
+    /// Most bytes one call writes; more is cut off (a log line, not a file).
+    const DEBUG_LOG_MAX: u64 = 4096;
+    let len = len.min(DEBUG_LOG_MAX);
     let pml4 = process::current_pml4();
     if !vmm::user_range_ok(pml4, buf, len, false) {
         return -EFAULT;

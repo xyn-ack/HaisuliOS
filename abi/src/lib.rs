@@ -220,6 +220,16 @@ pub mod errno {
     }
 }
 
+/// Memory mapping: `MMAP` protection bits (Linux values).
+pub mod mman {
+    /// Pages may be read (always true for a mapping).
+    pub const PROT_READ: u64 = 1;
+    /// Pages may be written.
+    pub const PROT_WRITE: u64 = 2;
+    /// Pages may be executed.
+    pub const PROT_EXEC: u64 = 4;
+}
+
 /// File access: `OPEN` flags, `FCNTL` commands and directory entries (Linux values).
 pub mod fcntl {
     /// Open for reading only.
@@ -359,14 +369,55 @@ pub mod signal {
 /// `wait4` option: report nothing instead of blocking if no child has exited.
 pub const WNOHANG: u64 = 1;
 
-/// The POSIX wait status of a process that exited with `code`.
-pub const fn wait_status_exited(code: i32) -> i32 {
-    (code & 0xFF) << 8
+/// How a process ended: what its POSIX wait status (`wait4`'s `*status`) encodes.
+///
+/// The encoding: the low 7 bits hold the signal that killed the process, 0
+/// if it exited; after an exit, bits 8 to 15 hold its exit code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Termination {
+    /// It called `exit`; only the low 8 bits of the code are kept.
+    Exited(u8),
+    /// A signal killed it.
+    Signalled(u64),
 }
 
-/// The POSIX wait status of a process killed by signal `sig`.
-pub const fn wait_status_signalled(sig: u64) -> i32 {
-    (sig & 0x7F) as i32
+impl Termination {
+    /// The wait-status bits holding the signal.
+    const SIGNAL_MASK: i32 = 0x7F;
+    /// Where the exit code starts in the wait status.
+    const CODE_SHIFT: u32 = 8;
+    /// A shell reports a process killed by signal n as status 128 + n (POSIX).
+    pub const SHELL_SIGNAL_BASE: i32 = 128;
+
+    /// The ending of a process that called `exit(code)`.
+    pub const fn exit(code: i32) -> Termination {
+        Termination::Exited(code as u8)
+    }
+
+    /// The POSIX wait status.
+    pub const fn wait_status(self) -> i32 {
+        match self {
+            Termination::Exited(code) => (code as i32) << Self::CODE_SHIFT,
+            Termination::Signalled(sig) => sig as i32 & Self::SIGNAL_MASK,
+        }
+    }
+
+    /// Decodes a POSIX wait status.
+    pub const fn from_wait_status(status: i32) -> Termination {
+        match status & Self::SIGNAL_MASK {
+            0 => Termination::Exited((status >> Self::CODE_SHIFT) as u8),
+            sig => Termination::Signalled(sig as u64),
+        }
+    }
+
+    /// The status a shell reports in `$?`: the exit code, or 128 + n for a
+    /// process killed by signal n.
+    pub const fn shell_status(self) -> i32 {
+        match self {
+            Termination::Exited(code) => code as i32,
+            Termination::Signalled(sig) => Self::SHELL_SIGNAL_BASE + sig as i32,
+        }
+    }
 }
 
 /// What a process in a [`ProcInfo`] is doing.
@@ -447,6 +498,127 @@ impl ProcInfo {
             .position(|&b| b == 0)
             .unwrap_or(PROC_NAME_LEN);
         core::str::from_utf8(&self.name[..n]).unwrap_or("?")
+    }
+}
+
+/// The 16550 UART of the serial console: registers and their bits.
+///
+/// Shared by the kernel's debug log and the user-space console driver, which
+/// program the same device (Linux likewise exports `serial_reg.h` to user
+/// space). Register values are written as `bits(&[...])` of their flags.
+pub mod uart {
+    /// The base I/O port of COM1.
+    pub const COM1: u16 = 0x3F8;
+    /// I/O ports of one UART, from its base.
+    pub const PORTS: u16 = 8;
+    /// The IRQ line of COM1.
+    pub const COM1_IRQ: u64 = 4;
+    /// The divisor for 38400 baud (the UART's clock is 115200 Hz).
+    pub const DIVISOR_38400: u16 = 3;
+
+    /// The UART's registers, by offset from the base port.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[repr(u16)]
+    pub enum Register {
+        /// Receive buffer (read) and transmit holding register (write).
+        Data = 0,
+        /// Which events raise an interrupt (see [`InterruptEnable`]).
+        InterruptEnable = 1,
+        /// FIFO control (write only; see [`FifoControl`]).
+        FifoControl = 2,
+        /// Line control: the word format, and [`LineControl::DivisorLatch`].
+        LineControl = 3,
+        /// Modem control (see [`ModemControl`]).
+        ModemControl = 4,
+        /// Line status (see [`LineStatus`]).
+        LineStatus = 5,
+    }
+
+    impl Register {
+        /// With [`LineControl::DivisorLatch`] set: the divisor's low byte.
+        pub const DIVISOR_LOW: Register = Register::Data;
+        /// With [`LineControl::DivisorLatch`] set: the divisor's high byte.
+        pub const DIVISOR_HIGH: Register = Register::InterruptEnable;
+    }
+
+    macro_rules! flags {
+        ($(#[$meta:meta])* enum $name:ident {
+            $($(#[$variant_meta:meta])* $variant:ident = $value:expr,)*
+        }) => {
+            $(#[$meta])*
+            #[derive(Clone, Copy, PartialEq, Eq)]
+            #[repr(u8)]
+            pub enum $name {
+                $($(#[$variant_meta])* $variant = $value,)*
+            }
+
+            impl $name {
+                /// The register value with exactly `flags` set.
+                pub const fn bits(flags: &[$name]) -> u8 {
+                    let mut bits = 0;
+                    let mut i = 0;
+                    while i < flags.len() {
+                        bits |= flags[i] as u8;
+                        i += 1;
+                    }
+                    bits
+                }
+            }
+        };
+    }
+
+    flags! {
+        /// [`Register::InterruptEnable`] bits.
+        enum InterruptEnable {
+            /// A byte has been received.
+            ReceivedData = 0x01,
+        }
+    }
+
+    flags! {
+        /// [`Register::FifoControl`] bits.
+        enum FifoControl {
+            /// Use the FIFOs.
+            Enable = 0x01,
+            /// Empty the receive FIFO.
+            ClearReceive = 0x02,
+            /// Empty the transmit FIFO.
+            ClearTransmit = 0x04,
+            /// Interrupt when 14 bytes are waiting (the largest trigger level).
+            Trigger14 = 0xC0,
+        }
+    }
+
+    flags! {
+        /// [`Register::LineControl`] bits.
+        enum LineControl {
+            /// 8 data bits (with no parity and one stop bit: "8N1").
+            Word8 = 0x03,
+            /// DLAB: registers 0 and 1 hold the baud-rate divisor.
+            DivisorLatch = 0x80,
+        }
+    }
+
+    flags! {
+        /// [`Register::ModemControl`] bits.
+        enum ModemControl {
+            /// DTR: data terminal ready.
+            DataTerminalReady = 0x01,
+            /// RTS: request to send.
+            RequestToSend = 0x02,
+            /// OUT2, which on a PC connects the UART's interrupt to the PIC.
+            Out2 = 0x08,
+        }
+    }
+
+    flags! {
+        /// [`Register::LineStatus`] bits.
+        enum LineStatus {
+            /// A received byte is waiting in [`Register::Data`].
+            DataReady = 0x01,
+            /// The transmit holding register can take another byte.
+            TransmitterEmpty = 0x20,
+        }
     }
 }
 

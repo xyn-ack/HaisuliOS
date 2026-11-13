@@ -9,13 +9,74 @@
 //! writable and executable are refused (W^X), as are segments outside the program-image region
 //! `[USER_BASE, MMAP_BASE)` and segments sharing a page with another segment.
 
+use crate::arch::x86::PageFlag;
 use crate::vmm;
 
-const PT_LOAD: u32 = 1;
-const PF_X: u32 = 1;
-const PF_W: u32 = 2;
-const ET_EXEC: u16 = 2;
-const EM_X86_64: u16 = 62;
+/// The file starts with these four bytes (`e_ident[EI_MAG0..4]`).
+const MAGIC: &[u8; 4] = b"\x7fELF";
+/// `e_ident[EI_CLASS]` of a 64-bit file.
+const CLASS_64: u8 = 2;
+/// `e_ident[EI_DATA]` of a little-endian file.
+const DATA_LITTLE_ENDIAN: u8 = 1;
+/// `e_type` of a (static) executable, `ET_EXEC`.
+const TYPE_EXECUTABLE: u16 = 2;
+/// `e_machine` of x86_64, `EM_X86_64`.
+const MACHINE_X86_64: u16 = 62;
+/// `p_type` of a segment to load, `PT_LOAD`.
+const SEGMENT_LOAD: u32 = 1;
+
+/// Offsets of the ELF64 file header's fields that the loader reads.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum Header {
+    /// `e_ident[EI_CLASS]` (u8).
+    Class = 4,
+    /// `e_ident[EI_DATA]` (u8).
+    Data = 5,
+    /// `e_type` (u16).
+    Type = 16,
+    /// `e_machine` (u16).
+    Machine = 18,
+    /// `e_entry` (u64): the entry point.
+    Entry = 24,
+    /// `e_phoff` (u64): where the program headers start.
+    ProgramHeaders = 32,
+    /// `e_phentsize` (u16): bytes per program header.
+    ProgramHeaderSize = 54,
+    /// `e_phnum` (u16): number of program headers.
+    ProgramHeaderCount = 56,
+}
+
+/// Offsets of the ELF64 program header's fields.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum ProgramHeader {
+    /// `p_type` (u32).
+    Type = 0,
+    /// `p_flags` (u32): see [`SegmentFlag`].
+    Flags = 4,
+    /// `p_offset` (u64): where the segment's bytes are in the file.
+    Offset = 8,
+    /// `p_vaddr` (u64).
+    VirtualAddress = 16,
+    /// `p_filesz` (u64): bytes in the file.
+    FileSize = 32,
+    /// `p_memsz` (u64): bytes in memory (the rest is zero).
+    MemorySize = 40,
+}
+
+/// The smallest program header that has every field the loader reads.
+const PROGRAM_HEADER_MIN: usize = 56;
+
+/// `p_flags` bits: the segment's permissions.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum SegmentFlag {
+    /// `PF_X`: executable.
+    Execute = 1 << 0,
+    /// `PF_W`: writable.
+    Write = 1 << 1,
+}
 
 fn u16_at(b: &[u8], off: usize) -> Option<u16> {
     Some(u16::from_le_bytes(b.get(off..off + 2)?.try_into().ok()?))
@@ -28,7 +89,7 @@ fn u64_at(b: &[u8], off: usize) -> Option<u64> {
 }
 
 pub(crate) fn is_elf(image: &[u8]) -> bool {
-    image.starts_with(b"\x7fELF")
+    image.starts_with(MAGIC)
 }
 
 struct Segment {
@@ -40,16 +101,23 @@ struct Segment {
 }
 
 fn segment(image: &[u8], ph: usize) -> Option<(u32, Segment)> {
+    let at = |field: ProgramHeader| ph + field as usize;
     Some((
-        u32_at(image, ph)?,
+        u32_at(image, at(ProgramHeader::Type))?,
         Segment {
-            flags: u32_at(image, ph + 4)?,
-            offset: u64_at(image, ph + 8)?,
-            vaddr: u64_at(image, ph + 16)?,
-            filesz: u64_at(image, ph + 32)?,
-            memsz: u64_at(image, ph + 40)?,
+            flags: u32_at(image, at(ProgramHeader::Flags))?,
+            offset: u64_at(image, at(ProgramHeader::Offset))?,
+            vaddr: u64_at(image, at(ProgramHeader::VirtualAddress))?,
+            filesz: u64_at(image, at(ProgramHeader::FileSize))?,
+            memsz: u64_at(image, at(ProgramHeader::MemorySize))?,
         },
     ))
+}
+
+impl Segment {
+    fn has(&self, flag: SegmentFlag) -> bool {
+        self.flags & flag as u32 != 0
+    }
 }
 
 /// Loads `image` into the (empty) user half of `pml4` and returns its entry point.
@@ -58,17 +126,24 @@ fn segment(image: &[u8], ph: usize) -> Option<(u32, Segment)> {
 /// destroys it.
 pub(crate) fn load(pml4: u64, image: &[u8]) -> Result<u64, &'static str> {
     const BAD: &str = "malformed ELF header";
-    if !is_elf(image) || image.get(4) != Some(&2) || image.get(5) != Some(&1) {
+    let byte = |field: Header| image.get(field as usize).copied();
+    if !is_elf(image)
+        || byte(Header::Class) != Some(CLASS_64)
+        || byte(Header::Data) != Some(DATA_LITTLE_ENDIAN)
+    {
         return Err("not a 64-bit little-endian ELF file");
     }
-    if u16_at(image, 16).ok_or(BAD)? != ET_EXEC || u16_at(image, 18).ok_or(BAD)? != EM_X86_64 {
+    let u16_field = |field: Header| u16_at(image, field as usize).ok_or(BAD);
+    let u64_field = |field: Header| u64_at(image, field as usize).ok_or(BAD);
+    if u16_field(Header::Type)? != TYPE_EXECUTABLE || u16_field(Header::Machine)? != MACHINE_X86_64
+    {
         return Err("not a static x86_64 executable");
     }
-    let entry = u64_at(image, 24).ok_or(BAD)?;
-    let phoff = u64_at(image, 32).ok_or(BAD)? as usize;
-    let phentsize = u16_at(image, 54).ok_or(BAD)? as usize;
-    let phnum = u16_at(image, 56).ok_or(BAD)? as usize;
-    if phentsize < 56 {
+    let entry = u64_field(Header::Entry)?;
+    let phoff = u64_field(Header::ProgramHeaders)? as usize;
+    let phentsize = u16_field(Header::ProgramHeaderSize)? as usize;
+    let phnum = u16_field(Header::ProgramHeaderCount)? as usize;
+    if phentsize < PROGRAM_HEADER_MIN {
         return Err(BAD);
     }
 
@@ -77,10 +152,10 @@ pub(crate) fn load(pml4: u64, image: &[u8]) -> Result<u64, &'static str> {
     for i in 0..phnum {
         let ph = phoff.checked_add(i * phentsize).ok_or(BAD)?;
         let (ty, s) = segment(image, ph).ok_or("truncated program header")?;
-        if ty != PT_LOAD || s.memsz == 0 {
+        if ty != SEGMENT_LOAD || s.memsz == 0 {
             continue;
         }
-        if s.flags & PF_W != 0 && s.flags & PF_X != 0 {
+        if s.has(SegmentFlag::Write) && s.has(SegmentFlag::Execute) {
             return Err("segment is both writable and executable");
         }
         let in_image = s.vaddr >= vmm::USER_BASE
@@ -95,12 +170,12 @@ pub(crate) fn load(pml4: u64, image: &[u8]) -> Result<u64, &'static str> {
             .get(s.offset as usize..file_end as usize)
             .ok_or("segment past end of file")?;
 
-        let mut flags = vmm::USER;
-        if s.flags & PF_W != 0 {
-            flags |= vmm::WRITABLE;
+        let mut flags = PageFlag::User as u64;
+        if s.has(SegmentFlag::Write) {
+            flags |= PageFlag::Writable as u64;
         }
-        if s.flags & PF_X == 0 {
-            flags |= vmm::NX;
+        if !s.has(SegmentFlag::Execute) {
+            flags |= PageFlag::NoExecute as u64;
         } else if (s.vaddr..s.vaddr + s.memsz).contains(&entry) {
             entry_ok = true;
         }

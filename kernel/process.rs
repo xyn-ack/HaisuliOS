@@ -29,22 +29,26 @@
 
 use crate::arch::entry::TrapFrame;
 use crate::arch::multiboot::{self, Module};
+use crate::arch::x86::{PageFlag, RFlag};
 use crate::arch::{context, cpu};
 use crate::signal::{self, Action, Disposition, Frame, SigAction, SigSet};
 use crate::sync::{Guard, Lock};
 use crate::{elf, fs, gdt, irq, syscall, vmm};
 use haisuli_abi::errno::*;
 use haisuli_abi::fcntl::{F_DUPFD, OPEN_MAX};
+use haisuli_abi::mman::{PROT_EXEC, PROT_WRITE};
 use haisuli_abi::signal::{
     NSIG, SA_RESETHAND, SA_RESTART, SIGCONT, SIGKILL, SIGSEGV, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK,
 };
 use haisuli_abi::{nr, proc_state, svc, ProcInfo, IO_PORTS, KMSG_IRQ, PID_KERNEL};
-use haisuli_abi::{wait_status_signalled, PROC_INFO_LEN, WNOHANG};
+use haisuli_abi::{Termination, PROC_INFO_LEN, WNOHANG};
 
 pub(crate) const MAX_PROCS: usize = 16;
 const MBOX_SIZE: usize = 8;
 const USER_STACK_PAGES: u64 = 8;
 const NAME_LEN: usize = 16;
+/// RFLAGS of a new process: interrupts enabled (and the reserved bit 1).
+pub(crate) const USER_RFLAGS: u64 = RFlag::bits(&[RFlag::Interrupt, RFlag::Reserved1]);
 /// A file descriptor that is not open.
 const NO_FD: u8 = u8::MAX;
 /// Descriptors per process.
@@ -351,13 +355,14 @@ fn spawn(m: &Module) -> Result<u64, &'static str> {
     let setup = || -> Result<TrapFrame, &'static str> {
         let entry = elf::load(pml4, m.data)?;
         let stack = USER_STACK_PAGES * 4096;
-        let stack_flags = vmm::USER | vmm::WRITABLE | vmm::NX;
+        let stack_flags =
+            PageFlag::bits(&[PageFlag::User, PageFlag::Writable, PageFlag::NoExecute]);
         vmm::map_init(pml4, vmm::USER_STACK_TOP - stack, stack, &[], stack_flags)
             .map_err(|_| "out of memory")?;
         Ok(TrapFrame {
             rip: entry,
             cs: gdt::USER_CS,
-            rflags: 0x202, // IF set (reserved bit 1 is always 1).
+            rflags: USER_RFLAGS,
             rsp: vmm::USER_STACK_TOP,
             ss: gdt::USER_DS,
             ..TrapFrame::default()
@@ -910,7 +915,7 @@ pub(crate) fn rt_sigreturn(f: &mut TrapFrame) -> i64 {
             table().cur_mut().blocked = blocked;
             f.rax as i64
         }
-        None => exit_current(wait_status_signalled(SIGSEGV)),
+        None => exit_current(Termination::Signalled(SIGSEGV).wait_status()),
     }
 }
 
@@ -1001,7 +1006,11 @@ fn post(t: &mut Table, slot: usize, sig: u64, sender: u64) -> Option<Dead> {
         return None; // It exited while this signal was on its way.
     }
     if sig == SIGKILL && !running {
-        return Some(make_zombie(t, slot, wait_status_signalled(sig)));
+        return Some(make_zombie(
+            t,
+            slot,
+            Termination::Signalled(sig).wait_status(),
+        ));
     }
     let disposition = p.actions[sig as usize].disposition(sig);
     if sig == SIGCONT {
@@ -1041,7 +1050,11 @@ fn act_on(t: &mut Table, slot: usize) -> Option<Dead> {
             Disposition::Default => match signal::default_action(sig) {
                 Action::Term => {
                     p.pending.remove(sig);
-                    return Some(make_zombie(t, slot, wait_status_signalled(sig)));
+                    return Some(make_zombie(
+                        t,
+                        slot,
+                        Termination::Signalled(sig).wait_status(),
+                    ));
                 }
                 Action::Stop => {
                     p.pending.remove(sig);
@@ -1134,7 +1147,7 @@ pub(crate) fn deliver_signals(f: &mut TrapFrame, nr: u64) {
         };
         match next {
             Next::Return => return,
-            Next::Die(sig) => exit_current(wait_status_signalled(sig)),
+            Next::Die(sig) => exit_current(Termination::Signalled(sig).wait_status()),
             Next::Stop => schedule(),
             Next::Handle(sig, act, sender, old_blocked) => {
                 if f.rax as i64 == -EINTR && act.flags & SA_RESTART != 0 && restartable(nr) {
@@ -1160,7 +1173,7 @@ fn enter_handler(f: &mut TrapFrame, sig: u64, act: &SigAction, sender: u64, bloc
         Some(addr) if vmm::copy_to_user(current_pml4(), addr, frame.as_bytes()) => {
             Frame::enter_handler(f, sig, act, addr);
         }
-        _ => exit_current(wait_status_signalled(SIGSEGV)),
+        _ => exit_current(Termination::Signalled(SIGSEGV).wait_status()),
     }
 }
 
@@ -1286,12 +1299,12 @@ pub(crate) fn mmap(len: u64, prot: u64) -> i64 {
         let t = table();
         (t.cur().pml4, t.cur().mmap_next)
     };
-    let mut flags = vmm::USER;
-    if prot & 2 != 0 {
-        flags |= vmm::WRITABLE; // `PROT_WRITE`.
+    let mut flags = PageFlag::User as u64;
+    if prot & PROT_WRITE != 0 {
+        flags |= PageFlag::Writable as u64;
     }
-    if prot & 4 == 0 {
-        flags |= vmm::NX; // No `PROT_EXEC`.
+    if prot & PROT_EXEC == 0 {
+        flags |= PageFlag::NoExecute as u64;
     }
     if vmm::map_init(pml4, base, pages * 4096, &[], flags).is_err() {
         return -ENOMEM;

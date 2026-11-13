@@ -4,18 +4,18 @@
 //!
 //! Sets up the GDT and the TSS, including each process's I/O-permission bitmap.
 //!
-//! The layout is dictated by the STAR MSR of SYSCALL/SYSRET:
-//!
-//! ```text
-//! 0x00 null | 0x08 kernel code | 0x10 kernel data
-//! 0x18 user data | 0x20 user code | 0x28 TSS (16 bytes)
-//! ```
+//! The layout ([`Selector`]) is dictated by the STAR MSR of SYSCALL/SYSRET: kernel code must be
+//! followed by kernel data, and user data by user code.
 //!
 //! The TSS carries an I/O-permission bitmap for ports `0..IO_PORTS`, loaded per process on every
 //! context switch: this is how user-space drivers get access to exactly the device registers they
 //! were granted (`ioperm`). Ports at or above `IO_PORTS` lie beyond the TSS limit and always fault.
 
 use crate::arch::cpu;
+use crate::arch::x86::{
+    segment_descriptor, system_descriptor, PrivilegeLevel, SegmentAccess, SegmentFlag,
+    SystemSegment,
+};
 use crate::sync::Lock;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -24,15 +24,60 @@ use haisuli_abi::IO_PORTS;
 /// Size of the per-process I/O bitmap: one bit per port, 1 = access denied.
 pub(crate) const IO_BITMAP_BYTES: usize = (IO_PORTS / 8) as usize;
 pub(crate) type IoBitmap = [u8; IO_BITMAP_BYTES];
+/// A bitmap byte denying all of its 8 ports.
+const DENY_8_PORTS: u8 = 0xFF;
 /// Bitmap denying every port (the default for each process).
-pub(crate) const IO_DENY_ALL: IoBitmap = [0xFF; IO_BITMAP_BYTES];
+pub(crate) const IO_DENY_ALL: IoBitmap = [DENY_8_PORTS; IO_BITMAP_BYTES];
 
-pub(crate) const KERNEL_CS: u64 = 0x08;
-pub(crate) const USER_DS: u64 = 0x18 | 3;
-pub(crate) const USER_CS: u64 = 0x20 | 3;
+/// The GDT's descriptors, by selector (byte offset in the GDT).
+///
+/// SYSCALL loads kernel code from STAR and kernel data from the next entry;
+/// SYSRET loads user data and then user code from the two entries after
+/// another base in STAR. Hence kernel data right after kernel code, and user
+/// data right before user code (see [`crate::arch::entry::init_syscalls`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub(crate) enum Selector {
+    /// The mandatory null descriptor.
+    Null = 0x00,
+    /// 64-bit kernel code.
+    KernelCode = 0x08,
+    /// Kernel data (and stack).
+    KernelData = 0x10,
+    /// User data (and stack).
+    UserData = 0x18,
+    /// 64-bit user code.
+    UserCode = 0x20,
+    /// The TSS, a 16-byte descriptor that takes two entries.
+    Tss = 0x28,
+}
 
-const KERNEL_DS: u64 = 0x10;
-const TSS_SELECTOR: u64 = 0x28;
+impl Selector {
+    /// Bytes per GDT entry.
+    const ENTRY_SIZE: usize = 8;
+
+    /// The GDT entry the selector refers to.
+    pub(crate) const fn index(self) -> usize {
+        self as usize / Self::ENTRY_SIZE
+    }
+
+    /// The selector value that requests privilege level `rpl`.
+    pub(crate) const fn with_rpl(self, rpl: PrivilegeLevel) -> u64 {
+        self as u64 | rpl as u64
+    }
+}
+
+/// The kernel's code segment.
+pub(crate) const KERNEL_CS: u64 = Selector::KernelCode.with_rpl(PrivilegeLevel::Kernel);
+/// The kernel's data segment.
+const KERNEL_DS: u64 = Selector::KernelData.with_rpl(PrivilegeLevel::Kernel);
+/// The user code segment, as user mode loads it (RPL 3).
+pub(crate) const USER_CS: u64 = Selector::UserCode.with_rpl(PrivilegeLevel::User);
+/// The user data and stack segment, as user mode loads it (RPL 3).
+pub(crate) const USER_DS: u64 = Selector::UserData.with_rpl(PrivilegeLevel::User);
+
+/// The interrupt-stack-table slot of the double-fault stack (`Tss::ist1`).
+pub(crate) const DOUBLE_FAULT_IST: u8 = 1;
 
 #[repr(C, packed)]
 struct Tss {
@@ -50,7 +95,10 @@ struct Tss {
     io_bitmap_end: u8,
 }
 
-const _: () = assert!(core::mem::offset_of!(Tss, io_bitmap) == 104);
+/// Where the I/O-permission bitmap starts in the TSS (right after the
+/// architectural part, which is 104 bytes).
+const IO_BITMAP_OFFSET: u16 = core::mem::offset_of!(Tss, io_bitmap) as u16;
+const _: () = assert!(IO_BITMAP_OFFSET == 104);
 
 static TSS: Lock<Tss> = Lock::new(Tss {
     _r0: 0,
@@ -61,22 +109,61 @@ static TSS: Lock<Tss> = Lock::new(Tss {
     _ist: [0; 6],
     _r2: 0,
     _r3: 0,
-    iopb: 104, // The offset of `io_bitmap`.
+    iopb: IO_BITMAP_OFFSET,
     io_bitmap: IO_DENY_ALL,
-    io_bitmap_end: 0xFF,
+    io_bitmap_end: DENY_8_PORTS,
 });
 
-static GDT: [AtomicU64; 7] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0x00AF_9A00_0000_FFFF), // Kernel code, 64-bit.
-    AtomicU64::new(0x00CF_9200_0000_FFFF), // Kernel data.
-    AtomicU64::new(0x00CF_F200_0000_FFFF), // User data.
-    AtomicU64::new(0x00AF_FA00_0000_FFFF), // User code, 64-bit.
-    AtomicU64::new(0),                     // TSS (16 bytes, filled in by `init`).
-    AtomicU64::new(0),
-];
+/// The largest segment limit (20 bits), in 4 KiB units with
+/// [`SegmentFlag::Granularity4K`]: the whole address space.
+const MAX_LIMIT: u32 = 0xF_FFFF;
 
-/// Separate stack for double faults (IST 1), used only by the CPU.
+/// A flat code segment (readable) for privilege level `dpl`.
+pub(crate) const fn code_segment(dpl: PrivilegeLevel) -> u64 {
+    let access = SegmentAccess::bits(&[
+        SegmentAccess::Present,
+        SegmentAccess::CodeOrData,
+        SegmentAccess::Executable,
+        SegmentAccess::ReadWrite,
+    ]);
+    let user = match dpl {
+        PrivilegeLevel::Kernel => 0,
+        PrivilegeLevel::User => SegmentAccess::User as u8,
+    };
+    let flags = SegmentFlag::bits(&[SegmentFlag::Granularity4K, SegmentFlag::LongMode]);
+    segment_descriptor(access | user, flags, MAX_LIMIT)
+}
+
+/// A flat data segment (writable) for privilege level `dpl`.
+pub(crate) const fn data_segment(dpl: PrivilegeLevel) -> u64 {
+    let access = SegmentAccess::bits(&[
+        SegmentAccess::Present,
+        SegmentAccess::CodeOrData,
+        SegmentAccess::ReadWrite,
+    ]);
+    let user = match dpl {
+        PrivilegeLevel::Kernel => 0,
+        PrivilegeLevel::User => SegmentAccess::User as u8,
+    };
+    let flags = SegmentFlag::bits(&[SegmentFlag::Granularity4K, SegmentFlag::Size32]);
+    segment_descriptor(access | user, flags, MAX_LIMIT)
+}
+
+/// Entries in the GDT: up to the TSS, which takes two.
+const GDT_ENTRIES: usize = Selector::Tss.index() + 2;
+
+static GDT: [AtomicU64; GDT_ENTRIES] = {
+    let mut gdt = [const { AtomicU64::new(0) }; GDT_ENTRIES];
+    gdt[Selector::Null.index()] = AtomicU64::new(0);
+    gdt[Selector::KernelCode.index()] = AtomicU64::new(code_segment(PrivilegeLevel::Kernel));
+    gdt[Selector::KernelData.index()] = AtomicU64::new(data_segment(PrivilegeLevel::Kernel));
+    gdt[Selector::UserData.index()] = AtomicU64::new(data_segment(PrivilegeLevel::User));
+    gdt[Selector::UserCode.index()] = AtomicU64::new(code_segment(PrivilegeLevel::User));
+    // The TSS is filled in by `init`, when its address is known.
+    gdt
+};
+
+/// Separate stack for double faults ([`DOUBLE_FAULT_IST`]), used only by the CPU.
 #[repr(C, align(16))]
 struct Stack([AtomicU64; 1024]);
 static DOUBLE_FAULT_STACK: Stack = Stack([const { AtomicU64::new(0) }; 1024]);
@@ -95,20 +182,14 @@ pub(crate) fn init() {
     TSS.lock().ist1 = DOUBLE_FAULT_STACK.0.as_ptr() as u64 + size_of::<Stack>() as u64;
 
     let base = TSS.addr();
-    let limit = (size_of::<Tss>() - 1) as u64;
-    GDT[5].store(
-        (limit & 0xFFFF)
-            | ((base & 0xFF_FFFF) << 16)
-            | (0x89u64 << 40) // Present, 64-bit available TSS.
-            | (((limit >> 16) & 0xF) << 48)
-            | (((base >> 24) & 0xFF) << 56),
-        Ordering::Relaxed,
-    );
-    GDT[6].store(base >> 32, Ordering::Relaxed);
+    let limit = (size_of::<Tss>() - 1) as u32;
+    let [low, high] = system_descriptor(SystemSegment::AvailableTss64, base, limit);
+    GDT[Selector::Tss.index()].store(low, Ordering::Relaxed);
+    GDT[Selector::Tss.index() + 1].store(high, Ordering::Relaxed);
     cpu::load_gdt(
         &GDT,
         KERNEL_CS as u16,
         KERNEL_DS as u16,
-        TSS_SELECTOR as u16,
+        Selector::Tss.with_rpl(PrivilegeLevel::Kernel) as u16,
     );
 }

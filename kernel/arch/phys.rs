@@ -17,7 +17,7 @@ pub(crate) const PAGE_SIZE: u64 = 4096;
 pub(crate) const MAX_PHYS: u64 = 1 << 30;
 const FRAMES: usize = (MAX_PHYS / PAGE_SIZE) as usize;
 /// Below 1 MiB: BIOS data, VGA memory, boot-loader scratch space.
-const LOW_MEMORY: u64 = 0x10_0000;
+pub(crate) const LOW_MEMORY: u64 = 0x10_0000;
 
 /// One bit per frame: set = managed.
 static MANAGED: [AtomicU64; FRAMES / 64] = [const { AtomicU64::new(0) }; FRAMES / 64];
