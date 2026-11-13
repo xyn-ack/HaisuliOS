@@ -51,10 +51,12 @@ def test_ctrl_u_kills_the_line(sh):
 
 
 def test_ctrl_c_abandons_the_line(sh):
-    # Ctrl-C discards the line and sends SIGINT to the foreground process group, the shell's:
-    # like a POSIX shell, it survives and shows a new prompt.
     sh.send("echo never\x03")
-    assert sh.expect(PROMPT) == "echo never^C\n" + PROMPT
+    assert sh.expect("^C\n") == "echo never^C\n"
+    # Ctrl-C sends SIGINT to the terminal's foreground process group, which is
+    # the shell's between jobs. The shell ignores the signal, but its read is
+    # interrupted, so it abandons the line and prompts again.
+    assert sh.expect(PROMPT) == PROMPT
     echo, out = sh.run_raw("echo after\r")
     assert (echo, out) == ("echo after", "after\n")
     assert "\nnever\n" not in sh.transcript

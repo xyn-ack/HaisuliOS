@@ -10,6 +10,8 @@ use crate::arch::cpu;
 use crate::arch::entry::{stub_address, ExceptionFrame, EXCEPTION_STUBS};
 use crate::gdt::KERNEL_CS;
 use core::sync::atomic::{AtomicU64, Ordering};
+use haisuli_abi::signal::SIGSEGV;
+use haisuli_abi::wait_status_signalled;
 
 /// 256 gates of 16 bytes (two words each).
 static IDT: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
@@ -72,7 +74,7 @@ pub(crate) extern "C" fn exception_handler(f: &ExceptionFrame) -> ! {
     }
     if from_user {
         // Behave like POSIX SIGSEGV: terminate the process, wait status = 11.
-        crate::process::exit_current(11)
+        crate::process::exit_current(wait_status_signalled(SIGSEGV))
     }
     panic!("unrecoverable exception in kernel mode");
 }

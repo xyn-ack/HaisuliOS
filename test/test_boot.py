@@ -11,7 +11,8 @@ from haisuli import PROMPT, read_rootfs
 def test_kernel_starts_init_and_console_server(sh):
     out = sh.boot_output
     assert out.startswith("HaisuliOS 0.1.0 - x86_64 microkernel\n")
-    assert re.search(r"^\[kernel\] started pid 1 \(init\): \d+ KiB image \+ ramdisk$", out, re.M)
+    # The kernel unpacks the ramdisk into its file system; init is not handed a copy.
+    assert re.search(r"^\[kernel\] started pid 1 \(init\): \d+ KiB image$", out, re.M)
     assert re.search(r"^\[kernel\] started pid 2 \(console\): \d+ KiB image$", out, re.M)
     assert re.search(r'^\[kernel\] ramdisk "initrd.tar": \d+ KiB$', out, re.M)
     assert "[console] serving COM1 (IRQ 4)\n" in out

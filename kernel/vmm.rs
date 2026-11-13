@@ -10,9 +10,10 @@
 //! PML4[0]        kernel: identity map of the first 1 GiB (shared, supervisor only)
 //! PML4[1..256]   user space (private per process, 4 KiB pages only)
 //!
-//! 0x0000_0080_0000_0000  USER_BASE      program image 0x0000_0100_0000_0000  MMAP_BASE
-//! anonymous mmap() region 0x0000_7000_0000_0000  RAMDISK_BASE   boot ramdisk (init only,
-//! read-only) 0x0000_7FFF_FFFF_F000  USER_STACK_TOP (stack grows down) ```
+//! 0x0000_0080_0000_0000  USER_BASE       program image
+//! 0x0000_0100_0000_0000  MMAP_BASE       anonymous mmap() region
+//! 0x0000_7FFF_FFFF_F000  USER_STACK_TOP  (stack grows down)
+//! ```
 //!
 //! Page tables and user pages are allocator frames, read and written through [`crate::arch::phys`].
 //! User memory is only ever reached through the page tables of its address space (never by
@@ -30,7 +31,6 @@ const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 pub(crate) const USER_BASE: u64 = 0x0000_0080_0000_0000;
 pub(crate) const MMAP_BASE: u64 = 0x0000_0100_0000_0000;
-pub(crate) const RAMDISK_BASE: u64 = 0x0000_7000_0000_0000;
 pub(crate) const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
 pub(crate) const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
 
