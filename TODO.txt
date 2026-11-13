@@ -1,0 +1,7 @@
+
+Move to user-space as policy server:
+- fork, exit, wait4, getpid, mmap?
+- file systems?
+- processes?
+
+Split docs. Roadmap moved to TODO. Basic readme
