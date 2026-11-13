@@ -23,11 +23,13 @@ mod arch;
 mod sync;
 
 mod elf;
+mod fs;
 mod gdt;
 mod idt;
 mod irq;
 mod pmm;
 mod process;
+mod signal;
 mod syscall;
 mod vmm;
 

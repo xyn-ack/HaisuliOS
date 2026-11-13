@@ -8,8 +8,9 @@
 //! borrows: a pointer passed to the kernel therefore always comes from a live borrow with its exact
 //! length, and from a `&mut` whenever the kernel (or, for IPC, the server) may write through it.
 
-use crate::abi::signal::{self as sig, SA_RESTORER};
-use crate::abi::{nr, tty, ProcInfo, PR_SET_NAME};
+use crate::abi::fcntl::{F_DUPFD, PATH_MAX};
+use crate::abi::signal::{SA_RESTORER, SIG_DFL, SIG_IGN};
+use crate::abi::{nr, ProcInfo, PROC_INFO_LEN};
 use core::arch::{asm, global_asm};
 
 /// An error number from [`crate::abi::errno`] (positive).
@@ -54,50 +55,70 @@ enum Sys<'a> {
         fd: u64,
         buf: &'a [u8],
     },
+    /// `path` is NUL-terminated.
+    Open {
+        path: &'a [u8],
+        flags: u64,
+    },
+    Close(u64),
+    Dup(u64),
+    Dup2 {
+        fd: u64,
+        newfd: u64,
+    },
+    DupFrom {
+        fd: u64,
+        min: u64,
+    },
+    /// The kernel fills `buf` with directory entries.
+    GetDents {
+        fd: u64,
+        buf: &'a mut [u8],
+    },
     Exit(i32),
-    GetPid,
-    GetPpid,
-    Yield,
     Fork,
-    Wait4 {
-        pid: i32,
+    /// The kernel writes the child's wait status into `status`.
+    Wait {
+        pid: i64,
         status: &'a mut i32,
         options: u64,
     },
     Kill {
-        pid: i32,
-        sig: u32,
+        pid: i64,
+        sig: u64,
     },
-    KillPg {
-        pgrp: i32,
-        sig: u32,
+    KillPgrp {
+        pgid: u64,
+        sig: u64,
     },
     Pause,
-    SetPgid {
-        pid: i32,
-        pgid: i32,
-    },
-    GetPgid(i32),
-    SetSid,
-    GetSid(i32),
+    /// The kernel reads the new disposition from `act` and writes the old one
+    /// to `old`.
     SigAction {
-        sig: u32,
-        act: &'a sig::SigAction,
+        sig: u64,
+        act: &'a KernelSigAction,
+        old: &'a mut KernelSigAction,
     },
+    /// The kernel reads `set` and writes the previous mask to `old`.
     SigProcMask {
         how: u64,
         set: &'a u64,
         old: &'a mut u64,
     },
-    /// The console server only writes `pgrp`.
-    TcGetPgrp(&'a mut i32),
-    /// The console server only reads `pgrp`.
-    TcSetPgrp(&'a i32),
-    SetName(&'a [u8; 16]),
-    ProcInfo {
+    SetPgid {
         pid: u64,
-        buf: &'a mut [u8; ProcInfo::SIZE],
+        pgid: u64,
     },
+    GetPgid(u64),
+    SetSid,
+    GetSid(u64),
+    /// The kernel fills `buf` with serialised `ProcInfo` entries.
+    ProcList {
+        buf: &'a mut [u8],
+    },
+    GetPid,
+    GetPpid,
+    Yield,
     Ioperm {
         from: u64,
         num: u64,
@@ -152,12 +173,18 @@ fn invoke(call: Sys<'_>) -> i64 {
             let (p, l) = ro(buf);
             (nr::WRITE, [fd, p, l, 0])
         }
+        Sys::Open { path, flags } => (nr::OPEN, [ro(path).0, flags, 0o644, 0]),
+        Sys::Close(fd) => (nr::CLOSE, [fd, 0, 0, 0]),
+        Sys::Dup(fd) => (nr::DUP, [fd, 0, 0, 0]),
+        Sys::Dup2 { fd, newfd } => (nr::DUP2, [fd, newfd, 0, 0]),
+        Sys::DupFrom { fd, min } => (nr::FCNTL, [fd, F_DUPFD, min, 0]),
+        Sys::GetDents { fd, buf } => {
+            let (p, l) = rw(buf);
+            (nr::GETDENTS64, [fd, p, l, 0])
+        }
         Sys::Exit(code) => (nr::EXIT, [code as u64, 0, 0, 0]),
-        Sys::GetPid => (nr::GETPID, [0; 4]),
-        Sys::GetPpid => (nr::GETPPID, [0; 4]),
-        Sys::Yield => (nr::SCHED_YIELD, [0; 4]),
         Sys::Fork => (nr::FORK, [0; 4]),
-        Sys::Wait4 {
+        Sys::Wait {
             pid,
             status,
             options,
@@ -165,25 +192,33 @@ fn invoke(call: Sys<'_>) -> i64 {
             nr::WAIT4,
             [pid as u64, status as *mut i32 as u64, options, 0],
         ),
-        Sys::Kill { pid, sig } => (nr::KILL, [pid as u64, sig as u64, 0, 0]),
-        Sys::KillPg { pgrp, sig } => (nr::KILLPG, [pgrp as u64, sig as u64, 0, 0]),
+        Sys::Kill { pid, sig } => (nr::KILL, [pid as u64, sig, 0, 0]),
+        Sys::KillPgrp { pgid, sig } => (nr::KILL_PGRP, [pgid, sig, 0, 0]),
         Sys::Pause => (nr::PAUSE, [0; 4]),
-        Sys::SetPgid { pid, pgid } => (nr::SETPGID, [pid as u64, pgid as u64, 0, 0]),
-        Sys::GetPgid(pid) => (nr::GETPGID, [pid as u64, 0, 0, 0]),
-        Sys::SetSid => (nr::SETSID, [0; 4]),
-        Sys::GetSid(pid) => (nr::GETSID, [pid as u64, 0, 0, 0]),
-        Sys::SigAction { sig, act } => (
+        Sys::SigAction { sig, act, old } => (
             nr::RT_SIGACTION,
-            [sig as u64, act as *const sig::SigAction as u64, 0, 8],
+            [
+                sig,
+                act as *const KernelSigAction as u64,
+                old as *mut KernelSigAction as u64,
+                8,
+            ],
         ),
         Sys::SigProcMask { how, set, old } => (
             nr::RT_SIGPROCMASK,
             [how, set as *const u64 as u64, old as *mut u64 as u64, 8],
         ),
-        Sys::TcGetPgrp(pgrp) => (nr::IOCTL, [0, tty::TIOCGPGRP, pgrp as *mut i32 as u64, 0]),
-        Sys::TcSetPgrp(pgrp) => (nr::IOCTL, [0, tty::TIOCSPGRP, pgrp as *const i32 as u64, 0]),
-        Sys::SetName(name) => (nr::PRCTL, [PR_SET_NAME, name.as_ptr() as u64, 0, 0]),
-        Sys::ProcInfo { pid, buf } => (nr::PROC_INFO, [pid, buf.as_mut_ptr() as u64, 0, 0]),
+        Sys::SetPgid { pid, pgid } => (nr::SETPGID, [pid, pgid, 0, 0]),
+        Sys::GetPgid(pid) => (nr::GETPGID, [pid, 0, 0, 0]),
+        Sys::SetSid => (nr::SETSID, [0; 4]),
+        Sys::GetSid(pid) => (nr::GETSID, [pid, 0, 0, 0]),
+        Sys::ProcList { buf } => {
+            let (p, l) = rw(buf);
+            (nr::PROC_LIST, [p, l, 0, 0])
+        }
+        Sys::GetPid => (nr::GETPID, [0; 4]),
+        Sys::GetPpid => (nr::GETPPID, [0; 4]),
+        Sys::Yield => (nr::SCHED_YIELD, [0; 4]),
         Sys::Ioperm { from, num, on } => (nr::IOPERM, [from, num, on as u64, 0]),
         Sys::IpcSend { dest, a, b } => (nr::IPC_SEND, [dest, a, b, 0]),
         Sys::IpcRecv(m) => (nr::IPC_RECV, [m as *mut Message as u64, 0, 0, 0]),
@@ -220,10 +255,8 @@ fn invoke(call: Sys<'_>) -> i64 {
     // SAFETY: Every pointer in `args` was taken from a borrow in `call`,
     // which lives until this function returns, with its exact length; it is
     // a `&mut` borrow wherever the kernel or a server can write memory (see
-    // `Sys`; for `Write` and `TcSetPgrp` the kernel itself forbids the server
-    // to write). The remaining calls take no pointers. `Fork` returns twice,
-    // but in two separate address spaces, each continuing with its own copy
-    // of every borrow.
+    // `Sys`; for `Write` the kernel itself forbids the server to write). The
+    // remaining calls take no pointers.
     unsafe { syscall(n, args[0], args[1], args[2], args[3], 0, 0) }
 }
 
@@ -247,10 +280,283 @@ pub fn write(fd: u64, buf: &[u8]) -> Result<usize> {
     check(invoke(Sys::Write { fd, buf })).map(|n| n as usize)
 }
 
+/// Opens the file at `path` with `O_*` flags ([`crate::abi::fcntl`]) and
+/// returns its file descriptor.
+pub fn open(path: &str, flags: u64) -> Result<u64> {
+    // The kernel wants a NUL-terminated path.
+    let mut buf = [0u8; 2 * PATH_MAX + 1];
+    if path.len() >= buf.len() || path.as_bytes().contains(&0) {
+        return Err(Errno(crate::abi::errno::ENAMETOOLONG));
+    }
+    buf[..path.len()].copy_from_slice(path.as_bytes());
+    check(invoke(Sys::Open {
+        path: &buf[..=path.len()],
+        flags,
+    }))
+}
+
+/// Closes file descriptor `fd`.
+pub fn close(fd: u64) -> Result<()> {
+    check(invoke(Sys::Close(fd))).map(drop)
+}
+
+/// Duplicates `fd` onto the lowest free descriptor, and returns that.
+pub fn dup(fd: u64) -> Result<u64> {
+    check(invoke(Sys::Dup(fd)))
+}
+
+/// Duplicates `fd` onto the lowest free descriptor that is at least `min`
+/// (`fcntl(fd, F_DUPFD, min)`), and returns that.
+pub fn dup_from(fd: u64, min: u64) -> Result<u64> {
+    check(invoke(Sys::DupFrom { fd, min }))
+}
+
+/// Makes `newfd` a copy of `fd` (closing whatever `newfd` was first).
+pub fn dup2(fd: u64, newfd: u64) -> Result<u64> {
+    check(invoke(Sys::Dup2 { fd, newfd }))
+}
+
+/// Fills `buf` with directory entries of directory `fd` and returns how many
+/// bytes it used (0 at the end); see [`DirEntries`] to walk them.
+pub fn getdents(fd: u64, buf: &mut [u8]) -> Result<usize> {
+    check(invoke(Sys::GetDents { fd, buf })).map(|n| n as usize)
+}
+
+/// The entries in a buffer that [`getdents`] filled: `(name, is_directory)`.
+pub struct DirEntries<'a> {
+    buf: &'a [u8],
+}
+
+impl<'a> DirEntries<'a> {
+    /// Walks the entries in `buf` (the bytes `getdents` reported).
+    pub fn new(buf: &'a [u8]) -> Self {
+        DirEntries { buf }
+    }
+}
+
+impl<'a> Iterator for DirEntries<'a> {
+    type Item = (&'a [u8], bool);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use crate::abi::fcntl::{DIRENT_HEADER, DT_DIR};
+        let header = self.buf.get(..DIRENT_HEADER)?;
+        let reclen = u16::from_ne_bytes([header[16], header[17]]) as usize;
+        let record = self.buf.get(..reclen).filter(|_| reclen > DIRENT_HEADER)?;
+        self.buf = &self.buf[reclen..];
+        let name = &record[DIRENT_HEADER..];
+        let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+        Some((name, header[18] == DT_DIR))
+    }
+}
+
 /// Terminates the calling process with exit status `code`.
 pub fn exit(code: i32) -> ! {
     invoke(Sys::Exit(code));
     unreachable!("exit returned")
+}
+
+/// Creates a child process; it returns 0, the parent the child's pid.
+///
+/// The child is a copy of the caller: same memory, same process group and
+/// session, and the same ignored signals.
+pub fn fork() -> Result<u64> {
+    check(invoke(Sys::Fork))
+}
+
+/// Waits for a child to exit and reaps it, returning its pid and wait status.
+///
+/// `pid` selects the children to wait for as POSIX does: that pid, -1 for any
+/// child, 0 for the caller's process group, below -1 for a process group.
+/// Fails with `ECHILD` if there is no such child (including one that has
+/// already been waited for).
+pub fn waitpid(pid: i64, options: u64) -> Result<(u64, WaitStatus)> {
+    let mut status = 0;
+    let reaped = check(invoke(Sys::Wait {
+        pid,
+        status: &mut status,
+        options,
+    }))?;
+    Ok((reaped, WaitStatus(status)))
+}
+
+/// Sends signal `sig` to a process (`pid` > 0), a process group (`pid` < 0) or
+/// the caller's own group (`pid` == 0).
+///
+/// Signal 0 only checks whether a target exists.
+pub fn kill(pid: i64, sig: u64) -> Result<()> {
+    check(invoke(Sys::Kill { pid, sig })).map(drop)
+}
+
+/// Sends signal `sig` to every process in group `pgid`, including group 1.
+///
+/// `kill(-pgid, sig)` means the same, except for group 1: `kill(-1)` is the
+/// POSIX broadcast to every process.
+pub fn kill_pgrp(pgid: u64, sig: u64) -> Result<()> {
+    check(invoke(Sys::KillPgrp { pgid, sig })).map(drop)
+}
+
+/// Sleeps until a signal arrives.
+///
+/// Returns `EINTR` after a signal handler has run. A signal whose default
+/// action applies terminates or stops the process instead.
+pub fn pause() -> Errno {
+    Errno(-invoke(Sys::Pause))
+}
+
+/// A Linux `struct sigaction`, as the kernel reads and writes it.
+#[repr(C)]
+#[derive(Default)]
+struct KernelSigAction {
+    handler: u64,
+    flags: u64,
+    restorer: u64,
+    mask: u64,
+}
+
+/// What a process does with a signal.
+#[derive(Clone, Copy, Debug)]
+pub enum SigHandler {
+    /// The signal's default action.
+    Default,
+    /// Discard the signal.
+    Ignore,
+    /// Call this function with the signal number.
+    ///
+    /// A handler interrupts the process at the end of a system call, so it
+    /// should only touch atomics (e.g. set a flag that the program checks).
+    Catch(extern "C" fn(i32)),
+}
+
+/// Sets what happens when the process receives `sig`, and returns the previous disposition.
+///
+/// `flags` takes `SA_RESTART`, `SA_NODEFER` and `SA_RESETHAND`
+/// ([`crate::abi::signal`]); `mask` is the set of signals (bits from
+/// [`crate::abi::signal::bit`]) to block while the handler runs. The runtime
+/// supplies the restorer that returns from a handler.
+pub fn sigaction(sig: u64, handler: SigHandler, flags: u64, mask: u64) -> Result<SigHandler> {
+    let act = match handler {
+        SigHandler::Default => KernelSigAction {
+            handler: SIG_DFL,
+            ..KernelSigAction::default()
+        },
+        SigHandler::Ignore => KernelSigAction {
+            handler: SIG_IGN,
+            ..KernelSigAction::default()
+        },
+        SigHandler::Catch(f) => KernelSigAction {
+            handler: f as usize as u64,
+            flags: flags | SA_RESTORER,
+            restorer: __haisuli_sigreturn as *const () as usize as u64,
+            mask,
+        },
+    };
+    let mut old = KernelSigAction::default();
+    check(invoke(Sys::SigAction {
+        sig,
+        act: &act,
+        old: &mut old,
+    }))?;
+    Ok(match old.handler {
+        SIG_DFL => SigHandler::Default,
+        SIG_IGN => SigHandler::Ignore,
+        // Only this runtime installs handlers, and only `extern "C" fn(i32)`s.
+        _ => SigHandler::Default,
+    })
+}
+
+/// Changes the blocked signals and returns the previous set.
+///
+/// `how` is `SIG_BLOCK`, `SIG_UNBLOCK` or `SIG_SETMASK`; sets use the bits of
+/// [`crate::abi::signal::bit`]. SIGKILL and SIGSTOP cannot be blocked.
+pub fn sigprocmask(how: u64, set: u64) -> Result<u64> {
+    let mut old = 0;
+    check(invoke(Sys::SigProcMask {
+        how,
+        set: &set,
+        old: &mut old,
+    }))?;
+    Ok(old)
+}
+
+// Where every signal handler returns to: the kernel's signal frame has this
+// address as the handler's return address, and `rt_sigreturn` restores the
+// interrupted context from the rest of the frame (it never returns here).
+global_asm!(
+    ".pushsection .text.__haisuli_sigreturn, \"ax\"",
+    ".global __haisuli_sigreturn",
+    "__haisuli_sigreturn:",
+    "    mov eax, {nr}",
+    "    syscall",
+    "    ud2",
+    ".popsection",
+    nr = const nr::RT_SIGRETURN,
+);
+
+extern "C" {
+    /// The restorer of every handler that [`sigaction`] installs (only its
+    /// address is used; it is never called from Rust).
+    fn __haisuli_sigreturn();
+}
+
+/// Puts process `pid` (0 = the caller) into process group `pgid` (0 = `pid`).
+pub fn setpgid(pid: u64, pgid: u64) -> Result<()> {
+    check(invoke(Sys::SetPgid { pid, pgid })).map(drop)
+}
+
+/// Returns the process group of `pid` (0 = the caller).
+pub fn getpgid(pid: u64) -> Result<u64> {
+    check(invoke(Sys::GetPgid(pid)))
+}
+
+/// Makes the caller the leader of a new session and process group.
+pub fn setsid() -> Result<u64> {
+    check(invoke(Sys::SetSid))
+}
+
+/// Returns the session of `pid` (0 = the caller).
+pub fn getsid(pid: u64) -> Result<u64> {
+    check(invoke(Sys::GetSid(pid)))
+}
+
+/// Lists the processes of the system into `out`, returning how many it wrote.
+pub fn proc_list(out: &mut [ProcInfo]) -> Result<usize> {
+    let mut buf = [0u8; PROC_INFO_LEN * 16];
+    let len = (out.len() * PROC_INFO_LEN).min(buf.len());
+    let n = check(invoke(Sys::ProcList {
+        buf: &mut buf[..len],
+    }))? as usize;
+    for (i, entry) in out.iter_mut().enumerate().take(n) {
+        let mut one = [0u8; PROC_INFO_LEN];
+        one.copy_from_slice(&buf[i * PROC_INFO_LEN..(i + 1) * PROC_INFO_LEN]);
+        *entry = ProcInfo::from_bytes(&one);
+    }
+    Ok(n)
+}
+
+/// The POSIX wait status of a process that has exited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitStatus(pub i32);
+
+impl WaitStatus {
+    /// The signal that killed the process, if one did.
+    pub fn signal(self) -> Option<u64> {
+        let sig = self.0 & 0x7F;
+        (sig != 0).then_some(sig as u64)
+    }
+
+    /// The status the process exited with, if it was not killed.
+    pub fn exit_code(self) -> Option<i32> {
+        self.signal().is_none().then_some((self.0 >> 8) & 0xFF)
+    }
+
+    /// The status a shell reports in `$?`: 128 + n for a process killed by
+    /// signal n, as POSIX requires.
+    pub fn shell_status(self) -> i32 {
+        match self.signal() {
+            Some(sig) => 128 + sig as i32,
+            None => (self.0 >> 8) & 0xFF,
+        }
+    }
 }
 
 /// Returns the calling process's id.
@@ -266,164 +572,6 @@ pub fn getppid() -> u64 {
 /// Lets the other ready processes run.
 pub fn sched_yield() {
     invoke(Sys::Yield);
-}
-
-// ---- Processes, process groups and sessions ----
-
-/// Creates a copy of the calling process; returns the child's pid, and 0 in the child.
-///
-/// The child has the same memory contents, process group, session, signal actions and blocked
-/// signals, but no pending signals.
-pub fn fork() -> Result<u64> {
-    check(invoke(Sys::Fork))
-}
-
-/// Waits for a child to change state (`wait4` / `waitpid`).
-///
-/// `pid` > 0 selects that child, -1 any child, 0 any child in the caller's process group and
-/// < -1 any child in process group `-pid`. `options` are [`abi::wait`](crate::abi::wait) flags.
-/// Returns the child's pid and wait status, or `None` with `WNOHANG` if no child is ready.
-pub fn waitpid(pid: i32, options: u64) -> Result<Option<(u64, i32)>> {
-    let mut status = 0;
-    let pid = check(invoke(Sys::Wait4 {
-        pid,
-        status: &mut status,
-        options,
-    }))?;
-    Ok((pid != 0).then_some((pid, status)))
-}
-
-/// Sends signal `sig` (0: only check) to process `pid`, or to a process group (see `nr::KILL`).
-pub fn kill(pid: i32, sig: u32) -> Result<()> {
-    check(invoke(Sys::Kill { pid, sig })).map(drop)
-}
-
-/// Sends signal `sig` to every process in process group `pgrp`, which may be 1 (unlike `kill`).
-pub fn killpg(pgrp: u64, sig: u32) -> Result<()> {
-    check(invoke(Sys::KillPg {
-        pgrp: pgrp as i32,
-        sig,
-    }))
-    .map(drop)
-}
-
-/// Waits until a signal handler has run; returns the error (always `EINTR`).
-pub fn pause() -> Errno {
-    Errno(-invoke(Sys::Pause))
-}
-
-/// Moves process `pid` (0: the caller) into process group `pgid` (0: `pid`).
-pub fn setpgid(pid: i32, pgid: i32) -> Result<()> {
-    check(invoke(Sys::SetPgid { pid, pgid })).map(drop)
-}
-
-/// Returns the process group id of `pid` (0: the caller).
-pub fn getpgid(pid: i32) -> Result<u64> {
-    check(invoke(Sys::GetPgid(pid)))
-}
-
-/// Makes the caller the leader of a new session and process group; returns the session id.
-pub fn setsid() -> Result<u64> {
-    check(invoke(Sys::SetSid))
-}
-
-/// Returns the session id of `pid` (0: the caller).
-pub fn getsid(pid: i32) -> Result<u64> {
-    check(invoke(Sys::GetSid(pid)))
-}
-
-/// Sets the calling process's name (as `ps` shows it); at most 15 bytes are kept.
-pub fn set_name(name: &str) {
-    let mut buf = [0u8; 16];
-    let n = name.len().min(15);
-    buf[..n].copy_from_slice(&name.as_bytes()[..n]);
-    invoke(Sys::SetName(&buf));
-}
-
-/// Describes the process with the lowest pid >= `pid`, for listing processes.
-pub fn proc_info(pid: u64) -> Result<ProcInfo> {
-    let mut buf = [0u8; ProcInfo::SIZE];
-    check(invoke(Sys::ProcInfo { pid, buf: &mut buf }))?;
-    Ok(ProcInfo::from_bytes(&buf))
-}
-
-// ---- Signals ----
-
-/// What to do with a signal.
-#[derive(Clone, Copy)]
-pub enum Handler {
-    /// The default action.
-    Default,
-    /// Ignore it.
-    Ignore,
-    /// Call this function with the signal number.
-    ///
-    /// Handlers run only when the process is about to return from a system call, never in the
-    /// middle of other code, so they may use atomics to talk to the rest of the program.
-    Catch(extern "C" fn(i32)),
-}
-
-// The restorer: where handlers return to. `rt_sigreturn` restores the state from before the
-// handler, so this never returns.
-global_asm!(
-    ".pushsection .text.__haisuli_sigreturn, \"ax\"",
-    ".global __haisuli_sigreturn",
-    "__haisuli_sigreturn:",
-    "    mov eax, {nr}",
-    "    syscall",
-    "    ud2",
-    ".popsection",
-    nr = const nr::RT_SIGRETURN,
-);
-
-extern "C" {
-    fn __haisuli_sigreturn();
-}
-
-/// Sets the action for signal `sig`.
-///
-/// `flags` are `SA_*` flags from [`abi::signal`](crate::abi::signal) (the runtime adds
-/// `SA_RESTORER`), and `mask` the signals to block while a handler runs.
-pub fn sigaction(sig: u32, handler: Handler, flags: u64, mask: u64) -> Result<()> {
-    let act = sig::SigAction {
-        handler: match handler {
-            Handler::Default => sig::SIG_DFL,
-            Handler::Ignore => sig::SIG_IGN,
-            Handler::Catch(f) => f as *const () as u64,
-        },
-        flags: flags | SA_RESTORER,
-        restorer: __haisuli_sigreturn as *const () as u64,
-        mask,
-    };
-    check(invoke(Sys::SigAction { sig, act: &act })).map(drop)
-}
-
-/// Changes the blocked signals (`how` is `SIG_BLOCK`, `SIG_UNBLOCK` or `SIG_SETMASK`) and
-/// returns the previous set.
-pub fn sigprocmask(how: u64, set: u64) -> Result<u64> {
-    let mut old = 0;
-    check(invoke(Sys::SigProcMask {
-        how,
-        set: &set,
-        old: &mut old,
-    }))?;
-    Ok(old)
-}
-
-// ---- Terminal ----
-
-/// Returns the terminal's foreground process group (`tcgetpgrp`; 0 if there is none).
-pub fn tcgetpgrp() -> Result<u64> {
-    let mut pgrp = 0;
-    check(invoke(Sys::TcGetPgrp(&mut pgrp)))?;
-    Ok(pgrp as u64)
-}
-
-/// Makes process group `pgrp` the terminal's foreground process group (`tcsetpgrp`).
-///
-/// Ctrl-C then sends `SIGINT` to that group.
-pub fn tcsetpgrp(pgrp: u64) -> Result<()> {
-    check(invoke(Sys::TcSetPgrp(&(pgrp as i32)))).map(drop)
 }
 
 /// Grants (or revokes) access to I/O ports `[from, from + num)`.

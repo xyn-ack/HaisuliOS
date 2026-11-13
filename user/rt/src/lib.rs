@@ -15,21 +15,20 @@ pub use haisuli_abi as abi;
 pub mod io;
 pub mod sys;
 
-/// What the kernel hands a new boot process (in `rdi` / `rsi`).
-pub struct StartInfo {
-    /// The boot ramdisk (a ustar archive), mapped read-only.
-    ///
-    /// Only init gets one; it is empty for every other process.
-    pub ramdisk: &'static [u8],
-}
+/// What a new program is started with.
+///
+/// Nothing yet: the boot ramdisk, which init used to get here, is now in the
+/// kernel's file system. It is the place for arguments once there is `exec`.
+#[non_exhaustive]
+pub struct StartInfo {}
 
 /// Define the program's entry point: `entry!(main)` with
 /// `fn main(info: StartInfo) -> i32`; the return value is the exit status.
 ///
 /// The expansion contains no unsafe blocks, only the `_start` assembly: it
 /// sets up a proper SysV call frame (the kernel starts us with an aligned
-/// stack and no return address) and passes the kernel's registers and the
-/// address of `main` to `__start`.
+/// stack and no return address) and passes the address of `main` to
+/// `__start`.
 #[macro_export]
 macro_rules! entry {
     ($main:path) => {
@@ -42,7 +41,7 @@ macro_rules! entry {
             "_start:",
             "    xor ebp, ebp",
             "    and rsp, -16",
-            "    lea rdx, [rip + {main}]",
+            "    lea rdi, [rip + {main}]",
             "    call {start}",
             "    ud2",
             ".popsection",
@@ -53,24 +52,13 @@ macro_rules! entry {
 }
 
 /// Runtime entry, called only by the `_start` that `entry!` defines.
-///
-/// # Safety
-/// `base`/`len` must be the ramdisk registers the kernel passed to the new
-/// process (0/0 or memory mapped for the whole program run), and `main` must
-/// be a function of the stated type.
 #[doc(hidden)]
 // `main` is a Rust function called by Rust code below; the assembly only
-// passes its address through (a pointer-sized, non-null value).
+// passes its address through (a pointer-sized, non-null value), and `entry!`
+// checks its type at compile time.
 #[expect(improper_ctypes_definitions)]
-pub unsafe extern "C" fn __start(base: u64, len: u64, main: fn(StartInfo) -> i32) -> ! {
-    let ramdisk = if base == 0 || len == 0 {
-        &[][..]
-    } else {
-        // SAFETY: Per this function's contract, the kernel mapped `len`
-        // read-only bytes at `base` for the lifetime of the process.
-        unsafe { core::slice::from_raw_parts(base as *const u8, len as usize) }
-    };
-    sys::exit(main(StartInfo { ramdisk }))
+pub extern "C" fn __start(main: fn(StartInfo) -> i32) -> ! {
+    sys::exit(main(StartInfo {}))
 }
 
 /// Panics are reported on the kernel debug log, which works even when the

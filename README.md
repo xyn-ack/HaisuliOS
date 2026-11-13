@@ -4,36 +4,30 @@ A tiny, bare-bones **microkernel** for **x86_64**, written in **Rust**, with a
 **POSIX-flavoured** syscall ABI. No external crates, no bootloader crate, no
 nightly features: just `core`, inline assembly, and a Multiboot v1 header.
 
-> Status: v0.1. It provides virtual memory, processes with POSIX signals,
-> process groups, sessions and `waitpid` semantics, IPC and user-space
-> drivers, and boots into a job control shell on a console served by a
-> user-space console server. It is **not** yet a POSIX system (no `exec`,
-> no files).
+> Status: v0.1. It provides virtual memory, processes, signals with POSIX job
+> control, IPC and user-space drivers, and boots into an interactive console
+> served by a user-space console server. It is **not** yet a full POSIX system:
+> there is no `execve` and no libc, and the file system is a RAM disk.
 
 ## What the kernel does (and deliberately doesn't)
 
 | In the kernel (mechanism)                             | In user space (policy)                      |
 |-------------------------------------------------------|---------------------------------------------|
-| Physical memory manager (bitmap frame allocator)      | **Console server**: COM1 driver + line discipline + controlling terminal (`user/console`) |
-| Virtual memory: 4-level paging, per-process spaces    | **init**: motd + a job control shell (`user/init`) |
-| Processes, kernel stacks, context switch, scheduler   | Job control: foreground process group, Ctrl-C -> `SIGINT` (console server) |
-| `fork`, `exit`, `wait4`, `getpid`, `mmap` (anon)      | Jobs, `kill`, `wait`, `ps`, `$?` (init)     |
-| POSIX signals, process groups, sessions (`process/`)  | Planned: VFS + file system servers          |
+| Physical memory manager (bitmap frame allocator)      | **Console server**: COM1 driver, line discipline and the job control terminal (`user/console`) |
+| Virtual memory: 4-level paging, per-process spaces    | **init**: motd, then a job control shell (`user/init`) |
+| Processes, kernel stacks, context switch, scheduler   | Job control policy: who is in the foreground, what Ctrl-C means |
+| `fork`, `exit`, `wait4`, `getpid`, `mmap` (anon)      | Planned: VFS + file system servers          |
+| RAM file system (the unpacked ramdisk), file descriptors | Shell redirections (`>`, `>>`, `<`, `2>&1`) |
+| Signals, process groups and sessions, stop/continue   | Planned: libc (musl port) on the ABI        |
 | IPC: async notifications + synchronous calls with data transfer | Planned: more device drivers      |
-| IRQ forwarding, per-process I/O-port permissions      | Planned: libc (musl port) on the ABI        |
+| IRQ forwarding, per-process I/O-port permissions      |                                             |
 | ELF loader for boot modules; well-known service registry |                                          |
 | Exceptions -> fault handling (SIGSEGV-style kill)     |                                             |
 
 The kernel contains no device drivers apart from a write-only debug log on
-COM1. `read(0)`, `write(1|2)` and the terminal `ioctl`s keep their Linux
-syscall numbers, but the kernel only forwards them, as IPC calls, to
-whichever process registered as the console service.
-
-Signals, process groups and sessions are kernel mechanisms because they need
-the scheduler and the user registers: stopping a process, interrupting a
-blocked call with `EINTR`, running a handler. What the keyboard means
-(Ctrl-C is `SIGINT` for the foreground process group) and what a job is are
-policy, in the console server and the shell. See [Processes and signals](#processes-and-signals).
+COM1. A process's file descriptors refer to files in the kernel's RAM file
+system or to the terminal; `read` and `write` on the terminal are forwarded,
+as IPC calls, to whichever process registered as the console service.
 
 ## Layout
 
@@ -54,16 +48,18 @@ kernel/            the kernel
   pmm.rs           Physical frame allocator (Multiboot memory map)
   vmm.rs           Paging: map, translate, clone (fork), destroy, user-memory copies
   elf.rs           ELF64 loader for user programs
-  process.rs       Process table, scheduler, fork/exit/wait, mmap, IPC, services
-  process/
-    signal.rs      signals: generation, delivery, handler frames, kill, sigaction
-    group.rs       process groups, sessions, process names, process listing (ps)
+  fs.rs            RAM file system (the unpacked ramdisk), open file descriptions
+  process.rs       Process table, scheduler, fork/exit/wait, signals, mmap, IPC, services
+  signal.rs        Dispositions, default actions, signal sets, the signal frame
   syscall.rs       Syscall dispatcher (Linux-compatible numbers)
   serial.rs        COM1 kernel debug log, print!/println!
 abi/               syscall numbers, errno values, IPC protocols (kernel + user)
 user/rt/           user runtime: entry point, syscall wrappers, print!, panics
 user/console/      console server
-user/init/         init (pid 1): /etc/motd, then a job control shell (jobs.rs, signals.rs)
+user/init/         init (pid 1): /etc/motd, then a job control shell
+  src/words.rs     command line words: quotes, `$?`, `&`, redirection operators
+  src/redirect.rs  applying (and undoing) redirections
+  src/traps.rs     the shell's signal handling and `trap`
 user/user.ld       linker script for user programs
 rootfs/            contents of the boot ramdisk (rootfs/etc/motd = /etc/motd)
 test/              tests (see below)
@@ -107,9 +103,9 @@ The boot loader loads the kernel and a list of **boot modules**. Every module
 that is an ELF file is started as a process, in order. The first becomes
 pid 1 (init). Boot-module processes are *privileged*: they may use `ioperm`,
 `irq_bind` and `svc_register`. Their forked children are not privileged.
-A module that is not an ELF file is the **ramdisk**, a ustar archive that is
-mapped read-only into init (address and size in `rdi`/`rsi`). There is no file
-system server yet, so init reads `/etc/motd` from the archive itself.
+A module that is not an ELF file is the **ramdisk**, a ustar archive: the
+kernel unpacks it into its RAM file system (see *Files* below), so `/etc/motd`
+is an ordinary file that init opens.
 
 When init exits, the kernel powers the machine off.
 
@@ -120,7 +116,6 @@ PML4[0]       kernel: identity map of first 1 GiB (shared, supervisor-only)
 PML4[1..256]  user (private):
   0x0000_0080_0000_0000  program image   (ELF segments: R-X / R-- / RW-)
   0x0000_0100_0000_0000  mmap() region   (RW-, NX unless PROT_EXEC)
-  0x0000_7000_0000_0000  boot ramdisk    (R--, init only)
   0x0000_7FFF_FFFF_F000  top of stack    (RW-, NX, 32 KiB, grows down)
 ```
 
@@ -136,28 +131,31 @@ All numbers and constants live in `abi/src/lib.rs`.
 
 | Nr     | Call                              | Notes                                                   |
 |--------|-----------------------------------|---------------------------------------------------------|
-| 0      | `read(0,buf,len)`                 | forwarded to the console server (one line per read)     |
-| 1      | `write(fd,buf,len)`               | fd 1/2, forwarded to the console server                 |
+| 0      | `read(fd,buf,len)`                | a file, or the terminal (one line per read)             |
+| 1      | `write(fd,buf,len)`               | a file, or the terminal                                 |
+| 2      | `open(path,flags,mode)`           | `O_CREAT`/`EXCL`/`TRUNC`/`APPEND`/`DIRECTORY`; no modes |
+| 3      | `close(fd)`                       |                                                         |
 | 9      | `mmap(_,len,prot,...)`            | anonymous only; kernel chooses the address              |
-| 13     | `rt_sigaction(sig,act,old,8)`     | Linux `struct kernel_sigaction`; `SA_RESTART` etc.      |
-| 14     | `rt_sigprocmask(how,set,old,8)`   | `SIGKILL`/`SIGSTOP` cannot be blocked                   |
-| 15     | `rt_sigreturn()`                  | only for the handler's restorer                         |
-| 16     | `ioctl(fd,req,arg)`               | fd 0-2: `TIOCGPGRP`/`TIOCSPGRP`, forwarded to the console |
+| 13     | `rt_sigaction(sig,act,old,sz)`    | Linux `struct sigaction`; a handler needs `SA_RESTORER` |
+| 14     | `rt_sigprocmask(how,set,old,sz)`  | `SIG_BLOCK` / `SIG_UNBLOCK` / `SIG_SETMASK`             |
+| 15     | `rt_sigreturn()`                  | from a handler's restorer; restores the saved context   |
 | 24     | `sched_yield()`                   |                                                         |
-| 34     | `pause()`                         | until a handler has run; always `-EINTR`                |
+| 32     | `dup(fd)`                         | lowest free descriptor; shares the open file description |
+| 33     | `dup2(fd,newfd)`                  |                                                         |
+| 34     | `pause()`                         | sleeps until a signal; `-EINTR` after a handler ran     |
 | 39     | `getpid()`                        |                                                         |
 | 57     | `fork()`                          | eager copy; child returns 0; privileges not inherited   |
 | 60     | `exit(code)`                      |                                                         |
-| 61     | `wait4(pid,&st,opt,_)`            | pid/-1/0/-pgid; `WNOHANG WUNTRACED WCONTINUED`          |
-| 62     | `kill(pid,sig)`                   | pid/0/-1/-pgid; sig 0 only checks                       |
-| 109    | `setpgid(pid,pgid)`               | caller or a child in its session                        |
+| 61     | `wait4(pid,&st,opts,..)`          | `pid`/-1/0/-pgid, `WNOHANG`; POSIX wait-status encoding |
+| 62     | `kill(pid,sig)`                   | process, group (`pid` < 0) or existence check (`sig` 0) |
+| 72     | `fcntl(fd,cmd,arg)`               | `F_DUPFD` only                                          |
+| 109    | `setpgid(pid,pgid)`               | caller or a child; not a session leader                 |
 | 110    | `getppid()`                       |                                                         |
-| 111    | `getpgrp()`                       |                                                         |
-| 112    | `setsid()`                        | `-EPERM` for a process group leader                     |
+| 112    | `setsid()`                        | new session and process group                           |
 | 121    | `getpgid(pid)`                    |                                                         |
 | 124    | `getsid(pid)`                     |                                                         |
-| 157    | `prctl(PR_SET_NAME/PR_GET_NAME,name)` | the name `ps` and the kernel log show               |
 | 173    | `ioperm(from,num,on)`             | privileged; ports `0..0x400` only                       |
+| 217    | `getdents64(fd,buf,len)`          | Linux `struct linux_dirent64` records                   |
 | 0x1000 | `ipc_send(pid,a,b)`               | async; non-blocking; `-EAGAIN` if mailbox (8) is full   |
 | 0x1001 | `ipc_recv(&[u64;3])`              | blocking; `[sender, a, b]` (see below)                  |
 | 0x1002 | `ipc_call(pid,op,buf,len)`        | synchronous; blocks until the server replies            |
@@ -169,89 +167,132 @@ All numbers and constants live in `abi/src/lib.rs`.
 | 0x1008 | `svc_register(id)`                | privileged; become a well-known service (1 = console)   |
 | 0x1009 | `svc_lookup(id)`                  | pid of a registered service                             |
 | 0x100A | `debug_log(buf,len)`              | kernel debug log; never blocks (used for panics)        |
-| 0x100B | `proc_info(pid,buf)`              | the process with the lowest pid >= `pid` (for `ps`)     |
-| 0x100C | `killpg(pgrp,sig)`                | like `kill(-pgrp)`, but also for process group 1         |
+| 0x100B | `proc_list(buf,len)`              | one `ProcInfo` per process; `ps` is built on it         |
+| 0x100C | `kill_pgrp(pgid,sig)`             | signal a process group, also group 1 (for the terminal) |
 
 `ipc_recv` delivers, in order: IRQ notifications `[0, KMSG_IRQ, line]`
 (sender 0 is the kernel and cannot be forged), mailbox messages, then the
 oldest pending call `[client, op, len]`. A server may keep a call pending,
 without replying, for as long as it likes. The console server does this for
 `read` until a full line has been typed. If a server exits, its clients'
-calls fail with `-EPIPE`. If a signal interrupts a client, its call is
-cancelled and fails with `-EINTR`: the server can no longer reply to it or
-transfer data.
+calls fail with `-EPIPE`.
 
 While a call is pending, the server can only reach the client's buffer
 through `ipc_read` / `ipc_write`, and the kernel limits even that to what the
 call allows. An explicit `ipc_call` lets the server read and write the
-buffer. For the `write(1|2)` and `read(0)` calls it forwards, the kernel lets
-the console server only *read* a `write()` buffer and only *write* a
+buffer. For the terminal `write` and `read` calls it forwards, the kernel
+lets the console server only *read* a `write()` buffer and only *write* a
 `read()` buffer. Anything else fails with `-EACCES`, so not even a buggy or
 malicious console server can modify memory that a writer only lent it, or
 see what a reader's buffer held before.
+
+### Files
+
+The kernel keeps a small RAM file system, filled at boot from the boot
+ramdisk and writable from then on, like Linux's initramfs: up to 64 files and
+directories, of up to 64 KiB each, in page frames from the frame allocator.
+Paths are normalised (`//`, `.` and `..`), and there is no current directory,
+so a relative path starts at the root. Files can be created (in an existing
+directory), written, appended to and truncated; there is no `unlink`,
+`mkdir` or `lseek` yet.
+
+File descriptors follow POSIX. Each process has 16, which refer to *open file
+descriptions* (a file, an offset and an access mode) in a table of 64 shared
+by the whole system. `dup`, `dup2` and `fork` make descriptors share a
+description, and so its offset, which is what makes `cmd > f 2>&1` write the
+output and the errors one after the other. Every process starts with
+descriptors 0, 1 and 2 on the terminal.
+
+The shell's redirections are built on these: for a command that runs in the
+shell itself, the descriptors it redirects are saved (as copies from
+descriptor 10 up) and restored afterwards; a job applies its redirections in
+the child.
+
+```
+haisuli# echo hello > greeting
+haisuli# cat /nope greeting > both 2>&1
+haisuli# cat < both
+cat: /nope: no such file
+hello
+```
 
 ### Console server
 
 `user/console` gets ports `0x3F8..0x3FF` via `ioperm`, binds IRQ 4 and
 registers as the console service. It is a canonical-mode terminal: input is
-echoed and can be edited (Backspace, Ctrl-U kills the line, cursor-key escape
-sequences are ignored) until Enter. A `read` then returns that line. Ctrl-D on
-an empty line is end-of-file. Output turns `\n` into `\r\n`.
+echoed and can be edited (Backspace, Ctrl-U kills the line, Ctrl-C abandons
+it, cursor-key escape sequences are ignored) until Enter. A `read` then
+returns that line. Ctrl-D on an empty line is end-of-file. Output turns `\n`
+into `\r\n`. The protocol (`OP_WRITE`, `OP_READ`, `OP_SET_FG_PGRP`) is in
+`abi/src/lib.rs`.
 
-It is also the controlling terminal. `tcsetpgrp` (`ioctl(TIOCSPGRP)`, which
-the kernel forwards as `OP_SETPGRP`) sets the foreground process group; the
-first session to do so (init's) becomes the terminal's session, and the
-server checks that the caller and the group belong to it, using `proc_info`.
-Ctrl-C and Ctrl-\ send `SIGINT` and `SIGQUIT` to the foreground process
-group and, as on a POSIX terminal, discard the line being edited and any
-input not read yet. The protocol (`OP_WRITE`, `OP_READ`, `OP_SETPGRP`,
-`OP_GETPGRP`) is in `abi/src/lib.rs`.
+It is also the *job control terminal*: it remembers a foreground process
+group (`OP_SET_FG_PGRP`, the `tcsetpgrp()` of HaisuliOS), and on Ctrl-C it
+abandons the line being typed and sends `SIGINT` to that group with
+`kill_pgrp`. (Not `kill(-pgid)`: between jobs the foreground group is the
+shell's, group 1, and `kill(-1)` is POSIX's broadcast to every process.) The
+shell catches `SIGINT` with a signal handler, so its pending `read` fails with
+`-EINTR` and it prompts again. The kernel withdraws an interrupted call, so the
+server can no longer touch the reader's buffer; it just finds the reader gone.
 
-### Processes and signals
+### Signals and job control
 
-Processes have POSIX process groups and sessions. Every boot module leads its
-own session and group; a child starts in its parent's. Pids are handed out in
-increasing order (wrapping at 32768), so a pid is not reused right after its
-process was reaped, and never while it is in use as a process group or
-session id. When a process exits, its children are handed to init.
+Signals are a kernel mechanism; who gets them is user-space policy. Every
+process has a process group and a session (inherited by `fork`, changed with
+`setpgid` / `setsid`), a disposition for every signal and a mask of blocked
+signals (both inherited by `fork`), and its pending signals.
 
-`wait4` waits for one child, any child, or any child in a process group, and
-reports children that exited, and with `WUNTRACED` / `WCONTINUED` also those
-that stopped or continued. A parent that ignores `SIGCHLD` (or sets
-`SA_NOCLDWAIT`) does not get zombies.
+A signal's *default action* happens as soon as it is sent, in the sender's
+context: the target is terminated (its wait status is the signal number),
+stopped or continued. POSIX's rules for a stopped process hold: only
+`SIGKILL` and `SIGCONT` act on it, anything else stays pending until it is
+continued, and `SIGCONT` discards pending stop signals. Terminating a process
+wakes its parent out of `wait4`, fails the calls it was serving with `-EPIPE`,
+and reparents its children to init. A blocked signal waits until it is
+unblocked.
 
-Signals 1 to 31 have their Linux numbers and default actions. A signal is
-*generated* by `kill`/`killpg` (or the kernel: `SIGCHLD`), and generation
-already does what cannot wait:
+A *caught* signal runs a handler when its process next returns to user mode.
+The scheduler is cooperative, so a process only stops running inside a system
+call, and the end of every system call is the one place where this happens.
+There the kernel pushes a signal frame on the user stack and enters the
+handler with the signal number, a `siginfo_t` and a `ucontext_t`, blocking
+the signal (unless `SA_NODEFER`) and `sa_mask` meanwhile. The frame has the
+Linux x86_64 layout, so a libc ported later finds things where it expects
+them. The handler returns to its `SA_RESTORER`, which calls `rt_sigreturn` to
+restore the interrupted registers and signal mask. The kernel treats that
+context as untrusted: it keeps the user code and stack segments, only takes
+the arithmetic flags from it, and a frame that cannot be read or written, or
+that would resume at a kernel address, kills the process with `SIGSEGV`.
 
-* `SIGKILL` and `SIGCONT` resume a stopped process; `SIGCONT` discards
-  pending stop signals and a stop signal discards a pending `SIGCONT`.
-* A stop signal with the default action stops the process at once. A stopped
-  process is simply not scheduled; it stays in whatever call it was blocked
-  in. So a stopped `pause()` is still in `pause()` after `SIGCONT`, and a
-  `SIGTERM` for a stopped process stays pending until it continues.
-* A signal that would be ignored is discarded (unless it is blocked).
-* Otherwise the signal is pending, and, unless blocked, interrupts any
-  blocking call (`read`, `wait4`, `pause`, `ipc_recv`, `ipc_call`), which
-  fails with `-EINTR`.
+A process asleep in `pause`, `wait4`, `ipc_recv` or a console `read` is
+woken by a caught signal, and the call fails with `-EINTR`, or is restarted
+after the handler with `SA_RESTART` (except `pause`, as POSIX requires).
+Console writes and other IPC calls always complete. `SA_RESETHAND` makes a
+handler one-shot.
 
-Pending signals are *delivered* at the end of every system call: the default
-action (terminate, with the signal number as the wait status; stop;
-continue; ignore) or a handler. For a handler, the kernel pushes a frame with
-the user registers and the blocked signals onto the user stack (below the
-red zone) and enters the handler as `handler(sig)`. The handler returns to the
-restorer given in `rt_sigaction` (the runtime's calls `rt_sigreturn`), which
-restores everything; from that untrusted frame the kernel takes only user
-addresses and the arithmetic flags. With `SA_RESTART`, an interrupted call
-(other than `pause`) is restarted after the handler.
+The pieces fit together like a Unix terminal session: init is a session
+leader (`sid` = `pgid` = 1); every job it starts is a new process group in
+that session; the shell hands the terminal to a foreground job with
+`tcsetpgrp()` and takes it back afterwards; and the console server sends
+Ctrl-C's `SIGINT` to whichever group holds the terminal. The shell catches
+`SIGINT` (and ignores the other job control signals), so Ctrl-C interrupts
+the job and not the shell; jobs reset those dispositions right after `fork`.
+`trap` attaches commands to signals: the shell's one handler only records the
+signal, and the commands run between commands, as in any POSIX shell.
 
-There are no users yet: a privileged process (a boot module) may signal any
-process, an ordinary one any but the privileged ones. As on Linux, init only
-gets the signals it has a handler for.
-
-The shell uses all of this for job control: each job runs in a process group
-of its own, a foreground job gets the terminal (so Ctrl-C interrupts it, not
-the shell), and Ctrl-C at the prompt only discards the line.
+```
+haisuli# pause &          a job of its own, in process group 3
+[1] 3
+haisuli# kill -STOP 3     ps then shows it as T (stopped)
+haisuli# kill -TERM 3     pending: a stopped process is not terminated yet
+haisuli# kill -CONT 3     continued, and the pending SIGTERM arrives
+haisuli# wait 3
+haisuli# echo $?
+143                       128 + SIGTERM, as POSIX requires
+haisuli# trap 'echo caught USR1' USR1
+haisuli# kill -USR1 $$    the shell's handler runs, then the trap command
+caught USR1
+```
 
 ## Build & run
 
@@ -301,9 +342,9 @@ module    /boot/initrd.tar initrd
 
 ```
 HaisuliOS 0.1.0 - x86_64 microkernel
-[pmm] 32339 frames free (126 MiB)
-[kernel] started pid 1 (init): 59 KiB image + ramdisk
-[kernel] started pid 2 (console): 27 KiB image
+[pmm] 32364 frames free (126 MiB)
+[kernel] started pid 1 (init): 30 KiB image
+[kernel] started pid 2 (console): 26 KiB image
 [kernel] ramdisk "initrd.tar": 10 KiB
 [kernel] entering user space
 [console] serving COM1 (IRQ 4)
@@ -313,42 +354,36 @@ HaisuliOS 0.1.0 - x86_64 microkernel
 
 haisuli# help
 commands:
-  help                this list
-  echo [text...]      print text
-  ls [dir]            list files on the boot ramdisk
-  cat file...         print files
-  ps                  list processes
-  pause               wait for a signal (Ctrl-C interrupts it)
-  kill [-sig] pid...  send a signal (default TERM; -l lists them)
-  wait [pid...]       wait for background jobs
-  exit [n]            leave the shell and power off
-'command &' runs a command in the background. $? is the exit status of the
-last command, $! the pid of the last background job and $$ the shell's pid.
+  help              this list
+  echo [text...]    print text
+  ls [dir]          list a directory
+  cat [file...]     print files (or the input)
+  ps                list processes
+  pause             wait for a signal (as a job: pause &)
+  kill [-sig] pid   signal a process (-pid: a process group)
+  wait [pid...]     wait for background jobs
+  trap [cmd sig...] run cmd on a signal ('' ignores, - resets)
+  exit [status]     leave the shell and power off
+end a command with & to run it in the background; $? is its status
+redirect with > file, >> file, < file, 2> file and 2>&1
 haisuli# pause &
 [1] 3
 haisuli# ps
-  PID  PPID  PGID   SID STAT COMMAND
+  PID  PPID  PGID   SID STAT NAME
     1     0     1     1 R    init
     2     0     2     2 S    console
-    3     1     3     1 S    pause
-haisuli# kill $!
-haisuli# [kernel] pid 3 (pause) exited (wait status 0xf)
-wait $!
+    3     1     3     1 S    init
+haisuli# kill 3
+[kernel] pid 3 (init) exited (wait status 0xf)
+haisuli# wait 3
 haisuli# echo $?
 143
-haisuli# pause
-^C
-[kernel] pid 4 (pause) exited (wait status 0x2)
-haisuli# echo $?
-130
 haisuli# exit
 [kernel] pid 1 (init) exited (wait status 0x0)
 [kernel] init exited - shutting down
 ```
 
-The kernel logs the exit of every process on the shared COM1, so such lines
-can appear anywhere, e.g. right after a prompt. QEMU then exits via
-`isa-debug-exit` (host exit status 1 is expected).
+QEMU then exits via `isa-debug-exit` (host exit status 1 is expected).
 
 ## Tests
 
@@ -373,8 +408,8 @@ test/test_boot.py         boot messages, /etc/motd shown before the first prompt
 test/test_commands.py     help, echo, ls, cat, unknown commands, odd input
 test/test_line_editing.py echo, Backspace, Ctrl-U/C, escape sequences, long lines
 test/test_exit.py         exit and Ctrl-D power the machine off
-test/test_process.py      signals, process groups/sessions, waitpid semantics, ps,
-                          Ctrl-C and jobs (make check TEST_ARGS="process")
+test/test_process.py      signals, process groups/sessions, waitpid semantics
+test/test_shell_redirection.py  >, >>, <, 2> and 2>&1, backed by the kernel's files
 ```
 
 A test is a function `test_*(sh)` in a `test/test_*.py` file. It receives a
@@ -428,26 +463,34 @@ HaisuliOS is licensed under the GNU General Public License, version 2 only
   memory is not reclaimed after the programs are loaded.
 * The kernel debug log and the console server share COM1 (output only on
   the kernel's side), so kernel messages can interleave with console output.
-* Signals are delivered when a system call returns, which with cooperative
-  scheduling is whenever a process could be interrupted at all. There are no
-  real-time signals, no `sigaltstack`, and CPU exceptions terminate the
-  process directly (a `SIGSEGV` handler is not called). Signal frames hold no
-  FPU/SSE state, which user programs (built soft-float) do not use.
-* Job control is partial: no Ctrl-Z, `fg` or `bg`; background jobs that use
-  the terminal get no `SIGTTIN`/`SIGTTOU`; orphaned process groups get no
-  `SIGHUP`/`SIGCONT`.
+* Signal handlers run only when a process returns from a system call. With
+  cooperative scheduling that is always before it runs again, except for a
+  forked child that has not run yet: its signals wait for its first system
+  call. CPU exceptions are not signals to a handler: a fault still
+  terminates the process (`SIGSEGV`). There is no `sigaltstack`, and
+  `SA_SIGINFO` changes nothing (every handler gets all three arguments).
+* The shell has single quotes and redirections, but no double quotes, `;`
+  or pipes, and a redirection operator must start a word (`echo a >b`, not
+  `echo a>b`).
+* A zombie whose parent died is reparented to init, but init only reaps the
+  children it knows about, so such a zombie keeps its slot in the process
+  table.
+* Stopping a server that the rest of the system depends on (for instance
+  `kill -STOP 2`, the console) leaves nothing runnable; the kernel reports
+  the deadlock and powers off.
 * Syscalls validate every user pointer against the page tables, but
   "privileged" (boot module or not) is the only permission model; there are
-  no users or capabilities yet.
+  no capabilities yet, and no file permissions either.
 
 ## Roadmap toward POSIX
 
-1. Timer (LAPIC/PIT) + preemption.
+1. Timer (LAPIC/PIT) + preemption. (Signal handlers are entered at the end of
+   system calls, which is enough only while scheduling is cooperative; with
+   preemption, returns from interrupts need the same `deliver_signals` step.)
 2. Higher-half kernel, kernel heap, copy-on-write `fork`.
-3. `execve` (the ELF loader exists); a file system server serving the ramdisk.
+3. `execve` (the ELF loader exists), loading programs from the file system.
 4. Capability-based IPC endpoints; shared memory / page grants.
-5. More user-space servers: VFS + tmpfs, then port musl libc (signals,
-   pgid/sid and `waitpid` semantics are done, see
-   [Processes and signals](#processes-and-signals)).
+5. More user-space servers: a VFS, with the RAM file system moving out of the
+   kernel into a file system server; then port musl libc.
 6. Move the fd table out of the kernel (libc/VFS), so that `read`/`write`
-   reach servers directly rather than via the kernel's console forwarding.
+   reach servers directly rather than via the kernel.

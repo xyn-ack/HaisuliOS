@@ -4,364 +4,694 @@
 //!
 //! The first process (pid 1): shows the message of the day, then runs an interactive shell.
 //!
-//! The message of the day comes from `/etc/motd` on the boot ramdisk. Until there is a file system
-//! server, init reads the ramdisk (a ustar archive the kernel mapped into its address space)
-//! directly. When init exits, the system shuts down.
+//! The message of the day comes from `/etc/motd`, from the boot ramdisk, which the kernel unpacks
+//! into its file system. When init exits, the system shuts down.
 //!
-//! The shell is a job control shell: `cmd &` runs a command in the background, `pause` runs in
-//! the foreground as a job that Ctrl-C interrupts, and `$?`, `$!`, `$$`, `wait` and `kill` work
-//! as in a POSIX shell (see [`jobs`]). Ctrl-C at the prompt discards the line and shows a new
-//! prompt.
+//! The shell does POSIX job control: `cmd &` runs a command in a child of its own process group,
+//! `$?` is the status of the last command (128 + n if signal n killed it), and `wait`, `kill` and
+//! `ps` manage the running processes. A foreground job owns the terminal while it runs, so Ctrl-C
+//! interrupts the job rather than the shell: the console server sends SIGINT to the foreground
+//! process group. Between jobs that is the shell's own group; the shell catches SIGINT with a real
+//! signal handler, which interrupts the line being read. `trap` attaches commands to signals (see
+//! [`traps`]).
+//!
+//! Commands take POSIX redirections (`>`, `>>`, `<`, `2>&1`; see [`redirect`]) and report errors on
+//! standard error. There is no `exec` yet, so commands are built in. Most of them are quick and run in the shell
+//! itself, like the special built-ins of a POSIX shell; commands that wait for something (see
+//! [`runs_in_child`]) always run in a child, so that they can be signalled.
 
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
 
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering};
-use haisuli_rt::abi::errno::EINTR;
-use haisuli_rt::abi::signal::{SIGINT, SIGQUIT, SIGTERM, SIGTSTP, SIGTTIN, SIGTTOU};
-use haisuli_rt::io::{write_all, BufWriter, Sink, STDIN, STDOUT};
-use haisuli_rt::sys::{self, Errno, Handler};
-use haisuli_rt::{print, println};
+use haisuli_rt::abi::errno::{self, ECHILD, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, ESRCH};
+use haisuli_rt::abi::fcntl::{O_DIRECTORY, O_RDONLY};
+use haisuli_rt::abi::proc_state;
+use haisuli_rt::abi::signal::{self, NSIG, SIGINT, SIGTERM};
+use haisuli_rt::abi::ProcInfo;
+use haisuli_rt::io::{tcsetpgrp, write_all, BufWriter, Sink, STDIN, STDOUT};
+use haisuli_rt::{eprintln, print, println, sys};
 
-mod jobs;
-mod signals;
-mod ustar;
+mod redirect;
+mod traps;
+mod words;
 
 haisuli_rt::entry!(main);
 
 const MOTD: &str = "/etc/motd";
 const PROMPT: &str = "haisuli# ";
-/// Longest command line after expanding `$?`, `$!` and `$$`.
-const EXPANDED_MAX: usize = 1024;
-/// Most words in a command line.
-const MAX_WORDS: usize = 64;
-
-/// The exit status of a command that does not exist.
+/// Background jobs the shell remembers at a time.
+const MAX_JOBS: usize = 8;
+/// Status of a command that could not be run, as POSIX prescribes.
 const STATUS_NOT_FOUND: i32 = 127;
 
-fn main(info: haisuli_rt::StartInfo) -> i32 {
-    let fs = ustar::Archive::new(info.ramdisk);
-    match fs.find(MOTD) {
-        Some(f) if f.is_file() => {
-            let _ = write_all(STDOUT, f.data);
+fn main(_: haisuli_rt::StartInfo) -> i32 {
+    match sys::open(MOTD, O_RDONLY) {
+        Ok(fd) => {
+            let _ = copy(fd, STDOUT);
+            let _ = sys::close(fd);
         }
-        _ => println!("init: {} not found on the boot ramdisk", MOTD),
+        Err(_) => eprintln!("init: {} not found on the boot ramdisk", MOTD),
     }
+    Shell::new().run()
+}
 
-    // An interactive shell survives the keyboard's signals: Ctrl-C only interrupts what it is
-    // waiting for (reading a line, `wait`). Jobs get the default actions back.
-    let _ = sys::sigaction(SIGINT, Handler::Catch(on_interrupt), 0, 0);
-    for sig in [SIGQUIT, SIGTERM, SIGTSTP, SIGTTIN, SIGTTOU] {
-        let _ = sys::sigaction(sig, Handler::Ignore, 0, 0);
-    }
-    jobs::take_terminal();
+/// Why copying between descriptors stopped early.
+enum CopyError {
+    /// Reading failed (e.g. `EISDIR`, or `EINTR` for Ctrl-C).
+    Read(sys::Errno),
+    /// Writing failed.
+    Write(sys::Errno),
+}
 
-    let mut sh = Shell {
-        fs,
-        pid: sys::getpid(),
-        status: 0,
-        last_background: None,
-        jobs: jobs::Jobs::new(),
-    };
-    let mut buf = [0u8; 256];
+/// Copies everything readable from `from` to `to`.
+fn copy(from: u64, to: u64) -> Result<(), CopyError> {
+    let mut buf = [0u8; 512];
     loop {
-        sh.jobs.report();
-        INTERRUPTED.store(false, Ordering::Relaxed);
-        print!("{}", PROMPT);
-        // Ctrl-C while the prompt was being written: the console has discarded the line, and
-        // the read would not notice. (Signals arrive only when a system call returns, so none
-        // can slip in between this check and the read.)
-        if INTERRUPTED.load(Ordering::Relaxed) {
-            continue;
-        }
-        let n = match sys::read(STDIN, &mut buf) {
-            Ok(0) => {
-                println!();
-                return sh.status; // End of input (Ctrl-D).
-            }
-            Ok(n) => n,
-            // Ctrl-C: the console has discarded the line; start over.
-            Err(Errno(EINTR)) => continue,
-            Err(e) => {
-                // The console itself is broken, so report on the kernel log.
-                let mut w = BufWriter::new(Sink::DebugLog);
-                let _ = writeln!(w, "init: console read failed (errno {}), giving up", e.0);
-                w.flush();
-                return 1;
-            }
-        };
-        let Ok(line) = core::str::from_utf8(&buf[..n]) else {
-            println!("init: input is not valid UTF-8");
-            sh.status = 1;
-            continue;
-        };
-        if let Some(status) = sh.run_line(line.trim()) {
-            return status;
+        match sys::read(from, &mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => write_all(to, &buf[..n]).map_err(CopyError::Write)?,
+            Err(e) => return Err(CopyError::Read(e)),
         }
     }
 }
 
-/// Set by Ctrl-C (`SIGINT`), which the shell survives.
-pub(crate) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-/// The shell's `SIGINT` handler.
-///
-/// Besides setting [`INTERRUPTED`], its existence makes Ctrl-C interrupt a blocking call
-/// (which then fails with `EINTR`) instead of terminating the shell.
-extern "C" fn on_interrupt(_sig: i32) {
-    INTERRUPTED.store(true, Ordering::Relaxed);
-}
-
-/// What a command did.
-enum Flow {
-    /// It finished with this exit status.
-    Status(i32),
-    /// The shell (or the job running the command) exits with this status.
-    Exit(i32),
-}
-
-struct Shell<'a> {
-    fs: ustar::Archive<'a>,
-    /// `$$`.
+/// A background job: a process group with one process in it.
+#[derive(Clone, Copy, Default)]
+struct Job {
     pid: u64,
-    /// `$?`: the exit status of the last command.
+}
+
+/// What running one command produced.
+struct Outcome {
+    /// The exit status, for `$?`.
+    status: i32,
+    /// Whether the shell itself should exit with it.
+    exit: bool,
+}
+
+impl Outcome {
+    fn status(status: i32) -> Outcome {
+        Outcome {
+            status,
+            exit: false,
+        }
+    }
+}
+
+struct Shell {
+    /// `$?`: the status of the last command.
     status: i32,
     /// `$!`: the pid of the last background job.
-    last_background: Option<u64>,
-    jobs: jobs::Jobs,
+    last_bg: u64,
+    /// `$$`: the shell's own pid.
+    pid: u64,
+    /// The shell's process group, which owns the terminal between jobs.
+    pgid: u64,
+    jobs: [Job; MAX_JOBS],
+    /// The number the next background job gets.
+    next_job: u32,
+    traps: traps::Traps,
+    /// Whether a trap command is running (traps do not nest).
+    in_trap: bool,
 }
 
-impl Shell<'_> {
-    /// Expands and executes one command line.
+impl Shell {
+    fn new() -> Shell {
+        let pid = sys::getpid();
+        // Job control: the shell keeps the terminal while no job runs, and
+        // survives the signals the terminal sends to the foreground group.
+        let traps = traps::Traps::new();
+        let pgid = sys::getpgid(0).unwrap_or(pid);
+        let _ = tcsetpgrp(pgid);
+        Shell {
+            status: 0,
+            last_bg: 0,
+            pid,
+            pgid,
+            jobs: [Job::default(); MAX_JOBS],
+            next_job: 1,
+            traps,
+            in_trap: false,
+        }
+    }
+
+    /// Reads and runs command lines until the shell exits.
+    fn run(&mut self) -> i32 {
+        let mut buf = [0u8; 256];
+        loop {
+            if let Some(status) = self.run_traps() {
+                return status;
+            }
+            print!("{}", PROMPT);
+            // Signals are only delivered when a system call returns, so one
+            // that arrived while prompting is seen here, before `read` blocks.
+            if traps::any_caught() {
+                leave_prompt();
+                continue;
+            }
+            let n = match sys::read(STDIN, &mut buf) {
+                Ok(0) => {
+                    println!();
+                    return 0; // End of input (Ctrl-D).
+                }
+                Ok(n) => n,
+                Err(e) if e.0 == EINTR => {
+                    leave_prompt();
+                    continue;
+                }
+                Err(e) => {
+                    // The console itself is broken, so report on the kernel log.
+                    let mut w = BufWriter::new(Sink::DebugLog);
+                    let _ = writeln!(w, "init: console read failed (errno {}), giving up", e.0);
+                    w.flush();
+                    return 1;
+                }
+            };
+            let Ok(line) = core::str::from_utf8(&buf[..n]) else {
+                eprintln!("init: input is not valid UTF-8");
+                continue;
+            };
+            if let Some(status) = self.line(line.trim()) {
+                return status;
+            }
+        }
+    }
+
+    /// Runs the commands of the traps whose signals were caught.
     ///
-    /// Returns `Some(status)` when the shell should exit.
-    fn run_line(&mut self, line: &str) -> Option<i32> {
-        let mut expanded = [0u8; EXPANDED_MAX];
-        let Some(line) = self.expand(line, &mut expanded) else {
-            println!("init: command line too long");
+    /// POSIX: a trap leaves `$?` as it was. `Some(status)` means a trap made
+    /// the shell exit.
+    fn run_traps(&mut self) -> Option<i32> {
+        if self.in_trap {
+            return None;
+        }
+        let caught = traps::take_caught();
+        for sig in (1..NSIG).filter(|&sig| caught & signal::bit(sig) != 0) {
+            let mut buf = traps::Traps::buffer();
+            let Some(command) = self.traps.command(sig, &mut buf) else {
+                continue;
+            };
+            let status = self.status;
+            self.in_trap = true;
+            let exit = self.line(command);
+            self.in_trap = false;
+            self.status = status;
+            if exit.is_some() {
+                return exit;
+            }
+        }
+        None
+    }
+
+    /// Runs one command line; `Some(status)` means the shell should exit.
+    fn line(&mut self, line: &str) -> Option<i32> {
+        let mut expanded = [0u8; 2 * 256];
+        let params = words::Params {
+            status: self.status,
+            last_bg: self.last_bg,
+            pid: self.pid,
+        };
+        let split = match words::split(line, &mut expanded, &params) {
+            Ok(split) => split,
+            Err(e) => {
+                match e {
+                    words::Error::TooMany => eprintln!(
+                        "init: too many words in one command (at most {} words and {} redirections)",
+                        words::MAX_WORDS,
+                        words::MAX_REDIRECTS
+                    ),
+                    words::Error::Unterminated => eprintln!("init: missing closing quote"),
+                    words::Error::MissingTarget => {
+                        eprintln!("init: syntax error: a redirection needs a file")
+                    }
+                }
+                // POSIX: 2 for a syntax error.
+                self.status = if matches!(e, words::Error::MissingTarget) {
+                    2
+                } else {
+                    1
+                };
+                return None;
+            }
+        };
+        let (background, words, redirects) = (split.background, split.get(), split.redirects());
+        if words.is_empty() && redirects.is_empty() {
+            return None; // An empty line leaves `$?` alone.
+        }
+        if background || words.first().is_some_and(|&w| runs_in_child(w)) {
+            self.spawn(words, redirects, background);
+            return None;
+        }
+        // A command of the shell itself: redirect around it.
+        let Ok(saved) = redirect::apply(redirects, true) else {
             self.status = 1;
             return None;
         };
-        let mut words = [""; MAX_WORDS];
-        let mut n = 0;
-        for w in line.split_ascii_whitespace() {
-            if n == MAX_WORDS {
-                println!("init: too many words");
-                self.status = 1;
-                return None;
-            }
-            words[n] = w;
-            n += 1;
-        }
-        // A trailing `&` (a word of its own, or the end of the last word): run in the background.
-        let mut background = false;
-        if let Some(last) = words[..n].last_mut() {
-            if let Some(rest) = last.strip_suffix('&') {
-                background = true;
-                *last = rest;
-                if rest.is_empty() {
-                    n -= 1;
-                }
-            }
-        }
-        let argv = &words[..n];
-        let Some(&cmd) = argv.first() else {
-            if background {
-                println!("init: syntax error near unexpected token `&'");
-                self.status = 2;
-            }
-            return None; // An empty line.
+        let outcome = if words.is_empty() {
+            Outcome::status(0) // Only redirections: they create or empty files.
+        } else {
+            self.execute(words)
         };
-        // `pause` waits for a signal, so it runs as a job of its own, which Ctrl-C interrupts.
-        if background || cmd == "pause" {
-            let (fs, status) = (&self.fs, self.status);
-            self.status = match self.jobs.start(cmd, background, || {
-                match execute(fs, status, &mut jobs::Jobs::new(), argv) {
-                    Flow::Status(s) | Flow::Exit(s) => s,
-                }
-            }) {
-                jobs::Started::Foreground(status) => status,
-                jobs::Started::Background(pid) => {
-                    self.last_background = Some(pid);
-                    0
-                }
-                jobs::Started::Failed => 1,
-            };
-            return None;
-        }
-        match execute(&self.fs, self.status, &mut self.jobs, argv) {
-            Flow::Status(s) => {
-                self.status = s;
-                None
+        saved.restore();
+        self.status = outcome.status;
+        outcome.exit.then_some(outcome.status)
+    }
+
+    /// Runs a command in a child process, as a foreground or background job.
+    fn spawn(&mut self, words: &[&str], redirects: &[words::Redirect<'_>], background: bool) {
+        let pid = match sys::fork() {
+            Ok(pid) => pid,
+            Err(e) => {
+                eprintln!("init: cannot fork: {}", errno::describe(e.0));
+                self.status = 1;
+                return;
             }
-            Flow::Exit(s) => Some(s),
+        };
+        if pid == 0 {
+            // The child is a new process group, with the shell's signals back
+            // at their default disposition so that it can be signalled.
+            let _ = sys::setpgid(0, 0);
+            self.traps.reset_for_job();
+            if redirect::apply(redirects, false).is_err() {
+                sys::exit(1);
+            }
+            let status = if words.is_empty() {
+                0
+            } else {
+                self.execute(words).status
+            };
+            sys::exit(status);
+        }
+        // Both sides set the group, so the job is in it whoever runs first.
+        let _ = sys::setpgid(pid, pid);
+        if background {
+            let number = self.add_job(pid);
+            self.last_bg = pid;
+            println!("[{}] {}", number, pid);
+            self.status = 0;
+        } else {
+            // Hand the terminal to the job, and take it back when it is done.
+            // A signal the shell catches meanwhile does not end the job, so
+            // keep waiting; its trap runs once the job is done.
+            let _ = tcsetpgrp(pid);
+            self.status = loop {
+                match sys::waitpid(pid as i64, 0) {
+                    Ok((_, status)) => break status.shell_status(),
+                    Err(e) if e.0 == EINTR => {} // Not the job's signal: keep waiting.
+                    Err(_) => break STATUS_NOT_FOUND,
+                }
+            };
+            let _ = tcsetpgrp(self.pgid);
         }
     }
 
-    /// Expands `$?`, `$!` and `$$` in `line` into `buf`; `None` if it does not fit.
-    fn expand<'b>(&self, line: &str, buf: &'b mut [u8; EXPANDED_MAX]) -> Option<&'b str> {
-        let mut w = Cursor { buf, len: 0 };
-        let mut rest = line;
-        while let Some(i) = rest.find('$') {
-            w.write_str(&rest[..i]).ok()?;
-            let after = &rest[i + 1..];
-            match after.as_bytes().first() {
-                Some(b'?') => write!(w, "{}", self.status).ok()?,
-                Some(b'!') => {
-                    if let Some(pid) = self.last_background {
-                        write!(w, "{}", pid).ok()?;
+    fn add_job(&mut self, pid: u64) -> u32 {
+        let number = self.next_job;
+        self.next_job += 1;
+        // More jobs than the shell can remember still run; they just cannot be
+        // listed, and `wait` without operands still waits for them.
+        if let Some(slot) = self.jobs.iter_mut().find(|j| j.pid == 0) {
+            *slot = Job { pid };
+        }
+        number
+    }
+
+    fn remove_job(&mut self, pid: u64) {
+        for job in self.jobs.iter_mut().filter(|j| j.pid == pid) {
+            *job = Job::default();
+        }
+        if self.jobs.iter().all(|j| j.pid == 0) {
+            self.next_job = 1; // Numbering starts over once nothing is left.
+        }
+    }
+
+    /// Runs one command, in the shell or in a freshly forked child.
+    fn execute(&mut self, words: &[&str]) -> Outcome {
+        let args = &words[1..];
+        match words[0] {
+            "help" => {
+                println!("commands:");
+                println!("  help              this list");
+                println!("  echo [text...]    print text");
+                println!("  ls [dir]          list a directory");
+                println!("  cat [file...]     print files (or the input)");
+                println!("  ps                list processes");
+                println!("  pause             wait for a signal (as a job: pause &)");
+                println!("  kill [-sig] pid   signal a process (-pid: a process group)");
+                println!("  wait [pid...]     wait for background jobs");
+                println!("  trap [cmd sig...] run cmd on a signal ('' ignores, - resets)");
+                println!("  exit [status]     leave the shell and power off");
+                println!("end a command with & to run it in the background; $? is its status");
+                println!("redirect with > file, >> file, < file, 2> file and 2>&1");
+                Outcome::status(0)
+            }
+            "echo" => {
+                let mut first = true;
+                for w in args {
+                    print!("{}{}", if first { "" } else { " " }, w);
+                    first = false;
+                }
+                println!();
+                Outcome::status(0)
+            }
+            "ls" => Outcome::status(self.ls(args.first().copied().unwrap_or("/"))),
+            "cat" => Outcome::status(self.cat(args)),
+            "ps" => Outcome::status(ps()),
+            "pause" => {
+                let e = sys::pause();
+                eprintln!("pause: {}", errno::describe(e.0));
+                Outcome::status(1)
+            }
+            "kill" => Outcome::status(kill(args)),
+            "wait" => Outcome::status(self.wait(args)),
+            "trap" => Outcome::status(self.trap(args)),
+            "exit" => Outcome {
+                // POSIX: `exit` without a status uses the status of the last
+                // command.
+                status: args.first().map_or(self.status, |a| parse_u64(a) as i32),
+                exit: true,
+            },
+            cmd => {
+                eprintln!("{}: command not found (try 'help')", cmd);
+                Outcome::status(STATUS_NOT_FOUND)
+            }
+        }
+    }
+
+    /// `ls [dir]`: lists a directory, marking subdirectories with `/`.
+    fn ls(&self, arg: &str) -> i32 {
+        let Ok(fd) = sys::open(arg, O_RDONLY | O_DIRECTORY) else {
+            eprintln!("ls: {}: no such directory", arg);
+            return 1;
+        };
+        let mut buf = [0u8; 512];
+        let mut status = 0;
+        loop {
+            match sys::getdents(fd, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    for (name, is_dir) in sys::DirEntries::new(&buf[..n]) {
+                        let name = core::str::from_utf8(name).unwrap_or("?");
+                        println!("{}{}", name, if is_dir { "/" } else { "" });
                     }
                 }
-                Some(b'$') => write!(w, "{}", self.pid).ok()?,
-                _ => {
-                    w.write_str("$").ok()?;
-                    rest = after;
-                    continue;
+                Err(e) => {
+                    eprintln!("ls: {}: {}", arg, errno::describe(e.0));
+                    status = 1;
+                    break;
                 }
             }
-            rest = &after[1..];
         }
-        w.write_str(rest).ok()?;
-        let Cursor { buf, len } = w;
-        core::str::from_utf8(&buf[..len]).ok()
+        let _ = sys::close(fd);
+        status
+    }
+
+    /// `cat [file...]`: prints files, or standard input without operands.
+    fn cat(&self, paths: &[&str]) -> i32 {
+        if paths.is_empty() {
+            return cat_one(STDIN, "-");
+        }
+        let mut status = 0;
+        for path in paths {
+            let result = match sys::open(path, O_RDONLY) {
+                Ok(fd) => {
+                    let result = cat_one(fd, path);
+                    let _ = sys::close(fd);
+                    result
+                }
+                Err(e) => {
+                    match e.0 {
+                        ENOENT | ENOTDIR => eprintln!("cat: {}: no such file", path),
+                        errno => eprintln!("cat: {}: {}", path, errno::describe(errno)),
+                    }
+                    1
+                }
+            };
+            status = status.max(result);
+        }
+        status
+    }
+
+    /// `wait [pid...]`: waits for children and reports the last one's status.
+    ///
+    /// Without operands it waits for every child. A pid that is not a child of
+    /// the shell (including one already waited for) gives status 127, as POSIX
+    /// requires.
+    fn wait(&mut self, args: &[&str]) -> i32 {
+        if args.is_empty() {
+            loop {
+                match sys::waitpid(-1, 0) {
+                    Ok((pid, _)) => self.remove_job(pid),
+                    Err(e) if e.0 == EINTR => return interrupted_status(),
+                    Err(_) => return 0,
+                }
+            }
+        }
+        let mut status = 0;
+        for arg in args {
+            match sys::waitpid(parse_u64(arg) as i64, 0) {
+                Ok((pid, reaped)) => {
+                    self.remove_job(pid);
+                    status = reaped.shell_status();
+                }
+                Err(e) if e.0 == EINTR => return interrupted_status(),
+                Err(e) => {
+                    if e.0 == ECHILD {
+                        eprintln!("wait: {}: not a child of this shell", arg);
+                    } else {
+                        eprintln!("wait: {}: cannot wait (errno {})", arg, e.0);
+                    }
+                    status = STATUS_NOT_FOUND;
+                }
+            }
+        }
+        status
     }
 }
 
-/// A [`Write`] into a fixed buffer that fails when the buffer is full.
-struct Cursor<'b> {
-    buf: &'b mut [u8],
-    len: usize,
-}
-
-impl Write for Cursor<'_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let end = self.len + s.len();
-        if end > self.buf.len() {
-            return Err(core::fmt::Error);
+impl Shell {
+    /// `trap [action signal...]`: sets what the shell does on a signal.
+    ///
+    /// The action is a command, `''` to ignore the signal or `-` to restore
+    /// the shell's default handling. Without operands, lists the traps.
+    fn trap(&mut self, args: &[&str]) -> i32 {
+        let Some((action, signals)) = args.split_first() else {
+            self.traps.list();
+            return 0;
+        };
+        if signals.is_empty() {
+            eprintln!("trap: usage: trap [action signal...]");
+            return 2;
         }
-        self.buf[self.len..end].copy_from_slice(s.as_bytes());
-        self.len = end;
-        Ok(())
+        let mut status = 0;
+        for spec in signals {
+            let Some(sig) = parse_signal(spec).filter(|&sig| sig != 0) else {
+                eprintln!("trap: {}: invalid signal specification", spec);
+                status = 1;
+                continue;
+            };
+            if let Err(why) = self.traps.set(sig, action) {
+                eprintln!("trap: {}: {}", signal::NAMES[sig as usize], why);
+                status = 1;
+            }
+        }
+        status
     }
 }
 
-/// Executes the command `argv` (not empty), in the shell or in a job.
+/// Ends the prompt's line after a caught signal, before traps and a new prompt.
 ///
-/// `status` is `$?`, for `exit` without an argument.
-fn execute(fs: &ustar::Archive<'_>, status: i32, jobs: &mut jobs::Jobs, argv: &[&str]) -> Flow {
-    let (cmd, args) = (argv[0], &argv[1..]);
-    Flow::Status(match cmd {
-        "help" => {
-            help();
-            0
-        }
-        "echo" => {
-            let mut first = true;
-            for w in args {
-                print!("{}{}", if first { "" } else { " " }, w);
-                first = false;
-            }
-            println!();
-            0
-        }
-        "ls" => ls(fs, args.first().copied().unwrap_or("/")),
-        "cat" => {
-            let mut status = 0;
-            for path in args {
-                match fs.find(path) {
-                    Some(f) if f.is_file() => {
-                        let _ = write_all(STDOUT, f.data);
-                    }
-                    Some(_) => {
-                        println!("cat: {}: is a directory", path);
-                        status = 1;
-                    }
-                    None => {
-                        println!("cat: {}: no such file", path);
-                        status = 1;
-                    }
-                }
-            }
-            status
-        }
-        "ps" => ps(),
-        "pause" => {
-            sys::pause();
-            0
-        }
-        "kill" => signals::kill(args),
-        "wait" => jobs.wait(args),
-        "exit" => {
-            return match args.first().map(|a| a.parse::<u8>()) {
-                None => Flow::Exit(status),
-                Some(Ok(code)) => Flow::Exit(code as i32),
-                Some(Err(_)) => {
-                    println!("exit: {}: numeric argument required", args[0]);
-                    Flow::Status(2)
-                }
-            };
-        }
-        _ => {
-            println!("{}: command not found (try 'help')", cmd);
-            STATUS_NOT_FOUND
-        }
-    })
-}
-
-fn help() {
-    println!("commands:");
-    println!("  help                this list");
-    println!("  echo [text...]      print text");
-    println!("  ls [dir]            list files on the boot ramdisk");
-    println!("  cat file...         print files");
-    println!("  ps                  list processes");
-    println!("  pause               wait for a signal (Ctrl-C interrupts it)");
-    println!("  kill [-sig] pid...  send a signal (default TERM; -l lists them)");
-    println!("  wait [pid...]       wait for background jobs");
-    println!("  exit [n]            leave the shell and power off");
-    println!("'command &' runs a command in the background. $? is the exit status of the");
-    println!("last command, $! the pid of the last background job and $$ the shell's pid.");
-}
-
-fn ls(fs: &ustar::Archive<'_>, arg: &str) -> i32 {
-    let dir = ustar::normalize(arg);
-    // Archives need not contain entries for directories, only for files.
-    let is_dir = fs.find(dir).is_some_and(|e| !e.is_file())
-        || fs
-            .entries()
-            .any(|e| ustar::child_of(dir, e.path()).is_some());
-    if !is_dir {
-        println!("ls: {}: no such directory", arg);
-        return 1;
+/// Ctrl-C already did: the terminal showed `^C` and a newline, and dropped the
+/// line being typed.
+fn leave_prompt() {
+    if !traps::caught(SIGINT) {
+        println!();
     }
-    for e in fs.entries() {
-        if let Some(name) = ustar::child_of(dir, e.path()) {
-            println!("{}{}", name, if e.is_file() { "" } else { "/" });
+}
+
+/// The status of a `wait` that a caught signal interrupted.
+///
+/// POSIX: greater than 128; like other shells, 128 plus the signal number.
+fn interrupted_status() -> i32 {
+    128 + traps::first_caught().unwrap_or(SIGINT) as i32
+}
+
+/// Copies `fd` (named `name` in errors) to standard output, for `cat`.
+fn cat_one(fd: u64, name: &str) -> i32 {
+    match copy(fd, STDOUT) {
+        Ok(()) => 0,
+        Err(CopyError::Read(e)) if e.0 == EISDIR => {
+            eprintln!("cat: {}: is a directory", name);
+            1
+        }
+        // Ctrl-C: the terminal already showed ^C.
+        Err(CopyError::Read(e)) if e.0 == EINTR => 1,
+        Err(CopyError::Read(e)) => {
+            eprintln!("cat: {}: {}", name, errno::describe(e.0));
+            1
+        }
+        // The output is the problem, not the file being read.
+        Err(CopyError::Write(e)) => {
+            eprintln!("cat: write error: {}", errno::describe(e.0));
+            1
         }
     }
-    0
 }
 
-/// `ps`: lists every process.
+/// Commands that always run in a child process.
+///
+/// `pause` waits for a signal, which only makes sense for a process that is
+/// not the shell: as a job it can be stopped, continued and killed.
+fn runs_in_child(command: &str) -> bool {
+    command == "pause"
+}
+
+/// `kill [-s signal | -signal] pid...`: sends a signal.
+///
+/// The default signal is SIGTERM, signal 0 only checks that the target exists,
+/// and a negative pid addresses a whole process group.
+fn kill(args: &[&str]) -> i32 {
+    let mut sig = SIGTERM;
+    let mut targets = args;
+    match args.first().copied() {
+        Some("-s") => match args.get(1).copied().and_then(parse_signal) {
+            Some(parsed) => {
+                sig = parsed;
+                targets = &args[2..];
+            }
+            None => {
+                eprintln!(
+                    "kill: {}: invalid signal specification",
+                    args.get(1).copied().unwrap_or("")
+                );
+                return 1;
+            }
+        },
+        // The first argument is the signal; later ones may be negative pids.
+        Some(spec) if spec.len() > 1 && spec.starts_with('-') && spec != "--" => {
+            match parse_signal(&spec[1..]) {
+                Some(parsed) => {
+                    sig = parsed;
+                    targets = &args[1..];
+                }
+                None => {
+                    eprintln!("kill: {}: invalid signal specification", &spec[1..]);
+                    return 1;
+                }
+            }
+        }
+        _ => {}
+    }
+    // `--` ends the options, so that a process group can follow.
+    if targets.first() == Some(&"--") {
+        targets = &targets[1..];
+    }
+    if targets.is_empty() {
+        eprintln!("kill: usage: kill [-s signal | -signal] [--] pid...");
+        return 2;
+    }
+    let mut status = 0;
+    for target in targets {
+        let pid = match parse_i64(target) {
+            Some(pid) => pid,
+            None => {
+                eprintln!(
+                    "kill: {}: arguments must be process or process group ids",
+                    target
+                );
+                status = 1;
+                continue;
+            }
+        };
+        match sys::kill(pid, sig) {
+            Ok(()) => {}
+            Err(e) => {
+                match e.0 {
+                    ESRCH => eprintln!("kill: {}: No such process", target),
+                    EPERM => eprintln!("kill: {}: Operation not permitted", target),
+                    errno => eprintln!("kill: {}: cannot signal (errno {})", target, errno),
+                }
+                status = 1;
+            }
+        }
+    }
+    status
+}
+
+/// `ps`: lists every process with its job control state.
 fn ps() -> i32 {
-    let mut w = BufWriter::new(Sink::Fd(STDOUT));
-    let _ = writeln!(w, "  PID  PPID  PGID   SID STAT COMMAND");
-    let mut next = 1;
-    while let Ok(p) = sys::proc_info(next) {
-        let _ = writeln!(
-            w,
-            "{:5} {:5} {:5} {:5} {:<4} {}",
+    let mut procs = [ProcInfo::default(); 16];
+    let n = match sys::proc_list(&mut procs) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("ps: cannot list processes (errno {})", e.0);
+            return 1;
+        }
+    };
+    println!(
+        "{:>5} {:>5} {:>5} {:>5} {:<4} {}",
+        "PID", "PPID", "PGID", "SID", "STAT", "NAME"
+    );
+    for p in &procs[..n] {
+        let stat = match p.state {
+            proc_state::RUNNING => "R",
+            proc_state::SLEEPING => "S",
+            proc_state::STOPPED => "T",
+            proc_state::ZOMBIE => "Z",
+            _ => "?",
+        };
+        println!(
+            "{:>5} {:>5} {:>5} {:>5} {:<4} {}",
             p.pid,
             p.ppid,
             p.pgid,
             p.sid,
-            p.state as char,
+            stat,
             p.name()
         );
-        next = p.pid + 1;
     }
-    w.flush();
     0
+}
+
+/// The signal a `kill` argument names: a number or a name such as `TERM`.
+fn parse_signal(spec: &str) -> Option<u64> {
+    if spec.bytes().all(|b| b.is_ascii_digit()) {
+        let n = spec.parse_u64()?;
+        (n < signal::NSIG).then_some(n)
+    } else {
+        signal::by_name(spec)
+    }
+}
+
+/// Parses a decimal number, or 0 if the text is not one.
+fn parse_u64(s: &str) -> u64 {
+    s.parse_u64().unwrap_or(0)
+}
+
+/// Parses a pid or a negative process group id.
+fn parse_i64(s: &str) -> Option<i64> {
+    match s.strip_prefix('-') {
+        Some(digits) => digits.parse_u64().map(|n| -(n as i64)),
+        None => s.parse_u64().map(|n| n as i64),
+    }
+}
+
+/// Parsing of the only number format the shell needs.
+trait ParseU64 {
+    fn parse_u64(&self) -> Option<u64>;
+}
+
+impl ParseU64 for str {
+    fn parse_u64(&self) -> Option<u64> {
+        if self.is_empty() || !self.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mut n: u64 = 0;
+        for b in self.bytes() {
+            n = n.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+        }
+        Some(n)
+    }
 }

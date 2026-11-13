@@ -26,14 +26,22 @@ pub enum Sink {
     DebugLog,
 }
 
-/// Writes all of `buf` to `fd`, retrying short writes and writes that a signal interrupted.
+/// Makes `pgid` the terminal's foreground process group (POSIX `tcsetpgrp`).
+///
+/// The console server sends the terminal's signals, such as the SIGINT of
+/// Ctrl-C, to that group, and interrupts reads from it with `EINTR`.
+pub fn tcsetpgrp(pgid: u64) -> sys::Result<()> {
+    let console = sys::svc_lookup(crate::abi::svc::CONSOLE)?;
+    let mut pgid = pgid.to_ne_bytes();
+    sys::ipc_call(console, crate::abi::console::OP_SET_FG_PGRP, &mut pgid).map(drop)
+}
+
+/// Writes all of `buf` to `fd`, retrying short writes.
 pub fn write_all(fd: u64, mut buf: &[u8]) -> sys::Result<()> {
     while !buf.is_empty() {
-        match sys::write(fd, buf) {
-            Ok(0) => return Err(sys::Errno(crate::abi::errno::EIO)),
-            Ok(n) => buf = &buf[n.min(buf.len())..],
-            Err(sys::Errno(crate::abi::errno::EINTR)) => {}
-            Err(e) => return Err(e),
+        match sys::write(fd, buf)? {
+            0 => return Err(sys::Errno(crate::abi::errno::EIO)),
+            n => buf = &buf[n.min(buf.len())..],
         }
     }
     Ok(())

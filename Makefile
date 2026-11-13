@@ -11,7 +11,8 @@ OBJCOPY ?= objcopy
 QEMU    ?= qemu-system-x86_64
 
 # Boot modules, in order: the first program is init (pid 1). The ramdisk is
-# a ustar archive of rootfs/ (it provides /etc/motd) and is handed to init.
+# a ustar archive of rootfs/ (it provides /etc/motd), which the kernel unpacks
+# into its RAM file system.
 PROGRAMS := build/init build/console
 RAMDISK  := build/initrd.tar
 MODULES  := build/init,build/console,$(RAMDISK)

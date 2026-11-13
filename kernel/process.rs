@@ -19,37 +19,36 @@
 //!   without blocking itself. Every process has at most one call outstanding, so callers simply
 //!   queue in the process table.
 //!
+//! Processes also carry the POSIX job-control state: a process group and a session (inherited
+//! across `fork`, set by `setpgid` / `setsid`), a disposition for every signal, the blocked
+//! signals and the pending ones. How a signal travels from [`kill`] to a handler is described at
+//! the start of the signals section below.
+//!
 //! All scheduler state lives in one `Table` behind a [`Lock`]. Functions take it for short,
 //! explicit scopes and always release it before switching context or idling.
-//!
-//! On top of this, processes have POSIX semantics: process groups and sessions ([`group`]),
-//! signals ([`signal`]) and `wait4` for a given child, process group or any child, including
-//! stopped and continued ones. Every blocking call is interruptible: a signal that will run a
-//! handler or terminate the process makes it fail with `EINTR`, and the signal takes effect on
-//! the way back to user mode ([`return_to_user`]). A stopped process is simply never scheduled.
 
 use crate::arch::entry::TrapFrame;
 use crate::arch::multiboot::{self, Module};
 use crate::arch::{context, cpu};
+use crate::signal::{self, Action, Disposition, Frame, SigAction, SigSet};
 use crate::sync::{Guard, Lock};
-use crate::{elf, gdt, irq, syscall, vmm};
+use crate::{elf, fs, gdt, irq, syscall, vmm};
 use haisuli_abi::errno::*;
-use haisuli_abi::signal::SIGCHLD;
-use haisuli_abi::wait::{WCONTINUED, WNOHANG, WUNTRACED};
-use haisuli_abi::{svc, IO_PORTS, KMSG_IRQ, PID_KERNEL};
-
-mod group;
-mod signal;
-
-pub(crate) use group::{getpgid, getpgrp, getsid, prctl, proc_info, setpgid, setsid};
-pub(crate) use signal::{kill, killpg, pause, return_to_user, sigaction, sigprocmask, sigreturn};
+use haisuli_abi::fcntl::{F_DUPFD, OPEN_MAX};
+use haisuli_abi::signal::{
+    NSIG, SA_RESETHAND, SA_RESTART, SIGCONT, SIGKILL, SIGSEGV, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK,
+};
+use haisuli_abi::{nr, proc_state, svc, ProcInfo, IO_PORTS, KMSG_IRQ, PID_KERNEL};
+use haisuli_abi::{wait_status_signalled, PROC_INFO_LEN, WNOHANG};
 
 pub(crate) const MAX_PROCS: usize = 16;
-/// Pids go up to this, then start again from 2.
-const PID_MAX: u64 = 32768;
 const MBOX_SIZE: usize = 8;
 const USER_STACK_PAGES: u64 = 8;
 const NAME_LEN: usize = 16;
+/// A file descriptor that is not open.
+const NO_FD: u8 = u8::MAX;
+/// Descriptors per process.
+const FDS: usize = OPEN_MAX as usize;
 /// The pid of init, the first boot module.
 ///
 /// The system shuts down when init exits.
@@ -67,17 +66,9 @@ pub(crate) enum State {
     BlockedService,
     /// In `pause`, waiting for a signal.
     BlockedPause,
+    /// Stopped by a signal, until SIGCONT (or SIGKILL) arrives.
+    Stopped,
     Zombie,
-}
-
-/// A change of a child's state that `wait4` has not reported yet (besides its exit).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Report {
-    None,
-    /// Stopped by this signal (reported with `WUNTRACED`).
-    Stopped(u32),
-    /// Continued by `SIGCONT` (reported with `WCONTINUED`).
-    Continued,
 }
 
 #[derive(Clone, Copy)]
@@ -120,14 +111,34 @@ struct Call {
     seq: u64,
     /// Whether the server has picked the call up with `ipc_recv` yet.
     received: bool,
-    /// Set by `ipc_reply` (or to -EPIPE if the server dies).
+    /// Set by `ipc_reply` (or to -EPIPE if the server dies, -EINTR if a
+    /// signal interrupts the call).
     result: i64,
+    /// Whether a caught signal may interrupt the call (a console `read`).
+    interruptible: bool,
 }
 
 struct Process {
     pid: u64,
     ppid: u64,
+    /// Process group, inherited across `fork` and changed by `setpgid`.
+    pgid: u64,
+    /// Session, inherited across `fork` and changed by `setsid`.
+    sid: u64,
     state: State,
+    /// The state to return to when a stopped process is continued.
+    stopped_prev: State,
+    /// The disposition of each signal, by number (inherited across `fork`).
+    actions: [SigAction; NSIG as usize],
+    /// Signals that are not delivered for now (inherited across `fork`).
+    blocked: SigSet,
+    /// Signals sent to the process that have not acted on it yet.
+    pending: SigSet,
+    /// The pid that sent each pending signal (for `siginfo_t.si_pid`).
+    senders: [u64; NSIG as usize],
+    /// File descriptors: the open file description each refers to ([`fs`]),
+    /// or [`NO_FD`].
+    fds: [u8; FDS],
     pml4: u64,
     wstatus: i32,
     mmap_next: u64,
@@ -143,21 +154,21 @@ struct Process {
     /// IRQ lines that fired and have not been delivered by `ipc_recv` yet.
     irq_pending: u16,
     call: Call,
-    /// Process group id.
-    pgid: u64,
-    /// Session id.
-    sid: u64,
-    sig: signal::Signals,
-    /// Stopped by a signal: not scheduled until `SIGCONT` or `SIGKILL`.
-    stopped: bool,
-    report: Report,
 }
 
 impl Process {
     const EMPTY: Process = Process {
         pid: 0,
         ppid: 0,
+        pgid: 0,
+        sid: 0,
         state: State::Unused,
+        stopped_prev: State::Ready,
+        actions: [SigAction::DEFAULT; NSIG as usize],
+        blocked: SigSet::EMPTY,
+        pending: SigSet::EMPTY,
+        senders: [0; NSIG as usize],
+        fds: [NO_FD; FDS],
         pml4: 0,
         wstatus: 0,
         mmap_next: vmm::MMAP_BASE,
@@ -181,26 +192,35 @@ impl Process {
             seq: 0,
             received: false,
             result: 0,
+            interruptible: false,
         },
-        pgid: 0,
-        sid: 0,
-        sig: signal::Signals::EMPTY,
-        stopped: false,
-        report: Report::None,
     };
 
     fn alive(&self) -> bool {
         !matches!(self.state, State::Unused | State::Zombie)
     }
 
-    /// Whether the process exists, possibly as a zombie.
-    fn exists(&self) -> bool {
-        self.state != State::Unused
+    /// Makes a blocked process runnable again.
+    ///
+    /// A stopped process stays stopped: it only remembers to be runnable once
+    /// it is continued, so that a reply or a message cannot un-stop it.
+    fn make_ready(&mut self) {
+        if self.state == State::Stopped {
+            self.stopped_prev = State::Ready;
+        } else {
+            self.state = State::Ready;
+        }
     }
 
-    /// Whether the scheduler may run the process.
-    fn runnable(&self) -> bool {
-        self.state == State::Ready && !self.stopped
+    /// What `ps` shows for this process.
+    fn reported_state(&self) -> u64 {
+        match self.state {
+            State::Unused => 0,
+            State::Ready => proc_state::RUNNING,
+            State::Stopped => proc_state::STOPPED,
+            State::Zombie => proc_state::ZOMBIE,
+            _ => proc_state::SLEEPING,
+        }
     }
 }
 
@@ -231,8 +251,6 @@ struct Table {
     call_seq: u64,
     /// Well-known services: pid registered for each service id (0 = none).
     services: [u64; svc::MAX as usize],
-    /// The next pid to try.
-    next_pid: u64,
 }
 
 impl Table {
@@ -244,46 +262,22 @@ impl Table {
         &mut self.procs[self.current]
     }
 
-    /// Slot of a live (not unused, not zombie) process.
+    /// Slot of a live (not unused, not zombie) process. pid = slot + 1.
     fn live_slot(&self, pid: u64) -> Option<usize> {
-        self.slot(pid).filter(|&s| self.procs[s].alive())
-    }
-
-    /// Slot of a process that exists, possibly as a zombie.
-    fn slot(&self, pid: u64) -> Option<usize> {
-        if pid == 0 {
+        if pid == 0 || pid > MAX_PROCS as u64 {
             return None;
         }
-        self.procs.iter().position(|p| p.exists() && p.pid == pid)
+        let slot = (pid - 1) as usize;
+        self.procs[slot].alive().then_some(slot)
     }
 
     fn free_slot(&self) -> Option<usize> {
         (0..MAX_PROCS).find(|&i| self.procs[i].state == State::Unused)
     }
 
-    /// A pid for a new process.
-    ///
-    /// Pids are handed out in increasing order, as on Unix, so that a pid is not reused right
-    /// after its process was reaped (a shell may still remember its status). A pid that is in
-    /// use as a process group or session id is skipped too, or the new process could end up in
-    /// somebody else's process group.
-    fn alloc_pid(&mut self) -> u64 {
-        loop {
-            let pid = self.next_pid;
-            self.next_pid = if pid >= PID_MAX { 2 } else { pid + 1 };
-            if !self
-                .procs
-                .iter()
-                .any(|p| p.exists() && (p.pid == pid || p.pgid == pid || p.sid == pid))
-            {
-                return pid;
-            }
-        }
-    }
-
     fn wake_receiver(&mut self, slot: usize) {
         if self.procs[slot].state == State::BlockedRecv {
-            self.procs[slot].state = State::Ready;
+            self.procs[slot].make_ready();
         }
     }
 }
@@ -293,7 +287,6 @@ static TABLE: Lock<Table> = Lock::new(Table {
     current: 0,
     call_seq: 0,
     services: [0; svc::MAX as usize],
-    next_pid: 1,
 });
 
 fn table() -> Guard<'static, Table> {
@@ -316,25 +309,20 @@ pub(crate) fn is_alive(pid: u64) -> bool {
 /// Starts every ELF boot module as a privileged process, in module order.
 ///
 /// The first becomes pid 1, init. A module that is not an ELF file is the
-/// boot ramdisk: it is mapped read-only into init at `RAMDISK_BASE`, and init
-/// receives its address and size in `rdi` / `rsi`.
+/// boot ramdisk, a ustar archive: it is unpacked into the file system
+/// ([`fs::init`]).
 pub(crate) fn spawn_boot_modules() {
     let ramdisk = multiboot::modules().find(|m| !elf::is_elf(m.data));
+    fs::init(ramdisk.map_or(&[][..], |r| r.data));
     let mut started = 0;
     for m in multiboot::modules().filter(|m| elf::is_elf(m.data)) {
-        let rd = if started == 0 {
-            ramdisk.map_or(&[][..], |r| r.data)
-        } else {
-            &[]
-        };
-        match spawn(&m, rd) {
+        match spawn(&m) {
             Ok(pid) => {
                 crate::println!(
-                    "[kernel] started pid {} ({}): {} KiB image{}",
+                    "[kernel] started pid {} ({}): {} KiB image",
                     pid,
                     Name::new(m.name()),
                     m.data.len().div_ceil(1024),
-                    if rd.is_empty() { "" } else { " + ramdisk" }
                 );
                 started += 1;
             }
@@ -357,7 +345,7 @@ pub(crate) fn spawn_boot_modules() {
     }
 }
 
-fn spawn(m: &Module, ramdisk: &[u8]) -> Result<u64, &'static str> {
+fn spawn(m: &Module) -> Result<u64, &'static str> {
     let slot = table().free_slot().ok_or("process table full")?;
     let pml4 = vmm::new_address_space().ok_or("out of memory")?;
     let setup = || -> Result<TrapFrame, &'static str> {
@@ -366,22 +354,14 @@ fn spawn(m: &Module, ramdisk: &[u8]) -> Result<u64, &'static str> {
         let stack_flags = vmm::USER | vmm::WRITABLE | vmm::NX;
         vmm::map_init(pml4, vmm::USER_STACK_TOP - stack, stack, &[], stack_flags)
             .map_err(|_| "out of memory")?;
-        let mut frame = TrapFrame {
+        Ok(TrapFrame {
             rip: entry,
             cs: gdt::USER_CS,
             rflags: 0x202, // IF set (reserved bit 1 is always 1).
             rsp: vmm::USER_STACK_TOP,
             ss: gdt::USER_DS,
             ..TrapFrame::default()
-        };
-        if !ramdisk.is_empty() {
-            let len = ramdisk.len() as u64;
-            vmm::map_init(pml4, vmm::RAMDISK_BASE, len, ramdisk, vmm::USER | vmm::NX)
-                .map_err(|_| "out of memory")?;
-            frame.rdi = vmm::RAMDISK_BASE;
-            frame.rsi = len;
-        }
-        Ok(frame)
+        })
     };
     let frame = match setup() {
         Ok(f) => f,
@@ -391,17 +371,22 @@ fn spawn(m: &Module, ramdisk: &[u8]) -> Result<u64, &'static str> {
         }
     };
     context::init(slot, &frame);
-    let mut t = table();
-    let pid = t.alloc_pid();
-    // Every boot module leads its own session and process group.
-    t.procs[slot] = Process {
+    let pid = slot as u64 + 1;
+    table().procs[slot] = Process {
         pid,
+        // A boot module has no parent and leads its own session.
+        pgid: pid,
+        sid: pid,
         state: State::Ready,
         pml4,
         privileged: true,
         name: Name::new(m.name()),
-        pgid: pid,
-        sid: pid,
+        // Standard input, output and error: the terminal.
+        fds: {
+            let mut fds = [NO_FD; FDS];
+            fds[..3].fill(fs::CONSOLE as u8);
+            fds
+        },
         ..Process::EMPTY
     };
     Ok(pid)
@@ -425,7 +410,7 @@ pub(crate) fn start() -> ! {
     let first = {
         let mut t = table();
         let first = (0..MAX_PROCS)
-            .find(|&i| t.procs[i].runnable())
+            .find(|&i| t.procs[i].state == State::Ready)
             .expect("no process");
         t.current = first;
         first
@@ -470,7 +455,7 @@ pub(crate) fn schedule() {
             let t = table();
             (1..=MAX_PROCS)
                 .map(|off| (t.current + off) % MAX_PROCS)
-                .find(|&i| t.procs[i].runnable())
+                .find(|&i| t.procs[i].state == State::Ready)
         };
         if let Some(i) = next {
             switch_to(i);
@@ -495,56 +480,79 @@ pub(crate) fn yield_now() -> i64 {
     0
 }
 
-/// Terminate the current process. `wstatus` uses the POSIX wait-status
-/// encoding: (exit_code << 8) for normal exit, or a signal number.
+/// What `make_zombie` leaves for its caller to clean up outside the lock.
+struct Dead {
+    pid: u64,
+    name: Name,
+    pml4: u64,
+    wstatus: i32,
+    fds: [u8; FDS],
+}
+
+/// Turns `slot` into a zombie: the process stops running, but its wait status
+/// stays until its parent reaps it.
 ///
-/// The process becomes a zombie until its parent reaps it with `wait4`, unless the parent
-/// ignores `SIGCHLD` (or set `SA_NOCLDWAIT`). Its children are handed to init.
-pub(crate) fn exit_current(wstatus: i32) -> ! {
-    let (pid, name, pml4) = {
-        let mut t = table();
-        let current = t.current;
-        let p = t.cur_mut();
-        let pml4 = core::mem::replace(&mut p.pml4, 0);
-        p.wstatus = wstatus;
-        p.state = State::Zombie;
-        p.stopped = false;
-        p.report = Report::None;
-        let (pid, ppid, name) = (p.pid, p.ppid, p.name);
-        release_server_state(&mut t, pid);
-        let mut orphaned_zombie = false;
-        for c in t.procs.iter_mut() {
-            if c.exists() && c.ppid == pid && pid != INIT_PID {
-                c.ppid = INIT_PID;
-                orphaned_zombie |= c.state == State::Zombie;
-            }
+/// Its children are reparented to init, the calls it was serving fail, and its
+/// parent wakes up from `wait`. The caller must pass the result to
+/// [`finish_death`] once it has dropped the process table.
+fn make_zombie(t: &mut Table, slot: usize, wstatus: i32) -> Dead {
+    let p = &mut t.procs[slot];
+    let pml4 = core::mem::replace(&mut p.pml4, 0);
+    let fds = core::mem::replace(&mut p.fds, [NO_FD; FDS]);
+    p.wstatus = wstatus;
+    p.state = State::Zombie;
+    let (pid, ppid, name) = (p.pid, p.ppid, p.name);
+    release_server_state(t, pid);
+    for p in t.procs.iter_mut() {
+        if p.ppid == pid && p.state != State::Unused {
+            p.ppid = INIT_PID; // POSIX: orphans are reparented to init.
         }
-        if orphaned_zombie {
-            child_changed(&mut t, INIT_PID);
+        if p.pid == ppid && p.state == State::BlockedWait {
+            p.make_ready();
         }
-        if let Some(parent) = t.live_slot(ppid) {
-            let act = t.procs[parent].sig.actions[SIGCHLD as usize];
-            if signal::reaps_children(&act) {
-                t.procs[current].state = State::Unused; // Nobody will wait for it.
-            }
-            child_changed(&mut t, ppid);
-        }
-        (pid, name, pml4)
-    };
-    irq::release_all(pid);
-    crate::println!(
-        "[kernel] pid {} ({}) exited (wait status {:#x})",
+    }
+    Dead {
         pid,
         name,
-        wstatus
+        pml4,
+        wstatus,
+        fds,
+    }
+}
+
+/// Frees what a zombie no longer needs and reports the exit on the kernel log.
+///
+/// Must be called without the process table locked, and only once the dead
+/// process's address space is no longer the active one.
+fn finish_death(d: Dead) {
+    irq::release_all(d.pid);
+    for &ofd in d.fds.iter().filter(|&&fd| fd != NO_FD) {
+        fs::release(ofd as usize);
+    }
+    crate::println!(
+        "[kernel] pid {} ({}) exited (wait status {:#x})",
+        d.pid,
+        d.name,
+        d.wstatus
     );
-    vmm::switch(vmm::kernel_pml4()); // Never free the active page tables.
-    vmm::destroy_user_space(pml4);
-    if pid == INIT_PID {
+    vmm::destroy_user_space(d.pml4);
+    if d.pid == INIT_PID {
         crate::println!("[kernel] init exited - shutting down");
         cpu::qemu_exit(0);
         cpu::halt();
     }
+}
+
+/// Terminate the current process. `wstatus` uses the POSIX wait-status
+/// encoding: (exit_code << 8) for normal exit, or a signal number.
+pub(crate) fn exit_current(wstatus: i32) -> ! {
+    let dead = {
+        let mut t = table();
+        let slot = t.current;
+        make_zombie(&mut t, slot, wstatus)
+    };
+    vmm::switch(vmm::kernel_pml4()); // Never free the active page tables.
+    finish_death(dead);
     schedule();
     cpu::halt();
 }
@@ -556,22 +564,12 @@ fn release_server_state(t: &mut Table, pid: u64) {
     for p in t.procs.iter_mut() {
         if p.state == State::BlockedCall && p.call.server == pid {
             p.call.result = -EPIPE;
-            p.state = State::Ready;
+            p.make_ready();
         }
     }
     for s in t.services.iter_mut() {
         if *s == pid {
             *s = 0;
-        }
-    }
-}
-
-/// Tells `pid` that one of its children changed state: `SIGCHLD`, and a wake-up for `wait4`.
-fn child_changed(t: &mut Table, pid: u64) {
-    if let Some(slot) = t.live_slot(pid) {
-        signal::post(t, slot, SIGCHLD);
-        if t.procs[slot].state == State::BlockedWait {
-            t.procs[slot].state = State::Ready;
         }
     }
 }
@@ -586,92 +584,178 @@ pub(crate) fn getppid() -> i64 {
 /// Creates a copy of the current process (the `fork` system call).
 ///
 /// The child is an eager (non-COW) copy and resumes with `rax` = 0. It does
-/// not inherit privileges, I/O permissions or IRQ bindings. It does inherit the
-/// process group, session, signal actions and blocked signals, but no pending signals.
+/// not inherit privileges, I/O permissions or IRQ bindings.
 pub(crate) fn fork(frame: &TrapFrame) -> i64 {
     let (slot, parent) = {
         let t = table();
         let p = t.cur();
-        (
-            t.free_slot(),
-            (p.pid, p.pml4, p.mmap_next, p.name, p.pgid, p.sid, p.sig),
-        )
+        // What the child inherits: its parent's process group and session,
+        // signal dispositions and mask (not its pending signals), and file
+        // descriptors, which share the parent's open file descriptions.
+        let child = Process {
+            ppid: p.pid,
+            pgid: p.pgid,
+            sid: p.sid,
+            actions: p.actions,
+            blocked: p.blocked,
+            fds: p.fds,
+            mmap_next: p.mmap_next,
+            name: p.name,
+            ..Process::EMPTY
+        };
+        (t.free_slot(), (child, p.pml4))
     };
     let Some(slot) = slot else {
         return -EAGAIN;
     };
-    let (ppid, parent_pml4, mmap_next, name, pgid, sid, sig) = parent;
+    let (child, parent_pml4) = parent;
     let Some(pml4) = vmm::clone_user_space(parent_pml4) else {
         return -ENOMEM;
     };
     let mut child_frame = *frame;
     child_frame.rax = 0;
     context::init(slot, &child_frame);
-    let mut t = table();
-    let pid = t.alloc_pid();
-    t.procs[slot] = Process {
+    let pid = slot as u64 + 1;
+    for &ofd in child.fds.iter().filter(|&&fd| fd != NO_FD) {
+        fs::retain(ofd as usize);
+    }
+    table().procs[slot] = Process {
         pid,
-        ppid,
         state: State::Ready,
         pml4,
-        mmap_next,
-        name,
-        pgid,
-        sid,
-        sig: signal::Signals { pending: 0, ..sig },
-        ..Process::EMPTY
+        ..child
     };
     pid as i64
 }
 
-/// Waits for a child to change state (the `wait4` system call).
-///
-/// `pid` selects the children: > 0 that child, -1 any child, 0 any child in the caller's process
-/// group, < -1 any child in process group `-pid`. A child that exited is reaped; with `WUNTRACED`
-/// a stopped child and with `WCONTINUED` a continued one are reported too. Returns the child's
-/// pid and stores its wait status at `status_ptr` (unless 0). With `WNOHANG`, returns 0 instead
-/// of blocking.
-pub(crate) fn wait(pid: i32, status_ptr: u64, options: u64) -> i64 {
-    if options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
+// ---- File descriptors ---------------------------------------------------------
+
+/// The open file description that the caller's descriptor `fd` refers to.
+pub(crate) fn description(fd: u64) -> Option<usize> {
+    let t = table();
+    match t.cur().fds.get(fd as usize) {
+        Some(&ofd) if ofd != NO_FD => Some(ofd as usize),
+        _ => None,
+    }
+}
+
+/// Gives description `ofd` the caller's lowest free descriptor that is at
+/// least `min`, handing over the reference the caller holds.
+fn install(ofd: usize, min: u64) -> i64 {
+    let fd = {
+        let mut t = table();
+        let fds = &mut t.cur_mut().fds;
+        let fd = (min as usize..FDS).find(|&fd| fds[fd] == NO_FD);
+        if let Some(fd) = fd {
+            fds[fd] = ofd as u8;
+        }
+        fd
+    };
+    match fd {
+        Some(fd) => fd as i64,
+        None => {
+            fs::release(ofd);
+            -EMFILE
+        }
+    }
+}
+
+/// Opens a file (the `open` system call), given the path the caller passed.
+pub(crate) fn open(path: &[u8], flags: u64) -> i64 {
+    match fs::open(path, flags) {
+        Ok(ofd) => install(ofd, 0),
+        Err(e) => e,
+    }
+}
+
+/// Closes descriptor `fd` (the `close` system call).
+pub(crate) fn close(fd: u64) -> i64 {
+    let ofd = {
+        let mut t = table();
+        match t.cur_mut().fds.get_mut(fd as usize) {
+            Some(slot) if *slot != NO_FD => core::mem::replace(slot, NO_FD),
+            _ => return -EBADF,
+        }
+    };
+    fs::release(ofd as usize);
+    0
+}
+
+/// Duplicates `fd` onto the lowest free descriptor that is at least `min`
+/// (the `dup` system call, and `fcntl(F_DUPFD)`).
+pub(crate) fn dup(fd: u64, min: u64) -> i64 {
+    let Some(ofd) = description(fd) else {
+        return -EBADF;
+    };
+    if min >= FDS as u64 {
         return -EINVAL;
     }
+    fs::retain(ofd);
+    install(ofd, min)
+}
+
+/// Makes `newfd` refer to what `fd` refers to, closing it first (the `dup2`
+/// system call).
+pub(crate) fn dup2(fd: u64, newfd: u64) -> i64 {
+    let Some(ofd) = description(fd) else {
+        return -EBADF;
+    };
+    if newfd >= FDS as u64 {
+        return -EBADF;
+    }
+    if fd == newfd {
+        return newfd as i64;
+    }
+    fs::retain(ofd);
+    let old = core::mem::replace(&mut table().cur_mut().fds[newfd as usize], ofd as u8);
+    if old != NO_FD {
+        fs::release(old as usize);
+    }
+    newfd as i64
+}
+
+/// The `fcntl` system call: only `F_DUPFD`.
+pub(crate) fn fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
+    match cmd {
+        F_DUPFD => dup(fd, arg),
+        _ => -EINVAL,
+    }
+}
+
+/// Waits for a child to exit and reaps it (the `wait4` system call).
+///
+/// `want` selects the children to wait for the POSIX way: a pid waits for that
+/// child, -1 for any child, 0 for the caller's process group and anything
+/// below -1 for process group `-want`. Without a matching child the call fails
+/// with `-ECHILD` (so waiting twice for the same child fails, because reaping
+/// it made it stop being one); with `WNOHANG` and no exited child it reports 0.
+pub(crate) fn wait4(want: i64, status_ptr: u64, options: u64) -> i64 {
     loop {
         let mut t = table();
         let (me, my_pgid, pml4) = (t.cur().pid, t.cur().pgid, t.cur().pml4);
         let mut have_child = false;
-        let mut found = None;
-        for (slot, c) in t.procs.iter().enumerate() {
-            let selected = match pid {
-                1.. => c.pid == pid as u64,
+        for p in t.procs.iter_mut() {
+            if p.state == State::Unused || p.ppid != me {
+                continue;
+            }
+            let wanted = match want {
                 -1 => true,
-                0 => c.pgid == my_pgid,
-                _ => c.pgid == pid.unsigned_abs() as u64,
+                0 => p.pgid == my_pgid,
+                w if w > 0 => p.pid == w as u64,
+                w => p.pgid == (-w) as u64,
             };
-            if !c.exists() || c.ppid != me || !selected {
+            if !wanted {
                 continue;
             }
             have_child = true;
-            found = match c.report {
-                _ if c.state == State::Zombie => Some((slot, c.wstatus)),
-                Report::Stopped(sig) if options & WUNTRACED != 0 => {
-                    Some((slot, ((sig as i32) << 8) | 0x7F))
+            if p.state == State::Zombie {
+                if status_ptr != 0 && !vmm::copy_to_user(pml4, status_ptr, &p.wstatus.to_ne_bytes())
+                {
+                    return -EFAULT;
                 }
-                Report::Continued if options & WCONTINUED != 0 => Some((slot, 0xFFFF)),
-                _ => continue,
-            };
-            break;
-        }
-        if let Some((slot, wstatus)) = found {
-            if status_ptr != 0 && !vmm::copy_to_user(pml4, status_ptr, &wstatus.to_ne_bytes()) {
-                return -EFAULT;
+                p.state = State::Unused; // The slot and kernel stack are reusable.
+                return p.pid as i64;
             }
-            let c = &mut t.procs[slot];
-            if c.state == State::Zombie {
-                c.state = State::Unused; // The slot and kernel stack are reusable.
-            } else {
-                c.report = Report::None;
-            }
-            return c.pid as i64;
         }
         if !have_child {
             return -ECHILD;
@@ -679,13 +763,517 @@ pub(crate) fn wait(pid: i32, status_ptr: u64, options: u64) -> i64 {
         if options & WNOHANG != 0 {
             return 0;
         }
-        if signal::interrupted(t.cur()) {
+        if interrupting(t.cur()) {
             return -EINTR;
         }
         t.cur_mut().state = State::BlockedWait;
         drop(t);
         schedule();
     }
+}
+
+// ---- Signals ----------------------------------------------------------------
+//
+// A signal is first *posted* (`post`): it becomes pending, unless the target
+// ignores it. What happens then depends on its disposition:
+//
+// - The default action of a signal that is not blocked happens at once (`act_on`):
+//   the target is terminated or stopped, whoever sent the signal.
+// - A caught signal waits for the target to return to user mode
+//   (`deliver_signals`, run at the end of every system call), where the kernel
+//   pushes a signal frame and enters the handler. If the target is asleep in an
+//   interruptible call (`pause`, `wait4`, `ipc_recv`, a console `read`), it is
+//   woken and that call fails with `-EINTR`, or is restarted with `SA_RESTART`.
+//
+// A stopped process only reacts to SIGKILL and SIGCONT; everything else stays
+// pending until it is continued. Since the scheduler is cooperative, a process
+// only ever stops running inside a system call, so the end of `syscall_dispatch`
+// is the one place where handlers need to be entered.
+
+/// Sleeps until a signal arrives (the `pause` system call).
+///
+/// Returns `-EINTR` once a handler is about to run; a signal whose default
+/// action applies terminates or stops the process instead.
+pub(crate) fn pause() -> i64 {
+    loop {
+        {
+            let mut t = table();
+            if interrupting(t.cur()) {
+                return -EINTR;
+            }
+            t.cur_mut().state = State::BlockedPause;
+        }
+        schedule();
+    }
+}
+
+/// Whether `p` has a caught signal that it does not block: its blocking
+/// system call must end with `-EINTR` so that the handler can run.
+fn interrupting(p: &Process) -> bool {
+    p.pending
+        .without(p.blocked)
+        .iter()
+        .any(|sig| p.actions[sig as usize].disposition(sig) == Disposition::Catch)
+}
+
+/// Sets the disposition of a signal (the `rt_sigaction` system call).
+///
+/// `act` and `oldact` point at Linux `struct sigaction`s (handler, flags,
+/// restorer, mask); either may be null. A handler needs `SA_RESTORER`: the
+/// restorer is where the handler returns to, and must call `rt_sigreturn`.
+pub(crate) fn rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> i64 {
+    if sigsetsize != 8 || sig == 0 || !signal::valid(sig) {
+        return -EINVAL;
+    }
+    let pml4 = current_pml4();
+    let new = if act == 0 {
+        None
+    } else {
+        let mut bytes = [0u8; SigAction::SIZE];
+        if !vmm::copy_from_user(pml4, act, &mut bytes) {
+            return -EFAULT;
+        }
+        let new = SigAction::from_bytes(&bytes);
+        if !signal::can_change_disposition(sig) || !new.is_valid() {
+            return -EINVAL;
+        }
+        Some(new)
+    };
+    let old = table().cur().actions[sig as usize];
+    if oldact != 0 && !vmm::copy_to_user(pml4, oldact, &old.to_bytes()) {
+        return -EFAULT;
+    }
+    if let Some(new) = new {
+        let mut t = table();
+        let p = t.cur_mut();
+        p.actions[sig as usize] = new;
+        if new.disposition(sig) == Disposition::Ignore {
+            p.pending.remove(sig); // POSIX: an ignored signal is discarded.
+        }
+    }
+    0
+}
+
+/// Changes the caller's blocked signals (the `rt_sigprocmask` system call).
+///
+/// SIGKILL and SIGSTOP are silently left unblocked. Signals that become
+/// unblocked are delivered when the call returns.
+pub(crate) fn rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> i64 {
+    if sigsetsize != 8 {
+        return -EINVAL;
+    }
+    let pml4 = current_pml4();
+    let old = table().cur().blocked;
+    let new = if set == 0 {
+        None
+    } else {
+        let mut bytes = [0u8; 8];
+        if !vmm::copy_from_user(pml4, set, &mut bytes) {
+            return -EFAULT;
+        }
+        let set = SigSet::from_bits(u64::from_ne_bytes(bytes));
+        Some(match how {
+            SIG_BLOCK => old.union(set),
+            SIG_UNBLOCK => old.without(set),
+            SIG_SETMASK => set,
+            _ => return -EINVAL,
+        })
+    };
+    if oldset != 0 && !vmm::copy_to_user(pml4, oldset, &old.bits().to_ne_bytes()) {
+        return -EFAULT;
+    }
+    if let Some(new) = new {
+        table().cur_mut().blocked = new.blockable();
+    }
+    0
+}
+
+/// Returns from a signal handler (the `rt_sigreturn` system call).
+///
+/// The handler's `ret` went to its restorer, which made this call with the
+/// stack pointer at the frame's `ucontext`. Restores the registers and signal
+/// mask saved there, and returns the interrupted `rax`, so that the system
+/// call dispatcher hands it back unchanged. A frame that cannot be read, or
+/// that would resume at a kernel address, is fatal: SIGSEGV, as on Linux.
+pub(crate) fn rt_sigreturn(f: &mut TrapFrame) -> i64 {
+    let pml4 = current_pml4();
+    let mut saved = signal::SavedContext::empty();
+    // The handler's `ret` popped the frame's first word, so the stack pointer
+    // is at the `ucontext`.
+    let blocked = if vmm::copy_from_user(pml4, f.rsp, saved.as_mut_bytes()) {
+        saved.restore(f)
+    } else {
+        None
+    };
+    match blocked {
+        Some(blocked) => {
+            table().cur_mut().blocked = blocked;
+            f.rax as i64
+        }
+        None => exit_current(wait_status_signalled(SIGSEGV)),
+    }
+}
+
+/// Sends `sig` to a process or process group (the `kill` system call).
+///
+/// `target` follows POSIX: a pid signals that process, 0 the caller's process
+/// group, -1 every process that may be signalled (except init and the caller)
+/// and anything below -1 the process group `-target`. Signal 0 only reports
+/// whether a target exists. A signal the caller sends itself is delivered
+/// before `kill` returns, as POSIX requires.
+pub(crate) fn kill(target: i64, sig: u64) -> i64 {
+    let target = match target {
+        -1 => Target::All,
+        0 => Target::Group(table().cur().pgid),
+        w if w > 0 => Target::Pid(w as u64),
+        w => Target::Group((-w) as u64),
+    };
+    send(target, sig)
+}
+
+/// Sends `sig` to every process in group `pgid` (the `kill_pgrp` system call).
+///
+/// Unlike `kill(-pgid)`, this also reaches group 1 (init's), which is the
+/// terminal's foreground group whenever the shell is waiting for input.
+pub(crate) fn kill_pgrp(pgid: u64, sig: u64) -> i64 {
+    if pgid == 0 {
+        return -EINVAL;
+    }
+    send(Target::Group(pgid), sig)
+}
+
+/// The processes a signal is sent to.
+enum Target {
+    Pid(u64),
+    Group(u64),
+    /// Every process that may be signalled: all but init and the sender.
+    All,
+}
+
+/// Sends `sig` to `target`: the common part of `kill` and `kill_pgrp`.
+fn send(target: Target, sig: u64) -> i64 {
+    if !signal::valid(sig) {
+        return -EINVAL;
+    }
+    let mut targets: u16 = 0;
+    let me = {
+        let t = table();
+        let me = t.cur().pid;
+        for (slot, p) in t.procs.iter().enumerate() {
+            if !p.alive() {
+                continue;
+            }
+            let hit = match target {
+                Target::All => p.pid != me && p.pid != INIT_PID,
+                Target::Group(pgid) => p.pgid == pgid,
+                Target::Pid(pid) => p.pid == pid,
+            };
+            if hit {
+                targets |= 1 << slot;
+            }
+        }
+        me
+    };
+    if targets == 0 {
+        return -ESRCH;
+    }
+    if sig == 0 {
+        return 0; // Existence check only.
+    }
+    for slot in (0..MAX_PROCS).filter(|slot| targets & (1 << slot) != 0) {
+        let dead = post(&mut table(), slot, sig, me);
+        if let Some(d) = dead {
+            finish_death(d);
+        }
+    }
+    0
+}
+
+/// Posts `sig`, sent by `sender`, to `slot`; returns what to clean up if that
+/// terminated the process.
+///
+/// The running process is never terminated or stopped here (it is still on
+/// its own kernel stack): its signals act when it returns to user mode.
+fn post(t: &mut Table, slot: usize, sig: u64, sender: u64) -> Option<Dead> {
+    let running = t.current == slot;
+    let p = &mut t.procs[slot];
+    if !p.alive() {
+        return None; // It exited while this signal was on its way.
+    }
+    if sig == SIGKILL && !running {
+        return Some(make_zombie(t, slot, wait_status_signalled(sig)));
+    }
+    let disposition = p.actions[sig as usize].disposition(sig);
+    if sig == SIGCONT {
+        // Continuing happens whatever the disposition, even if SIGCONT is
+        // ignored or blocked.
+        p.pending.drop_stops();
+        if p.state == State::Stopped {
+            p.state = p.stopped_prev;
+        }
+    } else if signal::default_action(sig) == Action::Stop {
+        p.pending.remove(SIGCONT);
+    }
+    if disposition != Disposition::Ignore || sig == SIGKILL {
+        p.pending.add(sig);
+        p.senders[sig as usize] = sender;
+    }
+    if running {
+        None
+    } else {
+        act_on(t, slot)
+    }
+}
+
+/// Takes the actions that `slot`'s pending signals call for right away.
+///
+/// For a process that is not running: default actions of unblocked signals
+/// happen now, and a caught one interrupts the call it sleeps in.
+fn act_on(t: &mut Table, slot: usize) -> Option<Dead> {
+    let p = &mut t.procs[slot];
+    if p.state == State::Stopped {
+        return None; // Only SIGKILL and SIGCONT act on it, in `post`.
+    }
+    for sig in p.pending.without(p.blocked).iter() {
+        match p.actions[sig as usize].disposition(sig) {
+            Disposition::Catch => interrupt_sleep(p),
+            Disposition::Ignore => p.pending.remove(sig),
+            Disposition::Default => match signal::default_action(sig) {
+                Action::Term => {
+                    p.pending.remove(sig);
+                    return Some(make_zombie(t, slot, wait_status_signalled(sig)));
+                }
+                Action::Stop => {
+                    p.pending.remove(sig);
+                    p.stopped_prev = p.state;
+                    p.state = State::Stopped;
+                    return None;
+                }
+                Action::Cont | Action::Ignore => p.pending.remove(sig),
+            },
+        }
+    }
+    None
+}
+
+/// Wakes `p` if it sleeps in a call that a signal interrupts.
+///
+/// The call notices the pending signal and fails with `-EINTR` (see
+/// [`interrupting`]); an interrupted IPC call is withdrawn, so its server can
+/// no longer touch the client's buffer.
+fn interrupt_sleep(p: &mut Process) {
+    match p.state {
+        State::BlockedPause | State::BlockedWait | State::BlockedRecv | State::BlockedService => {
+            p.state = State::Ready;
+        }
+        State::BlockedCall if p.call.interruptible => {
+            p.call.result = -EINTR;
+            p.state = State::Ready;
+        }
+        _ => {}
+    }
+}
+
+/// System calls that `SA_RESTART` restarts after a handler ran.
+///
+/// POSIX: `pause` always fails with `EINTR`.
+fn restartable(nr: u64) -> bool {
+    matches!(nr, nr::READ | nr::WAIT4 | nr::IPC_RECV)
+}
+
+/// What the current process does next with its pending signals.
+enum Next {
+    /// Nothing is deliverable: return to user mode.
+    Return,
+    /// Run the handler for `sig`.
+    Handle(u64, SigAction, u64, SigSet),
+    /// Terminate with the default action of `sig`.
+    Die(u64),
+    /// Stopped: let others run, then look again.
+    Stop,
+}
+
+/// Acts on the current process's pending signals on its way back to user mode.
+///
+/// Called at the end of every system call with the user registers, after
+/// `f.rax` got the result of call number `nr`. Default actions happen here
+/// for signals the process sent itself or just unblocked; a caught signal gets
+/// a signal frame on the user stack and `f` is pointed at its handler.
+pub(crate) fn deliver_signals(f: &mut TrapFrame, nr: u64) {
+    loop {
+        let next = {
+            let mut t = table();
+            let p = t.cur_mut();
+            match p.pending.without(p.blocked).lowest() {
+                None => Next::Return,
+                Some(sig) => {
+                    p.pending.remove(sig);
+                    let act = p.actions[sig as usize];
+                    match act.disposition(sig) {
+                        Disposition::Catch => {
+                            let old_blocked = p.blocked;
+                            p.blocked = p.blocked.union(act.blocks_while_handling(sig));
+                            if act.flags & SA_RESETHAND != 0 {
+                                p.actions[sig as usize] = SigAction::DEFAULT;
+                            }
+                            Next::Handle(sig, act, p.senders[sig as usize], old_blocked)
+                        }
+                        Disposition::Ignore => continue,
+                        Disposition::Default => match signal::default_action(sig) {
+                            Action::Term => Next::Die(sig),
+                            Action::Stop => {
+                                p.stopped_prev = State::Ready;
+                                p.state = State::Stopped;
+                                Next::Stop
+                            }
+                            Action::Cont | Action::Ignore => continue,
+                        },
+                    }
+                }
+            }
+        };
+        match next {
+            Next::Return => return,
+            Next::Die(sig) => exit_current(wait_status_signalled(sig)),
+            Next::Stop => schedule(),
+            Next::Handle(sig, act, sender, old_blocked) => {
+                if f.rax as i64 == -EINTR && act.flags & SA_RESTART != 0 && restartable(nr) {
+                    // Back up to the `syscall` instruction (2 bytes), so that
+                    // returning from the handler makes the call again.
+                    f.rip = f.rip.wrapping_sub(2);
+                    f.rax = nr;
+                }
+                enter_handler(f, sig, &act, sender, old_blocked);
+                return; // Further signals are delivered when it calls again.
+            }
+        }
+    }
+}
+
+/// Pushes the signal frame for `sig` and points `f` at its handler.
+///
+/// A process whose stack cannot take the frame is killed with SIGSEGV.
+fn enter_handler(f: &mut TrapFrame, sig: u64, act: &SigAction, sender: u64, blocked: SigSet) {
+    let frame = Frame::new(sig, sender, act, f, blocked);
+    // `copy_to_user` only accepts mapped, writable user memory.
+    match Frame::address(f.rsp) {
+        Some(addr) if vmm::copy_to_user(current_pml4(), addr, frame.as_bytes()) => {
+            Frame::enter_handler(f, sig, act, addr);
+        }
+        _ => exit_current(wait_status_signalled(SIGSEGV)),
+    }
+}
+
+// ---- Process groups and sessions ---------------------------------------------
+
+/// Puts `pid` into process group `pgid` (the `setpgid` system call).
+///
+/// `pid` 0 means the caller and `pgid` 0 the target's own pid. As POSIX
+/// requires, only the caller or one of its children can be moved, a session
+/// leader cannot change group, and the group must be in the caller's session.
+pub(crate) fn setpgid(pid: u64, pgid: u64) -> i64 {
+    let mut t = table();
+    let (me, my_sid) = (t.cur().pid, t.cur().sid);
+    let pid = if pid == 0 { me } else { pid };
+    let Some(slot) = t.live_slot(pid) else {
+        return -ESRCH;
+    };
+    let target = &t.procs[slot];
+    if target.pid != me && target.ppid != me {
+        return -ESRCH;
+    }
+    if target.pid == target.sid {
+        return -EPERM; // A session leader cannot leave its group.
+    }
+    if target.sid != my_sid {
+        return -EPERM;
+    }
+    let pgid = if pgid == 0 { pid } else { pgid };
+    // The group must be the target's own, or an existing one in the session.
+    if pgid != pid
+        && !t
+            .procs
+            .iter()
+            .any(|p| p.alive() && p.pgid == pgid && p.sid == my_sid)
+    {
+        return -EPERM;
+    }
+    t.procs[slot].pgid = pgid;
+    0
+}
+
+/// Returns the process group of `pid` (0 = the caller), for `getpgid`.
+pub(crate) fn getpgid(pid: u64) -> i64 {
+    let t = table();
+    let pid = if pid == 0 { t.cur().pid } else { pid };
+    match t.live_slot(pid) {
+        Some(slot) => t.procs[slot].pgid as i64,
+        None => -ESRCH,
+    }
+}
+
+/// Returns the session of `pid` (0 = the caller), for `getsid`.
+pub(crate) fn getsid(pid: u64) -> i64 {
+    let t = table();
+    let pid = if pid == 0 { t.cur().pid } else { pid };
+    match t.live_slot(pid) {
+        Some(slot) => t.procs[slot].sid as i64,
+        None => -ESRCH,
+    }
+}
+
+/// Makes the caller the leader of a new session (the `setsid` system call).
+pub(crate) fn setsid() -> i64 {
+    let mut t = table();
+    let me = t.cur().pid;
+    // A process group leader cannot start a session: its group would straddle
+    // two sessions.
+    if t.procs.iter().any(|p| p.alive() && p.pgid == me) {
+        return -EPERM;
+    }
+    let p = t.cur_mut();
+    p.sid = me;
+    p.pgid = me;
+    me as i64
+}
+
+/// Lists the processes into the caller's buffer (the `proc_list` system call).
+///
+/// Each entry is a serialised [`ProcInfo`]; `ps` formats them. The return
+/// value is the number of entries written.
+pub(crate) fn proc_list(buf: u64, len: u64) -> i64 {
+    let pml4 = current_pml4();
+    if !vmm::user_range_ok(pml4, buf, len, true) {
+        return -EFAULT;
+    }
+    let capacity = len as usize / PROC_INFO_LEN;
+    let mut written = 0;
+    for slot in 0..MAX_PROCS {
+        if written == capacity {
+            break;
+        }
+        let info = {
+            let t = table();
+            let p = &t.procs[slot];
+            if p.state == State::Unused {
+                continue;
+            }
+            ProcInfo {
+                pid: p.pid,
+                ppid: p.ppid,
+                pgid: p.pgid,
+                sid: p.sid,
+                state: p.reported_state(),
+                name: p.name.0,
+            }
+        };
+        let at = buf + (written * PROC_INFO_LEN) as u64;
+        if !vmm::copy_to_user(pml4, at, &info.to_bytes()) {
+            return -EFAULT;
+        }
+        written += 1;
+    }
+    written as i64
 }
 
 /// Anonymous private mapping (addr hint ignored; kernel picks the address).
@@ -777,7 +1365,7 @@ pub(crate) fn ipc_recv(out: u64) -> i64 {
     loop {
         let mut t = table();
         let Some(msg) = next_message(&mut t) else {
-            if signal::interrupted(t.cur()) {
+            if interrupting(t.cur()) {
                 return -EINTR;
             }
             t.cur_mut().state = State::BlockedRecv;
@@ -832,10 +1420,22 @@ fn next_message(t: &mut Table) -> Option<Msg> {
 /// Sends request `op` with buffer `buf[..len]` to `dest` and waits for the reply.
 ///
 /// Returns the reply status. `access` limits what the server may do with the
-/// buffer (the `IPC_CALL` system call grants both reading and writing).
-pub(crate) fn ipc_call(dest: u64, op: u64, buf: u64, len: u64, access: Access) -> i64 {
+/// buffer (the `IPC_CALL` system call grants both reading and writing). An
+/// `interruptible` call fails with `-EINTR` when a caught signal arrives; it is
+/// then withdrawn, so the server can no longer reach the buffer.
+pub(crate) fn ipc_call(
+    dest: u64,
+    op: u64,
+    buf: u64,
+    len: u64,
+    access: Access,
+    interruptible: bool,
+) -> i64 {
     {
         let mut t = table();
+        if interruptible && interrupting(t.cur()) {
+            return -EINTR;
+        }
         let Some(server) = t.live_slot(dest) else {
             return -ESRCH;
         };
@@ -844,9 +1444,6 @@ pub(crate) fn ipc_call(dest: u64, op: u64, buf: u64, len: u64, access: Access) -
         }
         if !vmm::user_range_ok(t.cur().pml4, buf, len, false) {
             return -EFAULT;
-        }
-        if signal::interrupted(t.cur()) {
-            return -EINTR;
         }
         t.call_seq += 1;
         let seq = t.call_seq;
@@ -860,13 +1457,12 @@ pub(crate) fn ipc_call(dest: u64, op: u64, buf: u64, len: u64, access: Access) -
             seq,
             received: false,
             result: 0,
+            interruptible,
         };
         p.state = State::BlockedCall;
         t.wake_receiver(server);
     }
-    // Until `ipc_reply` makes us ready, or the server's death (-EPIPE) or a signal (-EINTR,
-    // which cancels the call: the server can no longer reply or transfer data).
-    schedule();
+    schedule(); // Until `ipc_reply` (or the server's death) makes us ready.
     table().cur().call.result
 }
 
@@ -889,7 +1485,7 @@ pub(crate) fn ipc_reply(client: u64, status: u64) -> i64 {
         Ok(slot) => {
             let c = &mut t.procs[slot];
             c.call.result = status as i64;
-            c.state = State::Ready;
+            c.make_ready();
             0
         }
         Err(e) => e,
@@ -972,20 +1568,25 @@ pub(crate) fn svc_lookup(id: u64) -> i64 {
 ///
 /// The call lets the server only write / only read the caller's buffer.
 /// During boot the console may not have registered yet: wait for it.
+///
+/// A `read` may wait for a long time, for someone to type a line, so a caught
+/// signal interrupts it; a `write` always completes.
 pub(crate) fn console_call(op: u64, buf: u64, len: u64, access: Access) -> i64 {
+    let interruptible = op == haisuli_abi::console::OP_READ;
     loop {
         let pid = svc_lookup(svc::CONSOLE);
         if pid > 0 {
             // The console server itself must drive the hardware directly
             // (a call to itself fails with EDEADLK).
-            return ipc_call(pid as u64, op, buf, len, access);
+            return ipc_call(pid as u64, op, buf, len, access, interruptible);
         }
-        let mut t = table();
-        if signal::interrupted(t.cur()) {
-            return -EINTR;
+        {
+            let mut t = table();
+            if interruptible && interrupting(t.cur()) {
+                return -EINTR;
+            }
+            t.cur_mut().state = State::BlockedService;
         }
-        t.cur_mut().state = State::BlockedService;
-        drop(t);
         schedule();
     }
 }

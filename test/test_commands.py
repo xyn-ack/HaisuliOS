@@ -3,21 +3,22 @@
 
 Checks the shell's built-in commands (help, echo, ls, cat) and its error handling.
 """
-from haisuli import read_rootfs
+from haisuli import PROMPT, read_rootfs
 
 HELP = """\
 commands:
-  help                this list
-  echo [text...]      print text
-  ls [dir]            list files on the boot ramdisk
-  cat file...         print files
-  ps                  list processes
-  pause               wait for a signal (Ctrl-C interrupts it)
-  kill [-sig] pid...  send a signal (default TERM; -l lists them)
-  wait [pid...]       wait for background jobs
-  exit [n]            leave the shell and power off
-'command &' runs a command in the background. $? is the exit status of the
-last command, $! the pid of the last background job and $$ the shell's pid.
+  help              this list
+  echo [text...]    print text
+  ls [dir]          list a directory
+  cat [file...]     print files (or the input)
+  ps                list processes
+  pause             wait for a signal (as a job: pause &)
+  kill [-sig] pid   signal a process (-pid: a process group)
+  wait [pid...]     wait for background jobs
+  trap [cmd sig...] run cmd on a signal ('' ignores, - resets)
+  exit [status]     leave the shell and power off
+end a command with & to run it in the background; $? is its status
+redirect with > file, >> file, < file, 2> file and 2>&1
 """
 
 # ---- help -----------------------------------------------------------------
@@ -106,8 +107,14 @@ def test_cat_continues_after_an_error(sh):
     assert out == "cat: /nope: no such file\n" + motd + "cat: /etc: is a directory\n"
 
 
-def test_cat_without_arguments_prints_nothing(sh):
-    assert sh.run("cat") == ""
+def test_cat_without_arguments_reads_its_input(sh):
+    # POSIX: without operands, cat copies its standard input; Ctrl-D on an
+    # empty line ends it at once.
+    sh.send("cat\r")
+    sh.send("\x04")
+    assert sh.expect(PROMPT) == "cat\n" + PROMPT
+    # The Ctrl-D was cat's, not the shell's (which would have exited).
+    assert sh.run("echo still here") == "still here\n"
 
 
 # ---- errors and odd input ---------------------------------------------------
