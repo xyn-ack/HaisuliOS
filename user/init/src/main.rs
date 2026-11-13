@@ -29,7 +29,7 @@ use haisuli_rt::abi::errno::{self, ECHILD, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM
 use haisuli_rt::abi::fcntl::{O_DIRECTORY, O_RDONLY};
 use haisuli_rt::abi::proc_state;
 use haisuli_rt::abi::signal::{self, NSIG, SIGINT, SIGTERM};
-use haisuli_rt::abi::ProcInfo;
+use haisuli_rt::abi::{ProcInfo, Termination};
 use haisuli_rt::io::{tcsetpgrp, write_all, BufWriter, Sink, STDIN, STDOUT};
 use haisuli_rt::{eprintln, print, println, sys};
 
@@ -515,7 +515,7 @@ fn leave_prompt() {
 ///
 /// POSIX: greater than 128; like other shells, 128 plus the signal number.
 fn interrupted_status() -> i32 {
-    128 + traps::first_caught().unwrap_or(SIGINT) as i32
+    Termination::Signalled(traps::first_caught().unwrap_or(SIGINT)).shell_status()
 }
 
 /// Copies `fd` (named `name` in errors) to standard output, for `cat`.

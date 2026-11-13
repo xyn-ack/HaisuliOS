@@ -41,6 +41,7 @@ kernel/            the kernel
     context.rs     kernel stacks, context switch
     phys.rs        physical memory access, limited to allocator-owned frames
     multiboot.rs   boot-loader information: memory map, boot modules
+    x86.rs         names for the CPU's numbers: register bits, vectors, descriptors
   sync.rs          Lock: a cell that panics on re-entrant use instead of aliasing
   gdt.rs           GDT + TSS (layout chosen for SYSCALL/SYSRET), I/O bitmap
   idt.rs           IDT, CPU exception handling
@@ -53,7 +54,8 @@ kernel/            the kernel
   signal.rs        Dispositions, default actions, signal sets, the signal frame
   syscall.rs       Syscall dispatcher (Linux-compatible numbers)
   serial.rs        COM1 kernel debug log, print!/println!
-abi/               syscall numbers, errno values, IPC protocols (kernel + user)
+abi/               syscall numbers, errno values, IPC protocols, the 16550 UART's
+                   registers (kernel + user)
 user/rt/           user runtime: entry point, syscall wrappers, print!, panics
 user/console/      console server
 user/init/         init (pid 1): /etc/motd, then a job control shell
@@ -429,6 +431,12 @@ The code follows the Linux kernel's Rust coding guidelines
   period, including `// SAFETY:` comments. The first paragraph of every doc
   comment is a single sentence. Functions that can panic have a `# Panics`
   section, and unsafe functions have a `# Safety` section.
+* No magic numbers. A hardware or format constant has a name and a doc
+  comment saying what it is: an enum for a set of alternatives or the flags of
+  one register (`Selector`, `Exception`, `RFlag`, `PageFlag`, the UART's
+  `LineStatus`, ...), with `bits(&[...])` for the flags that get combined; a
+  documented constant for a size or count. The assembly takes them as `const`
+  operands rather than repeating the numbers.
 * Every workspace crate uses the kernel's Rust lint set (`rust_common_flags`
   in the kernel Makefile), configured under `[workspace.lints]` in
   `Cargo.toml`: for example `unreachable_pub`, `rust_2018_idioms`,

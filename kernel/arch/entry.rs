@@ -8,7 +8,9 @@
 //! reference with `sym` operands: [`crate::idt::exception_handler`], [`crate::irq::irq_dispatch`]
 //! and [`crate::syscall::syscall_dispatch`]. `trap_return` is the common way back to user mode.
 
-use super::cpu::{self, MSR_EFER, MSR_LSTAR, MSR_SFMASK, MSR_STAR};
+use super::cpu;
+use super::x86::{Efer, Msr, RFlag};
+use crate::gdt::{Selector, USER_CS, USER_DS};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -140,6 +142,10 @@ isr\n:
 .endm
 
 .pushsection .text
+# The CPU pushes an error code for these exceptions only (SDM table 6-1; see
+# `x86::Exception`): #DF 8, #TS 10, #NP 11, #SS 12, #GP 13, #PF 14, #AC 17,
+# #CP 21, #VC 29 and #SX 30. For the others the stub pushes a 0 in its place,
+# so that every handler finds the same frame.
 .irp n, 0,1,2,3,4,5,6,7,9,15,16,18,19,20,22,23,24,25,26,27,28,31
     ISR_NOERR \n
 .endr
@@ -232,14 +238,29 @@ pub(crate) fn set_syscall_stack(top: u64) {
     SYSCALL_KERNEL_RSP.store(top, Ordering::Relaxed);
 }
 
+/// STAR: `syscall` loads the kernel code segment from bits 32..48 (and the
+/// kernel data segment from the next GDT entry). `sysret` loads the user data
+/// segment from the entry after the selector in bits 48..64, and user code
+/// from the one after that. (HaisuliOS returns with `iretq`, but `sysret`
+/// would work.)
+const STAR: u64 = (Selector::UserData as u64 - 8) << 48 | (Selector::KernelCode as u64) << 32;
+const _: () = {
+    // The GDT layout that `syscall` and `sysret` assume.
+    assert!(Selector::KernelData as u64 == Selector::KernelCode as u64 + 8);
+    assert!(Selector::UserCode as u64 == Selector::UserData as u64 + 8);
+};
+
+/// RFLAGS bits that `syscall` clears: single-stepping, interrupts (the kernel
+/// runs with them off) and the direction flag (the ABI wants it clear).
+const SYSCALL_CLEARS: u64 = RFlag::bits(&[RFlag::Trap, RFlag::Interrupt, RFlag::Direction]);
+
 /// Enables the `syscall` instruction and points it at `syscall_entry`.
-///
-/// STAR must match the GDT layout (see [`crate::gdt`]).
 pub(crate) fn init_syscalls() {
-    cpu::wrmsr(MSR_EFER, cpu::rdmsr(MSR_EFER) | 1); // Set `EFER.SCE`.
-    cpu::wrmsr(MSR_STAR, (0x10u64 << 48) | (0x08u64 << 32));
-    cpu::wrmsr(MSR_LSTAR, stub_address(syscall_entry));
-    cpu::wrmsr(MSR_SFMASK, 0x700); // Clear TF, IF and DF on entry.
+    let efer = cpu::rdmsr(Msr::Efer) | Efer::Syscall as u64;
+    cpu::wrmsr(Msr::Efer, efer);
+    cpu::wrmsr(Msr::Star, STAR);
+    cpu::wrmsr(Msr::LStar, stub_address(syscall_entry));
+    cpu::wrmsr(Msr::SfMask, SYSCALL_CLEARS);
 }
 
 // We always return to user mode through iretq (trap_return), never sysret.
@@ -250,10 +271,10 @@ global_asm!(
 syscall_entry:
     mov [rip + {user_rsp}], rsp
     mov rsp, [rip + {kernel_rsp}]
-    push 0x1B                                  # ss
+    push {user_ss}                             # ss
     push qword ptr [rip + {user_rsp}]          # rsp
     push r11                                   # rflags
-    push 0x23                                  # cs
+    push {user_cs}                             # cs
     push rcx                                   # rip
     push rax
     push rbx
@@ -298,5 +319,7 @@ trap_return:
 "#,
     user_rsp = sym SYSCALL_USER_RSP,
     kernel_rsp = sym SYSCALL_KERNEL_RSP,
+    user_ss = const USER_DS,
+    user_cs = const USER_CS,
     dispatch = sym crate::syscall::syscall_dispatch,
 );

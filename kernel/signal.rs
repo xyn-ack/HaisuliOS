@@ -11,6 +11,9 @@
 //! future libc port, finds `siginfo_t` and `ucontext_t` where it expects them.
 
 use crate::arch::entry::TrapFrame;
+use crate::arch::x86::RFlag;
+use crate::process::USER_RFLAGS;
+use crate::vmm::USER_LIMIT;
 use haisuli_abi::signal::{
     self, NSIG, SA_NODEFER, SA_RESETHAND, SA_RESTORER, SIGCHLD, SIGCONT, SIGKILL, SIGSTOP, SIGTSTP,
     SIGTTIN, SIGTTOU, SIG_DFL, SIG_IGN,
@@ -225,7 +228,7 @@ impl SigAction {
 /// Anything else must never reach `rip` or `rsp` on the way to user mode: a
 /// non-canonical address would make `iretq` fault in the kernel.
 pub(crate) fn is_user_address(addr: u64) -> bool {
-    addr < 0x0000_8000_0000_0000
+    addr < USER_LIMIT
 }
 
 /// `siginfo_t.si_code` of a signal sent with `kill` (Linux `SI_USER`).
@@ -233,21 +236,93 @@ const SI_USER: u32 = 0;
 
 // Offsets in the Linux x86_64 signal frame (`struct rt_sigframe`):
 // `pretcode` (the restorer), then `struct ucontext`, then `struct siginfo`.
+/// `struct ucontext` in the frame, after the 8-byte `pretcode`.
 const UC: usize = 8;
+/// `uc_flags`, `uc_link` and `uc_stack`: the part of `struct ucontext`
+/// before `uc_mcontext`.
+const UCONTEXT_HEADER: usize = 40;
 /// `ucontext.uc_mcontext` (a `struct sigcontext`) in the frame.
-const MCONTEXT: usize = UC + 40;
+const MCONTEXT: usize = UC + UCONTEXT_HEADER;
+/// Words in a `struct sigcontext`, including its reserved ones.
+const SIGCONTEXT_WORDS: usize = 32;
 /// `ucontext.uc_sigmask` in the frame.
-const SIGMASK: usize = MCONTEXT + 32 * 8;
+const SIGMASK: usize = MCONTEXT + SIGCONTEXT_WORDS * 8;
 /// `struct siginfo` in the frame.
 const SIGINFO: usize = SIGMASK + 8;
-/// `struct sigcontext`: r8 ... r15, rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip, eflags.
-const MCONTEXT_WORDS: usize = 18;
-/// The RFLAGS bits a handler's `rt_sigreturn` may change: CF PF AF ZF SF DF OF.
-const USER_FLAGS: u64 = 0xCD5;
-/// RFLAGS for user mode: IF, and the reserved bit 1.
-const BASE_FLAGS: u64 = 0x202;
-/// RFLAGS.DF and RFLAGS.TF, which the ABI wants clear when a function is called.
-const DF_TF: u64 = 0x500;
+
+/// The words of Linux's x86_64 `struct sigcontext`, in order.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum SigContext {
+    R8,
+    R9,
+    R10,
+    R11,
+    R12,
+    R13,
+    R14,
+    R15,
+    Rdi,
+    Rsi,
+    Rbp,
+    Rbx,
+    Rdx,
+    Rax,
+    Rcx,
+    Rsp,
+    Rip,
+    Eflags,
+    /// `cs`, `gs`, `fs` and `ss`, 16 bits each (see [`SS_SHIFT`]).
+    Segments,
+    /// The error code of the exception that raised the signal (0 here).
+    Err,
+    /// Its vector (0 here).
+    TrapNo,
+    /// The blocked signals, for old-style handlers.
+    OldMask,
+}
+
+/// Where `ss` is in the [`SigContext::Segments`] word (`cs` is at bit 0).
+const SS_SHIFT: u32 = 48;
+
+impl SigContext {
+    /// The field's offset in the signal frame.
+    const fn offset(self) -> usize {
+        MCONTEXT + self as usize * 8
+    }
+}
+
+/// Offsets of the `struct siginfo` fields the kernel fills in.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum SigInfo {
+    /// `si_signo` (i32), followed by `si_errno` (i32, 0 here).
+    Signo = 0,
+    /// `si_code` (i32).
+    Code = 8,
+    /// `si_pid` (i32) of the sender, followed by its `si_uid` (u32, 0 here).
+    Pid = 16,
+}
+
+impl SigInfo {
+    /// The field's offset in the signal frame.
+    const fn offset(self) -> usize {
+        SIGINFO + self as usize
+    }
+}
+/// The RFLAGS bits a handler's `rt_sigreturn` may change: the arithmetic
+/// flags and the direction flag. (Not TF, IF or the I/O privilege level.)
+const USER_FLAGS: u64 = RFlag::bits(&[
+    RFlag::Carry,
+    RFlag::Parity,
+    RFlag::Adjust,
+    RFlag::Zero,
+    RFlag::Sign,
+    RFlag::Direction,
+    RFlag::Overflow,
+]);
+/// RFLAGS bits that the ABI wants clear when a function (the handler) is called.
+const CLEAR_ON_CALL: u64 = RFlag::bits(&[RFlag::Direction, RFlag::Trap]);
 
 /// The signal frame the kernel writes below the user stack pointer to run a handler.
 pub(crate) struct Frame {
@@ -270,23 +345,40 @@ impl Frame {
         let mut f = Frame {
             bytes: [0; Frame::SIZE],
         };
-        f.put(0, act.restorer);
+        f.put(0, act.restorer); // `pretcode`: where the handler returns to.
+        use SigContext as C;
         let r = regs;
-        let mcontext = [
-            r.r8, r.r9, r.r10, r.r11, r.r12, r.r13, r.r14, r.r15, r.rdi, r.rsi, r.rbp, r.rbx,
-            r.rdx, r.rax, r.rcx, r.rsp, r.rip, r.rflags,
-        ];
-        for (i, &w) in mcontext.iter().enumerate() {
-            f.put(MCONTEXT + i * 8, w);
+        for (field, value) in [
+            (C::R8, r.r8),
+            (C::R9, r.r9),
+            (C::R10, r.r10),
+            (C::R11, r.r11),
+            (C::R12, r.r12),
+            (C::R13, r.r13),
+            (C::R14, r.r14),
+            (C::R15, r.r15),
+            (C::Rdi, r.rdi),
+            (C::Rsi, r.rsi),
+            (C::Rbp, r.rbp),
+            (C::Rbx, r.rbx),
+            (C::Rdx, r.rdx),
+            (C::Rax, r.rax),
+            (C::Rcx, r.rcx),
+            (C::Rsp, r.rsp),
+            (C::Rip, r.rip),
+            (C::Eflags, r.rflags),
+            (C::Segments, r.cs | r.ss << SS_SHIFT),
+            // No exception raised the signal.
+            (C::Err, 0),
+            (C::TrapNo, 0),
+            (C::OldMask, blocked.bits()),
+        ] {
+            f.put(field.offset(), value);
         }
-        // cs, gs, fs and ss, as four 16-bit fields.
-        f.put(MCONTEXT + 18 * 8, r.cs | (r.ss << 48));
-        f.put(MCONTEXT + 21 * 8, blocked.bits()); // `oldmask`.
         f.put(SIGMASK, blocked.bits());
-        // siginfo: si_signo, si_errno, si_code, then si_pid and si_uid.
-        f.put(SIGINFO, sig);
-        f.put(SIGINFO + 8, SI_USER as u64);
-        f.put(SIGINFO + 16, sender);
+        f.put(SigInfo::Signo.offset(), sig);
+        f.put(SigInfo::Code.offset(), SI_USER as u64);
+        f.put(SigInfo::Pid.offset(), sender);
         f
     }
 
@@ -313,7 +405,7 @@ impl Frame {
         regs.rsi = frame_addr + SIGINFO as u64;
         regs.rdx = frame_addr + UC as u64;
         regs.rax = 0;
-        regs.rflags &= !DF_TF;
+        regs.rflags &= !CLEAR_ON_CALL;
     }
 
     fn put(&mut self, at: usize, v: u64) {
@@ -354,29 +446,30 @@ impl SavedContext {
     /// segments are always the user ones, only the arithmetic flags and DF
     /// come from it, and `rip` and `rsp` must be user addresses.
     pub(crate) fn restore(&self, regs: &mut TrapFrame) -> Option<SigSet> {
-        let w: [u64; MCONTEXT_WORDS] = core::array::from_fn(|i| self.word(MCONTEXT + i * 8));
-        let (rsp, rip) = (w[15], w[16]);
+        use SigContext as C;
+        let get = |field: SigContext| self.word(field.offset());
+        let (rsp, rip) = (get(C::Rsp), get(C::Rip));
         if !is_user_address(rip) || !is_user_address(rsp) {
             return None;
         }
-        regs.r8 = w[0];
-        regs.r9 = w[1];
-        regs.r10 = w[2];
-        regs.r11 = w[3];
-        regs.r12 = w[4];
-        regs.r13 = w[5];
-        regs.r14 = w[6];
-        regs.r15 = w[7];
-        regs.rdi = w[8];
-        regs.rsi = w[9];
-        regs.rbp = w[10];
-        regs.rbx = w[11];
-        regs.rdx = w[12];
-        regs.rax = w[13];
-        regs.rcx = w[14];
+        regs.r8 = get(C::R8);
+        regs.r9 = get(C::R9);
+        regs.r10 = get(C::R10);
+        regs.r11 = get(C::R11);
+        regs.r12 = get(C::R12);
+        regs.r13 = get(C::R13);
+        regs.r14 = get(C::R14);
+        regs.r15 = get(C::R15);
+        regs.rdi = get(C::Rdi);
+        regs.rsi = get(C::Rsi);
+        regs.rbp = get(C::Rbp);
+        regs.rbx = get(C::Rbx);
+        regs.rdx = get(C::Rdx);
+        regs.rax = get(C::Rax);
+        regs.rcx = get(C::Rcx);
         regs.rsp = rsp;
         regs.rip = rip;
-        regs.rflags = BASE_FLAGS | (w[17] & USER_FLAGS);
+        regs.rflags = USER_RFLAGS | (get(C::Eflags) & USER_FLAGS);
         Some(SigSet::from_bits(self.word(SIGMASK)).blockable())
     }
 }

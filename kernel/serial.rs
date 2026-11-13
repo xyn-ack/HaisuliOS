@@ -8,20 +8,44 @@
 
 use crate::arch::cpu::Device::Com1;
 use core::fmt::{self, Write};
+use haisuli_abi::uart::{
+    FifoControl, LineControl, LineStatus, ModemControl, Register, DIVISOR_38400,
+};
 
+fn write(reg: Register, value: u8) {
+    Com1.write8(reg as u16, value);
+}
+
+/// Sets up COM1 for output: 38400 baud, 8N1, FIFOs on, no interrupts.
 pub(crate) fn init() {
-    Com1.write8(1, 0x00); // No interrupts.
-    Com1.write8(3, 0x80); // DLAB on.
-    Com1.write8(0, 0x03); // 38400 baud.
-    Com1.write8(1, 0x00);
-    Com1.write8(3, 0x03); // 8N1.
-    Com1.write8(2, 0xC7); // FIFO.
-    Com1.write8(4, 0x0B);
+    write(Register::InterruptEnable, 0);
+    write(Register::LineControl, LineControl::DivisorLatch as u8);
+    let [low, high] = DIVISOR_38400.to_le_bytes();
+    write(Register::DIVISOR_LOW, low);
+    write(Register::DIVISOR_HIGH, high);
+    write(Register::LineControl, LineControl::Word8 as u8); // Also ends DLAB.
+    write(
+        Register::FifoControl,
+        FifoControl::bits(&[
+            FifoControl::Enable,
+            FifoControl::ClearReceive,
+            FifoControl::ClearTransmit,
+            FifoControl::Trigger14,
+        ]),
+    );
+    write(
+        Register::ModemControl,
+        ModemControl::bits(&[
+            ModemControl::DataTerminalReady,
+            ModemControl::RequestToSend,
+            ModemControl::Out2,
+        ]),
+    );
 }
 
 pub(crate) fn write_byte(b: u8) {
-    while Com1.read8(5) & 0x20 == 0 {}
-    Com1.write8(0, b);
+    while Com1.read8(Register::LineStatus as u16) & LineStatus::TransmitterEmpty as u8 == 0 {}
+    write(Register::Data, b);
 }
 
 pub(crate) fn write_bytes(s: &[u8]) {

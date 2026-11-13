@@ -13,6 +13,8 @@
 //! - [`context`]: kernel stacks and context switching.
 //! - [`phys`]: physical memory, limited to allocator-owned frames.
 //! - [`multiboot`]: the boot loader's (reserved) information and modules.
+//! - [`x86`]: names for the CPU's own numbers (register bits, vectors, descriptor formats); no
+//!   code that touches the hardware.
 
 pub(crate) mod boot;
 pub(crate) mod context;
@@ -20,3 +22,4 @@ pub(crate) mod cpu;
 pub(crate) mod entry;
 pub(crate) mod multiboot;
 pub(crate) mod phys;
+pub(crate) mod x86;

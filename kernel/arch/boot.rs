@@ -7,12 +7,14 @@
 //! The assembly builds an identity map of the first 1 GiB (2 MiB pages), enables PAE, long mode and
 //! NX, loads a temporary GDT and calls `boot_entry`, which calls [`crate::kmain`].
 //!
-//! These page tables stay in use as the *kernel half* of every address space: PML4[0] is shared by
-//! all processes, and user space lives in PML4[1..256]. The top-level table is a Rust static so the
+//! These page tables stay in use as the *kernel half* of every address space: PML4\[0\] is shared by
+//! all processes, and user space lives in PML4\[1..256\]. The top-level table is a Rust static so the
 //! rest of the kernel can read it without unsafe code; the assembly refers to it (and to the Rust
 //! entry point) with `sym` operands.
 
-use super::multiboot;
+use super::multiboot::{self, Magic, HEADER_CHECKSUM, HEADER_FLAGS};
+use super::x86::{segment_descriptor, Cr0, Cr4, Efer, Msr, PageFlag, SegmentAccess, SegmentFlag};
+use crate::gdt::Selector;
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,7 +36,7 @@ pub(crate) fn kernel_pml4_entry() -> u64 {
 
 /// First Rust code, on the boot stack in 64-bit mode.
 extern "C" fn boot_entry(mb_info: u32, magic: u32) -> ! {
-    if magic == multiboot::BOOTLOADER_MAGIC {
+    if magic == Magic::Loader as u32 {
         // SAFETY: A Multiboot loader passed `mb_info` in ebx, and the boot
         // code above has not touched memory outside the kernel image.
         unsafe { multiboot::init(mb_info as u64) };
@@ -42,13 +44,50 @@ extern "C" fn boot_entry(mb_info: u32, magic: u32) -> ! {
     crate::kmain()
 }
 
+/// Page-table entries pointing at the next-level tables.
+const TABLE_ENTRY: u64 = PageFlag::bits(&[PageFlag::Present, PageFlag::Writable]);
+/// Page-directory entries mapping 2 MiB of kernel memory each.
+const HUGE_PAGE_ENTRY: u64 =
+    PageFlag::bits(&[PageFlag::Present, PageFlag::Writable, PageFlag::Huge]);
+/// log2 of the 2 MiB that a page-directory entry maps.
+const HUGE_PAGE_SHIFT: u32 = 21;
+/// Entries per page table.
+const TABLE_ENTRIES: u32 = 512;
+
+/// The temporary GDT's code segment: 64-bit kernel code (long mode ignores
+/// the base and limit; the GDT proper comes from [`crate::gdt`]).
+const BOOT_CODE_SEGMENT: u64 = segment_descriptor(
+    SegmentAccess::bits(&[
+        SegmentAccess::Present,
+        SegmentAccess::CodeOrData,
+        SegmentAccess::Executable,
+        SegmentAccess::ReadWrite,
+    ]),
+    SegmentFlag::LongMode as u8,
+    0,
+);
+/// The temporary GDT's data segment.
+const BOOT_DATA_SEGMENT: u64 = segment_descriptor(
+    SegmentAccess::bits(&[
+        SegmentAccess::Present,
+        SegmentAccess::CodeOrData,
+        SegmentAccess::ReadWrite,
+    ]),
+    0,
+    0,
+);
+
+// The boot GDT (null, code, data, in that order below) has the kernel's code
+// and data segments at the same selectors as the GDT proper.
+const _: () = assert!(Selector::KernelCode.index() == 1 && Selector::KernelData.index() == 2);
+
 global_asm!(
     r#"
 .pushsection .multiboot, "a"
 .balign 4
-.long 0x1BADB002          # magic
-.long 0x00000003          # flags: page-align modules, want memory info/map
-.long 0xE4524FFB          # checksum = -(magic + flags)
+.long {mb_magic}
+.long {mb_flags}
+.long {mb_checksum}
 .popsection
 
 .pushsection .bss.boot, "aw", @nobits
@@ -71,54 +110,55 @@ _start:
     movl %eax, %esi
 
     movl $boot_pdpt, %eax
-    orl  $0x3, %eax
+    orl  ${table_entry}, %eax
     movl %eax, {pml4}
     movl $boot_pd, %eax
-    orl  $0x3, %eax
+    orl  ${table_entry}, %eax
     movl %eax, boot_pdpt
 
+    # Identity-map the first 1 GiB with 2 MiB pages.
     xorl %ecx, %ecx
 .Lboot_fill_pd:
     movl %ecx, %eax
-    shll $21, %eax
-    orl  $0x83, %eax               # present | writable | 2 MiB page
+    shll ${huge_shift}, %eax
+    orl  ${huge_entry}, %eax
     movl %eax, boot_pd(,%ecx,8)
     movl $0, boot_pd+4(,%ecx,8)
     incl %ecx
-    cmpl $512, %ecx
+    cmpl ${table_entries}, %ecx
     jne  .Lboot_fill_pd
 
     movl ${pml4}, %eax
     movl %eax, %cr3
 
     movl %cr4, %eax
-    orl  $0x20, %eax               # CR4.PAE
+    orl  ${cr4_pae}, %eax
     movl %eax, %cr4
 
-    movl $0xC0000080, %ecx         # IA32_EFER
+    movl ${msr_efer}, %ecx
     rdmsr
-    orl  $0x900, %eax              # LME (bit 8) | NXE (bit 11)
+    orl  ${efer_lme_nxe}, %eax
     wrmsr
 
     movl %cr0, %eax
-    orl  $0x80000001, %eax         # PG | PE
+    orl  ${cr0_pg_pe}, %eax
     movl %eax, %cr0
 
     lgdt boot_gdt_ptr
-    ljmp $0x08, $long_mode_entry
+    ljmp ${kernel_cs}, $long_mode_entry
 
 .balign 8
 boot_gdt:
     .quad 0
-    .quad 0x00209A0000000000       # 64-bit code
-    .quad 0x0000920000000000       # data
+    .quad {boot_code}
+    .quad {boot_data}
 boot_gdt_ptr:
     .word boot_gdt_ptr - boot_gdt - 1
     .long boot_gdt
 
 .code64
 long_mode_entry:
-    movw $0x10, %ax
+    movw ${kernel_ds}, %ax
     movw %ax, %ds
     movw %ax, %es
     movw %ax, %ss
@@ -138,5 +178,20 @@ long_mode_entry:
 "#,
     pml4 = sym BOOT_PML4,
     entry = sym boot_entry,
+    mb_magic = const Magic::Header as u32,
+    mb_flags = const HEADER_FLAGS,
+    mb_checksum = const HEADER_CHECKSUM,
+    table_entry = const TABLE_ENTRY,
+    huge_entry = const HUGE_PAGE_ENTRY,
+    huge_shift = const HUGE_PAGE_SHIFT,
+    table_entries = const TABLE_ENTRIES,
+    cr4_pae = const Cr4::bits(&[Cr4::PhysicalAddressExtension]),
+    msr_efer = const Msr::Efer as u32,
+    efer_lme_nxe = const Efer::bits(&[Efer::LongMode, Efer::NoExecute]),
+    cr0_pg_pe = const Cr0::bits(&[Cr0::Paging, Cr0::ProtectionEnable]),
+    kernel_cs = const Selector::KernelCode as u16,
+    kernel_ds = const Selector::KernelData as u16,
+    boot_code = const BOOT_CODE_SEGMENT,
+    boot_data = const BOOT_DATA_SEGMENT,
     options(att_syntax)
 );

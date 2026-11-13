@@ -42,20 +42,18 @@ const LINE_MAX: usize = 256;
 mod uart {
     //! 16550 UART on COM1, polled output, interrupt-driven input.
     use core::arch::asm;
+    use haisuli_rt::abi::uart::{
+        FifoControl, InterruptEnable, LineControl, LineStatus, ModemControl, Register, COM1,
+        DIVISOR_38400,
+    };
+    pub(crate) use haisuli_rt::abi::uart::{COM1 as BASE, COM1_IRQ as IRQ, PORTS};
 
-    pub(crate) const BASE: u16 = 0x3F8;
-    pub(crate) const PORTS: u64 = 8;
-    pub(crate) const IRQ: u64 = 4;
-    const LSR_DATA_READY: u8 = 0x01;
-    const LSR_THR_EMPTY: u8 = 0x20;
-
-    /// Port of UART register `reg`; only the UART's own 8 registers.
-    fn port(reg: u16) -> u16 {
-        assert!((reg as u64) < PORTS);
-        BASE + reg
+    /// The port of UART register `reg`: one of the UART's own registers.
+    fn port(reg: Register) -> u16 {
+        COM1 + reg as u16
     }
 
-    fn outb(reg: u16, v: u8) {
+    fn outb(reg: Register, v: u8) {
         let port = port(reg);
         // SAFETY: Port I/O on the UART's registers (granted to us by
         // ioperm) touches no memory; the UART does no DMA.
@@ -64,7 +62,7 @@ mod uart {
         };
     }
 
-    fn inb(reg: u16) -> u8 {
+    fn inb(reg: Register) -> u8 {
         let port = port(reg);
         let v: u8;
         // SAFETY: As in `outb`.
@@ -74,26 +72,43 @@ mod uart {
         v
     }
 
+    /// Sets up COM1: 38400 baud, 8N1, an interrupt for every byte received.
     pub(crate) fn init() {
-        outb(1, 0x00); // Interrupts off while configuring.
-        outb(3, 0x80); // DLAB on.
-        outb(0, 0x03); // 38400 baud.
-        outb(1, 0x00);
-        outb(3, 0x03); // 8N1.
-                       // FIFO on, interrupt per received byte. Do not set the "clear receive
-                       // FIFO" bit: anything already received is real (early) typeahead.
-        outb(2, 0x01);
-        outb(4, 0x0B); // DTR | RTS | OUT2 (OUT2 gates the IRQ line).
-        outb(1, 0x01); // Interrupt on received data.
+        outb(Register::InterruptEnable, 0); // Interrupts off while configuring.
+        outb(Register::LineControl, LineControl::DivisorLatch as u8);
+        let [low, high] = DIVISOR_38400.to_le_bytes();
+        outb(Register::DIVISOR_LOW, low);
+        outb(Register::DIVISOR_HIGH, high);
+        outb(Register::LineControl, LineControl::Word8 as u8); // Also ends DLAB.
+                                                               // FIFOs on, interrupt per received byte. Not `ClearReceive`: anything
+                                                               // already received is real (early) typeahead.
+        outb(Register::FifoControl, FifoControl::Enable as u8);
+        // OUT2 connects the UART's interrupt line to the PIC.
+        outb(
+            Register::ModemControl,
+            ModemControl::bits(&[
+                ModemControl::DataTerminalReady,
+                ModemControl::RequestToSend,
+                ModemControl::Out2,
+            ]),
+        );
+        outb(
+            Register::InterruptEnable,
+            InterruptEnable::ReceivedData as u8,
+        );
+    }
+
+    fn line_status(status: LineStatus) -> bool {
+        inb(Register::LineStatus) & status as u8 != 0
     }
 
     pub(crate) fn read_byte() -> Option<u8> {
-        (inb(5) & LSR_DATA_READY != 0).then(|| inb(0))
+        line_status(LineStatus::DataReady).then(|| inb(Register::Data))
     }
 
     pub(crate) fn write_byte(b: u8) {
-        while inb(5) & LSR_THR_EMPTY == 0 {}
-        outb(0, b);
+        while !line_status(LineStatus::TransmitterEmpty) {}
+        outb(Register::Data, b);
     }
 
     /// Terminal output: newline becomes CR LF.
@@ -158,6 +173,61 @@ struct Reader {
     capacity: usize,
 }
 
+/// The ASCII control characters the terminal acts on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Control {
+    /// Ctrl-C (ETX): interrupt.
+    Interrupt = 0x03,
+    /// Ctrl-D (EOT): end of input (on an empty line), else hand over the line.
+    EndOfFile = 0x04,
+    /// BEL: output to ring the terminal's bell.
+    Bell = 0x07,
+    /// Ctrl-H (BS): erase a character; as output, move the cursor left.
+    Backspace = 0x08,
+    /// LF: end of line.
+    LineFeed = 0x0A,
+    /// CR (Enter): end of line.
+    CarriageReturn = 0x0D,
+    /// Ctrl-U (NAK): kill the line being typed.
+    Kill = 0x15,
+    /// ESC: starts an escape sequence (which is ignored).
+    Escape = 0x1B,
+    /// DEL, which most terminals send for Backspace: erase a character.
+    Delete = 0x7F,
+}
+
+impl Control {
+    fn from_byte(b: u8) -> Option<Control> {
+        use Control::*;
+        [
+            Interrupt,
+            EndOfFile,
+            Bell,
+            Backspace,
+            LineFeed,
+            CarriageReturn,
+            Kill,
+            Escape,
+            Delete,
+        ]
+        .into_iter()
+        .find(|&c| c as u8 == b)
+    }
+}
+
+/// What erasing a character looks like: back, overwrite with a space, back.
+const ERASE: [u8; 3] = [Control::Backspace as u8, b' ', Control::Backspace as u8];
+
+/// The final byte of a CSI escape sequence (ECMA-48: 0x40 to 0x7E); the bytes
+/// before it are parameters.
+const CSI_FINAL: core::ops::RangeInclusive<u8> = b'@'..=b'~';
+
+/// Whether `b` continues a multi-byte UTF-8 character (it is `0b10xx_xxxx`).
+fn is_utf8_continuation(b: u8) -> bool {
+    b & 0b1100_0000 == 0b1000_0000
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Escape {
     None,
@@ -215,7 +285,7 @@ impl Tty {
                 return;
             }
             Escape::Csi => {
-                if (0x40..=0x7E).contains(&b) {
+                if CSI_FINAL.contains(&b) {
                     self.escape = Escape::None;
                 }
                 return;
@@ -226,33 +296,35 @@ impl Tty {
             }
             Escape::None => {}
         }
-        match b {
-            b'\n' if after_cr => {} // CR LF from the terminal: one newline.
-            b'\r' | b'\n' => {
+        match Control::from_byte(b) {
+            // CR LF from the terminal: one newline.
+            Some(Control::LineFeed) if after_cr => {}
+            Some(Control::CarriageReturn | Control::LineFeed) => {
                 uart::write(b"\n");
                 self.line[self.line_len] = b'\n';
                 self.line_len += 1;
                 self.finish_line();
             }
-            0x7F | 0x08 => {
-                self.erase_char(); // Backspace / Delete.
+            Some(Control::Delete | Control::Backspace) => {
+                self.erase_char();
             }
-            0x15 => while self.erase_char() {}, // Ctrl-U: kill the line.
-            0x03 => {
+            Some(Control::Kill) => while self.erase_char() {},
+            Some(Control::Interrupt) => {
                 uart::write(b"^C\n");
                 self.line_len = 0;
                 self.interrupt();
             }
-            0x04 => self.finish_line(), // Ctrl-D: flush; on an empty line, EOF.
-            0x1B => self.escape = Escape::Esc,
-            b if b < 0x20 && b != b'\t' => {} // Other control characters.
-            b => {
+            Some(Control::EndOfFile) => self.finish_line(), // On an empty line: EOF.
+            Some(Control::Escape) => self.escape = Escape::Esc,
+            // Other control characters (and BEL) do nothing; a tab is text.
+            Some(Control::Bell) | None if b.is_ascii_control() && b != b'\t' => {}
+            Some(Control::Bell) | None => {
                 if self.line_len < LINE_MAX - 1 {
                     self.line[self.line_len] = b;
                     self.line_len += 1;
                     uart::write_byte(b);
                 } else {
-                    uart::write_byte(0x07); // Line full: ring the bell.
+                    uart::write_byte(Control::Bell as u8); // Line full.
                 }
             }
         }
@@ -264,10 +336,10 @@ impl Tty {
             return false;
         }
         self.line_len -= 1;
-        while self.line_len > 0 && self.line[self.line_len] & 0xC0 == 0x80 {
-            self.line_len -= 1; // Continuation bytes of a multi-byte character.
+        while self.line_len > 0 && is_utf8_continuation(self.line[self.line_len]) {
+            self.line_len -= 1; // The rest of a multi-byte character.
         }
-        uart::write(b"\x08 \x08");
+        uart::write(&ERASE);
         true
     }
 
@@ -276,7 +348,7 @@ impl Tty {
         let n = self.line_len;
         self.line_len = 0;
         if self.cooked.free() < n || self.lines.free() == 0 {
-            uart::write_byte(0x07); // Nobody is reading: input dropped.
+            uart::write_byte(Control::Bell as u8); // Nobody is reading: input dropped.
             return;
         }
         for &b in &self.line[..n] {
@@ -407,7 +479,7 @@ fn fail(what: &str, e: sys::Errno) -> i32 {
 }
 
 fn main(_: haisuli_rt::StartInfo) -> i32 {
-    if let Err(e) = sys::ioperm(uart::BASE as u64, uart::PORTS, true) {
+    if let Err(e) = sys::ioperm(uart::BASE as u64, uart::PORTS as u64, true) {
         return fail("ioperm", e);
     }
     uart::init();

@@ -42,6 +42,10 @@ pub unsafe fn syscall(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u
     ret
 }
 
+/// The permissions `open` asks for when it creates a file: `rw-r--r--`, the
+/// usual default (HaisuliOS has no file permissions yet, so it is unused).
+const NEW_FILE_MODE: u64 = 0o644;
+
 /// The system calls this runtime makes.
 enum Sys<'a> {
     /// The kernel lets the console server only write into `buf`.
@@ -173,7 +177,7 @@ fn invoke(call: Sys<'_>) -> i64 {
             let (p, l) = ro(buf);
             (nr::WRITE, [fd, p, l, 0])
         }
-        Sys::Open { path, flags } => (nr::OPEN, [ro(path).0, flags, 0o644, 0]),
+        Sys::Open { path, flags } => (nr::OPEN, [ro(path).0, flags, NEW_FILE_MODE, 0]),
         Sys::Close(fd) => (nr::CLOSE, [fd, 0, 0, 0]),
         Sys::Dup(fd) => (nr::DUP, [fd, 0, 0, 0]),
         Sys::Dup2 { fd, newfd } => (nr::DUP2, [fd, newfd, 0, 0]),
@@ -538,24 +542,15 @@ pub fn proc_list(out: &mut [ProcInfo]) -> Result<usize> {
 pub struct WaitStatus(pub i32);
 
 impl WaitStatus {
-    /// The signal that killed the process, if one did.
-    pub fn signal(self) -> Option<u64> {
-        let sig = self.0 & 0x7F;
-        (sig != 0).then_some(sig as u64)
-    }
-
-    /// The status the process exited with, if it was not killed.
-    pub fn exit_code(self) -> Option<i32> {
-        self.signal().is_none().then_some((self.0 >> 8) & 0xFF)
+    /// How the process ended.
+    pub fn termination(self) -> crate::abi::Termination {
+        crate::abi::Termination::from_wait_status(self.0)
     }
 
     /// The status a shell reports in `$?`: 128 + n for a process killed by
     /// signal n, as POSIX requires.
     pub fn shell_status(self) -> i32 {
-        match self.signal() {
-            Some(sig) => 128 + sig as i32,
-            None => (self.0 >> 8) & 0xFF,
-        }
+        self.termination().shell_status()
     }
 }
 

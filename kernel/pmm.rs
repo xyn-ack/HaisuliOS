@@ -5,7 +5,8 @@
 //! A bitmap frame allocator over the first 1 GiB, the range identity-mapped by the boot page
 //! tables.
 
-use crate::arch::{multiboot, phys};
+use crate::arch::multiboot::{self, MemoryType};
+use crate::arch::phys;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub(crate) use crate::arch::phys::{MAX_PHYS, PAGE_SIZE};
@@ -44,8 +45,8 @@ fn reserve(from: u64, to: u64) {
 /// Populate the allocator from the Multiboot memory map.
 pub(crate) fn init() {
     for (base, len, kind) in multiboot::memory_map() {
-        if kind != 1 {
-            continue; // Not usable RAM.
+        if kind != MemoryType::Available {
+            continue;
         }
         let start = (base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let stop = ((base + len) & !(PAGE_SIZE - 1)).min(MAX_PHYS);
@@ -55,7 +56,7 @@ pub(crate) fn init() {
             a += PAGE_SIZE;
         }
     }
-    reserve(0, 0x10_0000); // BIOS, VGA, boot-loader scratch space, frame 0.
+    reserve(0, phys::LOW_MEMORY); // BIOS, VGA, boot-loader scratch space, frame 0.
     let (start, end) = phys::kernel_image();
     reserve(start, end);
     // Boot modules (user programs, ramdisk) and the boot information that
@@ -73,7 +74,7 @@ pub(crate) fn init() {
     crate::println!(
         "[pmm] {} frames free ({} MiB)",
         free_frames(),
-        free_frames() * 4 / 1024
+        free_frames() as u64 * PAGE_SIZE / (1 << 20)
     );
 }
 
