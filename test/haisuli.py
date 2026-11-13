@@ -81,8 +81,13 @@ class Machine:
         self._stderr = b""
         self._err_reader = threading.Thread(target=self._read_stderr, daemon=True)
         self._err_reader.start()
-        # Everything up to and including the first prompt.
-        self.boot_output = self.expect(PROMPT)
+        # Everything up to and including the first prompt. If the machine does not get there,
+        # the caller gets no Machine to close, so stop QEMU here.
+        try:
+            self.boot_output = self.expect(PROMPT)
+        except BaseException:
+            self.close()
+            raise
 
     # ---- plumbing ---------------------------------------------------------
 

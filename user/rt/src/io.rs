@@ -26,12 +26,14 @@ pub enum Sink {
     DebugLog,
 }
 
-/// Writes all of `buf` to `fd`, retrying short writes.
+/// Writes all of `buf` to `fd`, retrying short writes and writes that a signal interrupted.
 pub fn write_all(fd: u64, mut buf: &[u8]) -> sys::Result<()> {
     while !buf.is_empty() {
-        match sys::write(fd, buf)? {
-            0 => return Err(sys::Errno(crate::abi::errno::EIO)),
-            n => buf = &buf[n.min(buf.len())..],
+        match sys::write(fd, buf) {
+            Ok(0) => return Err(sys::Errno(crate::abi::errno::EIO)),
+            Ok(n) => buf = &buf[n.min(buf.len())..],
+            Err(sys::Errno(crate::abi::errno::EINTR)) => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(())

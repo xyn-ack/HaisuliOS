@@ -7,11 +7,17 @@ from haisuli import read_rootfs
 
 HELP = """\
 commands:
-  help            this list
-  echo [text...]  print text
-  ls [dir]        list files on the boot ramdisk
-  cat file...     print files
-  exit            leave the shell and power off
+  help                this list
+  echo [text...]      print text
+  ls [dir]            list files on the boot ramdisk
+  cat file...         print files
+  ps                  list processes
+  pause               wait for a signal (Ctrl-C interrupts it)
+  kill [-sig] pid...  send a signal (default TERM; -l lists them)
+  wait [pid...]       wait for background jobs
+  exit [n]            leave the shell and power off
+'command &' runs a command in the background. $? is the exit status of the
+last command, $! the pid of the last background job and $$ the shell's pid.
 """
 
 # ---- help -----------------------------------------------------------------

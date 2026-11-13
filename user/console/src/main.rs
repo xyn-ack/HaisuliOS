@@ -6,23 +6,31 @@
 //!
 //! The server owns the UART (I/O ports granted with `ioperm`, receive interrupts delivered as IPC
 //! notifications) and implements a small canonical-mode line discipline on top of it: input is
-//! echoed and edited (Backspace, Ctrl-U, Ctrl-C) until Enter, then becomes readable as one line;
-//! Ctrl-D on an empty line is end-of-file.
+//! echoed and edited (Backspace, Ctrl-U) until Enter, then becomes readable as one line; Ctrl-D on
+//! an empty line is end-of-file.
 //!
-//! Protocol ([`haisuli_rt::abi::console`], usually reached through `read(0)` and `write(1|2)`,
-//! which the kernel forwards here):
+//! It is also the controlling terminal for job control. The first session that sets a
+//! foreground process group becomes the terminal's session. Ctrl-C and `Ctrl-\` send `SIGINT`
+//! and `SIGQUIT` to the foreground process group, and, as on a POSIX terminal, discard the line
+//! being edited and any input that was not read yet.
+//!
+//! Protocol ([`haisuli_rt::abi::console`], usually reached through `read(0)`, `write(1|2)` and
+//! `ioctl(0..2)`, which the kernel forwards here):
 //!
 //! - `OP_WRITE`: output the client's buffer; the reply is the number of bytes written.
 //! - `OP_READ`: reply with at most one line, as soon as one is available. Readers wait in a queue;
-//!   the server itself never blocks on them.
+//!   the server itself never blocks on them. A reader that a signal interrupted is dropped when
+//!   it next reads (or when the reply fails).
+//! - `OP_SETPGRP` / `OP_GETPGRP`: set / get the foreground process group.
 
 #![no_std]
 #![no_main]
 // The only unsafe code is the port I/O in `uart`.
 #![deny(unsafe_code)]
 
-use haisuli_rt::abi::console::{OP_READ, OP_WRITE};
-use haisuli_rt::abi::errno::{EAGAIN, EFAULT, ENOSYS};
+use haisuli_rt::abi::console::{OP_GETPGRP, OP_READ, OP_SETPGRP, OP_WRITE};
+use haisuli_rt::abi::errno::{EAGAIN, EFAULT, EINTR, EINVAL, ENOSYS, ENOTTY, EPERM};
+use haisuli_rt::abi::signal::{SIGINT, SIGQUIT};
 use haisuli_rt::abi::{svc, KMSG_IRQ, PID_KERNEL};
 use haisuli_rt::sys;
 
@@ -132,6 +140,22 @@ impl<T: Copy, const N: usize> Fifo<T, N> {
     fn front_mut(&mut self) -> Option<&mut T> {
         (self.len > 0).then(|| &mut self.buf[self.head])
     }
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+    /// Keeps only the elements for which `keep` returns true, in order.
+    fn retain(&mut self, keep: impl Fn(&T) -> bool) {
+        let len = self.len;
+        let mut kept = 0;
+        for i in 0..len {
+            let v = self.get(i);
+            if keep(&v) {
+                self.buf[(self.head + kept) % N] = v;
+                kept += 1;
+            }
+        }
+        self.len = kept;
+    }
     fn pop(&mut self) -> Option<T> {
         let v = *self.front()?;
         self.head = (self.head + 1) % N;
@@ -174,6 +198,10 @@ struct Tty {
     readers: Fifo<Reader, 16>,
     escape: Escape,
     after_cr: bool,
+    /// The controlling session (0 until a session sets a foreground process group).
+    session: u64,
+    /// The foreground process group, which gets the signals from the keyboard (0: none).
+    foreground: u64,
 }
 
 impl Tty {
@@ -189,6 +217,8 @@ impl Tty {
             }),
             escape: Escape::None,
             after_cr: false,
+            session: 0,
+            foreground: 0,
         }
     }
 
@@ -228,11 +258,9 @@ impl Tty {
                 self.erase_char(); // Backspace / Delete.
             }
             0x15 => while self.erase_char() {}, // Ctrl-U: kill the line.
-            0x03 => {
-                // Ctrl-C: no signals yet, so just abandon the line.
-                uart::write(b"^C\n");
-                self.line_len = 0;
-            }
+            // Ctrl-C and Ctrl-\: signals for the foreground process group.
+            0x03 => self.interrupt(b"^C\n", SIGINT),
+            0x1C => self.interrupt(b"^\\\n", SIGQUIT),
             0x04 => self.finish_line(), // Ctrl-D: flush; on an empty line, EOF.
             0x1B => self.escape = Escape::Esc,
             b if b < 0x20 && b != b'\t' => {} // Other control characters.
@@ -246,6 +274,56 @@ impl Tty {
                 }
             }
         }
+    }
+
+    /// Ctrl-C or `Ctrl-\`: discards all input and sends `sig` to the foreground process group.
+    fn interrupt(&mut self, echo: &[u8], sig: u32) {
+        uart::write(echo);
+        self.line_len = 0;
+        self.cooked.clear();
+        self.lines.clear();
+        if self.foreground != 0 {
+            // The group may be gone already; then there is nobody to interrupt.
+            let _ = sys::killpg(self.foreground, sig);
+        }
+    }
+
+    /// OP_SETPGRP: makes the group in the client's buffer the foreground process group.
+    ///
+    /// The client and the group must belong to the terminal's session; the first session to
+    /// set a group becomes the terminal's session.
+    fn set_foreground(&mut self, client: u64) {
+        let mut buf = [0u8; 4];
+        let status = match sys::ipc_read(client, 0, &mut buf) {
+            Ok(4) => {
+                let pgrp = i32::from_ne_bytes(buf);
+                match session_of(client) {
+                    None => -EINVAL,
+                    Some(_) if pgrp <= 0 => -EINVAL,
+                    Some(sid) if self.session != 0 && sid != self.session => -ENOTTY,
+                    Some(sid) if !group_in_session(pgrp as u64, sid) => -EPERM,
+                    Some(sid) => {
+                        self.session = sid;
+                        self.foreground = pgrp as u64;
+                        0
+                    }
+                }
+            }
+            Ok(_) => -EINVAL,
+            Err(e) => -e.0,
+        };
+        let _ = sys::ipc_reply(client, status);
+    }
+
+    /// OP_GETPGRP: writes the foreground process group into the client's buffer.
+    fn get_foreground(&self, client: u64) {
+        let pgrp = (self.foreground as i32).to_ne_bytes();
+        let status = match sys::ipc_write(client, 0, &pgrp) {
+            Ok(4) => 0,
+            Ok(_) => -EINVAL,
+            Err(e) => -e.0,
+        };
+        let _ = sys::ipc_reply(client, status);
     }
 
     /// Remove the last (UTF-8) character of the line being edited.
@@ -277,6 +355,8 @@ impl Tty {
     }
 
     fn read_request(&mut self, client: u64, capacity: usize) {
+        // A process has one call at a time: an older read of this client was interrupted.
+        self.readers.retain(|r| r.pid != client);
         if !self.readers.push(Reader {
             pid: client,
             capacity,
@@ -338,6 +418,26 @@ fn write_request(client: u64, len: usize) {
     let _ = sys::ipc_reply(client, if done > 0 { done as i64 } else { status });
 }
 
+/// The session of process `pid`.
+fn session_of(pid: u64) -> Option<u64> {
+    sys::proc_info(pid)
+        .ok()
+        .filter(|p| p.pid == pid)
+        .map(|p| p.sid)
+}
+
+/// Whether process group `pgrp` has a member in session `sid`.
+fn group_in_session(pgrp: u64, sid: u64) -> bool {
+    let mut next = 1;
+    while let Ok(p) = sys::proc_info(next) {
+        if p.pgid == pgrp && p.sid == sid && p.state != b'Z' {
+            return true;
+        }
+        next = p.pid + 1;
+    }
+    false
+}
+
 fn fail(what: &str, e: sys::Errno) -> i32 {
     let mut w = haisuli_rt::io::BufWriter::new(haisuli_rt::io::Sink::DebugLog);
     let _ = core::fmt::Write::write_fmt(
@@ -369,6 +469,7 @@ fn main(_: haisuli_rt::StartInfo) -> i32 {
     loop {
         let m = match sys::ipc_recv() {
             Ok(m) => m,
+            Err(sys::Errno(EINTR)) => continue, // A signal with a handler; none so far.
             Err(e) => return fail("ipc_recv", e),
         };
         match (m.sender, m.a) {
@@ -381,6 +482,8 @@ fn main(_: haisuli_rt::StartInfo) -> i32 {
             (PID_KERNEL, _) => {}
             (client, OP_WRITE) => write_request(client, m.b as usize),
             (client, OP_READ) => tty.read_request(client, m.b as usize),
+            (client, OP_SETPGRP) => tty.set_foreground(client),
+            (client, OP_GETPGRP) => tty.get_foreground(client),
             // Unknown request (or a stray notification, for which the reply
             // simply fails).
             (client, _) => {
