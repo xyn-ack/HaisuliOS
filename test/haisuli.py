@@ -51,8 +51,10 @@ class Config:
 class Machine:
     """One QEMU instance running HaisuliOS, booted to the first prompt."""
 
-    def __init__(self, config=Config):
+    def __init__(self, config=Config, extra_modules=()):
+        """Boots QEMU with the configured boot modules, followed by `extra_modules` (paths)."""
         self.config = config
+        modules = ",".join([config.modules, *extra_modules])
         # Everything the console printed so far, decoded, with the terminal's
         # CR LF line ends turned into LF.
         self._text = ""
@@ -64,7 +66,7 @@ class Machine:
         cmd = [
             config.qemu,
             "-kernel", config.kernel,
-            "-initrd", config.modules,
+            "-initrd", modules,
             "-m", "128M",
             "-serial", "stdio",
             "-monitor", "none",

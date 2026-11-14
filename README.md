@@ -58,6 +58,7 @@ abi/               syscall numbers, errno values, IPC protocols, the 16550 UART'
                    registers (kernel + user)
 user/rt/           user runtime: entry point, syscall wrappers, print!, panics
 user/console/      console server
+user/proctest/     test probe for the process server (booted only by its tests)
 user/init/         init (pid 1): /etc/motd, then a job control shell
   src/words.rs     command line words: quotes, `$?`, `&`, redirection operators
   src/redirect.rs  applying (and undoing) redirections
@@ -393,8 +394,21 @@ QEMU then exits via `isa-debug-exit` (host exit status 1 is expected).
 make check                          # build, then run every test
 make check TEST_ARGS="echo"         # only tests whose id contains "echo"
 make check TEST_ARGS="-v -j 1"      # one at a time, print every transcript
+make check TEST_EXPLICIT="process-server"  # only the explicit target process-server
 python3 test/run_tests.py --list    # list the test ids
 ```
+
+Tests for work in progress form *explicit targets*: a test file sets
+`EXPLICIT = "name"`, and its tests, which are expected to fail until the
+feature exists, never run in a plain `make check`. `TEST_EXPLICIT` runs them,
+and only them; its name must match the target exactly (`TEST_ARGS` selectors
+match parts of test ids, but never pick up an explicit target). Selectors in
+`TEST_ARGS` still narrow the target down. A test file can also boot extra
+programs after the usual boot modules (`EXTRA_MODULES`).
+
+| Explicit target  | Tests                           | Describes                                  |
+|------------------|---------------------------------|--------------------------------------------|
+| `process-server` | `test/test_process_server.py`   | `fork`, `exit`, `wait4`, `getpid`, `getppid` in a user-space process server instead of the kernel |
 
 The tests drive the shell the way a user would. Each test boots its own
 QEMU machine with the console on a pipe, types at the prompt, and checks what
@@ -412,6 +426,7 @@ test/test_line_editing.py echo, Backspace, Ctrl-U/C, escape sequences, long line
 test/test_exit.py         exit and Ctrl-D power the machine off
 test/test_process.py      signals, process groups/sessions, waitpid semantics
 test/test_shell_redirection.py  >, >>, <, 2> and 2>&1, backed by the kernel's files
+test/test_process_server.py     explicit target process-server (see above)
 ```
 
 A test is a function `test_*(sh)` in a `test/test_*.py` file. It receives a

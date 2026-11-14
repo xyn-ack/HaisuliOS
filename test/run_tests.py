@@ -11,6 +11,13 @@ user-space panics).
 
 Tests run in parallel (one QEMU each). Only the Python standard library is needed. Usually
 invoked through `make check`; see --help for options.
+
+A test file can belong to an *explicit target* by setting `EXPLICIT = "name"`. Its tests describe
+work in progress (they are expected to fail until the feature exists), so they never run by
+default, and selectors alone do not pick them up: they run only with `--explicit name` (`make check
+TEST_EXPLICIT=name`), where the name must match exactly, and then only they run. Selectors still
+narrow them down. A test file can also set `EXTRA_MODULES`, paths relative to the source tree of
+programs to boot after the usual boot modules.
 """
 import argparse
 import concurrent.futures
@@ -28,15 +35,39 @@ sys.dont_write_bytecode = True  # Keep test/ free of __pycache__.
 import haisuli  # noqa: E402
 
 
-def discover(selectors):
-    """[(test id, function)] in file and definition order."""
+ROOT = os.path.dirname(HERE)
+
+
+class Test:
+    def __init__(self, test_id, func, extra_modules):
+        self.test_id = test_id
+        self.func = func
+        self.extra_modules = extra_modules  # Absolute paths of programs to boot as well.
+
+
+def discover(selectors, explicit=()):
+    """(tests, targets): the selected tests in file and definition order, and the names of all
+    explicit targets.
+
+    Without `explicit`, files that belong to an explicit target are skipped; with it, only the
+    files of exactly those targets are used.
+    """
     tests = []
+    targets = set()
     for name in sorted(os.listdir(HERE)):
         if not (name.startswith("test_") and name.endswith(".py")):
             continue
         spec = importlib.util.spec_from_file_location(name[:-3], os.path.join(HERE, name))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        target = getattr(module, "EXPLICIT", None)
+        if target is not None:
+            targets.add(target)
+        wanted = target in explicit if explicit else target is None
+        if not wanted:
+            continue
+        extra_modules = tuple(
+            os.path.join(ROOT, path) for path in getattr(module, "EXTRA_MODULES", ()))
         funcs = [
             f for n, f in vars(module).items()
             if n.startswith("test_") and callable(f)
@@ -46,8 +77,8 @@ def discover(selectors):
         for f in funcs:
             test_id = f"{name[:-3]}::{f.__name__}"
             if not selectors or any(s in test_id for s in selectors):
-                tests.append((test_id, f))
-    return tests
+                tests.append(Test(test_id, f, extra_modules))
+    return tests, targets
 
 
 class Result:
@@ -60,12 +91,13 @@ class Result:
         self.stderr = stderr
 
 
-def run_one(test_id, func):
+def run_one(test):
+    test_id = test.test_id
     start = time.monotonic()
     machine = None
     try:
-        machine = haisuli.Machine()
-        func(machine)
+        machine = haisuli.Machine(extra_modules=test.extra_modules)
+        test.func(machine)
         machine.check_healthy()
         status, message = "PASS", ""
     except AssertionError:
@@ -99,19 +131,29 @@ def main():
                     help="machines to run in parallel (default %(default)s)")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="show transcripts of passing tests too")
+    ap.add_argument("--explicit", action="append", default=[], metavar="TARGET",
+                    help="run only the tests of explicit target TARGET (an exact name; "
+                         "may be repeated)")
     ap.add_argument("--list", action="store_true", help="list the tests and exit")
     args = ap.parse_args()
 
-    tests = discover(args.selectors)
+    tests, targets = discover(args.selectors, args.explicit)
+    unknown = [t for t in args.explicit if t not in targets]
+    if unknown:
+        known = ", ".join(sorted(targets)) or "none"
+        print(f"unknown explicit target: {', '.join(unknown)} (known targets: {known})")
+        return 1
     if args.list:
-        for test_id, _ in tests:
-            print(test_id)
+        for test in tests:
+            print(test.test_id)
         return 0
     if not tests:
         print("no tests selected")
         return 1
 
-    missing = [p for p in [args.kernel, *args.modules.split(",")] if not os.path.exists(p)]
+    extra = {path for test in tests for path in test.extra_modules}
+    missing = [p for p in [args.kernel, *args.modules.split(","), *sorted(extra)]
+               if not os.path.exists(p)]
     if missing:
         print(f"missing build output: {', '.join(missing)} (run `make` first)")
         return 1
@@ -127,7 +169,7 @@ def main():
     start = time.monotonic()
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = [pool.submit(run_one, test_id, func) for test_id, func in tests]
+        futures = [pool.submit(run_one, test) for test in tests]
         for future in concurrent.futures.as_completed(futures):
             r = future.result()
             results.append(r)
@@ -136,7 +178,7 @@ def main():
                 print(r.transcript)
 
     failed = [r for r in results if r.status != "PASS"]
-    order = {test_id: i for i, (test_id, _) in enumerate(tests)}
+    order = {test.test_id: i for i, test in enumerate(tests)}
     for r in sorted(failed, key=lambda r: order[r.test_id]):
         print(f"\n{'=' * 70}\n{r.status}: {r.test_id}\n{'-' * 70}\n{r.message.rstrip()}")
         print(f"{'-' * 70}\nconsole transcript:\n{r.transcript.rstrip()}")
