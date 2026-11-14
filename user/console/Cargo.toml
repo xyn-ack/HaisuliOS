@@ -2,7 +2,7 @@
 
 [package]
 name = "console"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "HaisuliOS console server: COM1 driver and terminal line discipline"
 license = "GPL-2.0"

@@ -2,7 +2,7 @@
 
 [package]
 name = "haisuli-abi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "HaisuliOS kernel <-> user space ABI: syscall numbers, errno values, IPC protocols"
 license = "GPL-2.0"

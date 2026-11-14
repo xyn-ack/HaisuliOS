@@ -40,7 +40,10 @@ use arch::{cpu, multiboot};
 /// Called by `arch::boot` once the CPU is in 64-bit mode.
 pub fn kmain() -> ! {
     serial::init();
-    println!("HaisuliOS 0.1.0 - x86_64 microkernel");
+    println!(
+        "HaisuliOS {} - x86_64 microkernel",
+        env!("CARGO_PKG_VERSION")
+    );
     if !multiboot::has_memory_map() {
         panic!("not started by a Multiboot loader with a memory map");
     }
