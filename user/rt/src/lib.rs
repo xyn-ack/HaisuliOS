@@ -67,7 +67,9 @@ pub extern "C" fn __start(main: fn(StartInfo) -> i32) -> ! {
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     use core::fmt::Write;
     let mut w = io::BufWriter::new(io::Sink::DebugLog);
-    let _ = writeln!(w, "[pid {}] panic: {}", sys::getpid(), info);
+    // The task id, not the pid: asking the process server may not work
+    // (the process server itself may be the one panicking).
+    let _ = writeln!(w, "[task {}] panic: {}", sys::task_self(), info);
     w.flush();
     sys::exit(101)
 }

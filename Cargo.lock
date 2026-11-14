@@ -35,7 +35,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "proctest"
+name = "proc"
 version = "0.1.0"
 dependencies = [
  "haisuli-rt",

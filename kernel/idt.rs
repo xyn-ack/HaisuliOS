@@ -10,9 +10,8 @@ use crate::arch::cpu;
 use crate::arch::entry::{stub_address, ExceptionFrame, EXCEPTION_STUBS};
 use crate::arch::x86::{gate_descriptor, Exception, GateType, PrivilegeLevel};
 use crate::gdt::{DOUBLE_FAULT_IST, KERNEL_CS};
+use crate::task::{self, Why};
 use core::sync::atomic::{AtomicU64, Ordering};
-use haisuli_abi::signal::SIGSEGV;
-use haisuli_abi::Termination;
 
 /// Vectors in the IDT: every vector there is.
 const GATES: usize = 256;
@@ -70,8 +69,9 @@ pub(crate) extern "C" fn exception_handler(f: &ExceptionFrame) -> ! {
         crate::println!("    faulting address (CR2) = {:#x}", cpu::fault_address());
     }
     if from_user {
-        // Behave like POSIX SIGSEGV: terminate the process, wait status = 11.
-        crate::process::exit_current(Termination::Signalled(SIGSEGV).wait_status())
+        // The task cannot go on. What that means for its process (SIGSEGV) is
+        // the task manager's business, which `end_current` tells.
+        task::end_current(Why::Fault)
     }
     panic!("unrecoverable exception in kernel mode");
 }

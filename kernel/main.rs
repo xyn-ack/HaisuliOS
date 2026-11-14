@@ -4,9 +4,10 @@
 //!
 //! A bare-bones x86_64 microkernel that provides mechanisms and leaves policy to user space.
 //!
-//! The kernel provides physical and virtual memory, processes with private address spaces, a
-//! scheduler, message-passing IPC and a small POSIX-flavoured system call ABI. Policy and drivers
-//! live in user-space servers that the boot loader hands over as Multiboot modules (see `user/`).
+//! The kernel provides physical and virtual memory, tasks with private address spaces, a
+//! scheduler, message-passing IPC and a small Linux-flavoured system call ABI. Policy and drivers
+//! live in user-space servers that the boot loader hands over as Multiboot modules (see `user/`):
+//! POSIX processes, for one, are implemented by the process server on top of the kernel's tasks.
 //!
 //! Unsafe code is confined to [`arch`] (the hardware layer) and [`sync`] (the kernel's lock); the
 //! compiler rejects it anywhere else.
@@ -28,9 +29,9 @@ mod gdt;
 mod idt;
 mod irq;
 mod pmm;
-mod process;
-mod signal;
 mod syscall;
+mod task;
+mod upcall;
 mod vmm;
 
 use arch::{cpu, multiboot};
@@ -47,9 +48,9 @@ pub fn kmain() -> ! {
     pmm::init();
     irq::init();
     syscall::init();
-    process::spawn_boot_modules();
+    task::spawn_boot_modules();
     println!("[kernel] entering user space");
-    process::start()
+    task::start()
 }
 
 #[panic_handler]

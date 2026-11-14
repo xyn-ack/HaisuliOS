@@ -12,8 +12,8 @@
 //! remove one yet.
 //!
 //! An *open file description* (POSIX) is what `open` creates: a node, an offset and an access
-//! mode. Processes refer to descriptions by index from their file descriptors (see
-//! [`crate::process`]), and `dup`, `dup2` and `fork` make several descriptors share one. That is
+//! mode. Tasks refer to descriptions by index from their file descriptors (see
+//! [`crate::task`]), and `dup`, `dup2` and `task_fork` make several descriptors share one. That is
 //! what makes `2>&1` work: both descriptors write at the same offset. Description [`CONSOLE`] is
 //! the terminal; reads and writes on it go to the console server instead.
 //!
@@ -39,7 +39,7 @@ const MAX_OPEN: usize = 64;
 /// Bytes copied between user memory and a file at a time.
 const CHUNK: usize = 256;
 
-/// The open file description of the terminal: every process starts with its
+/// The open file description of the terminal: every task starts with its
 /// standard input, output and error on it.
 pub(crate) const CONSOLE: usize = 0;
 

@@ -2,16 +2,26 @@
 
 //! System calls.
 //!
-//! Safe wrappers for every HaisuliOS system call; errors are returned as `Err(Errno)`.
+//! Safe wrappers for every HaisuliOS system call, and for the POSIX process calls that the process
+//! server implements; errors are returned as `Err(Errno)`.
 //!
-//! Every call goes through `invoke`, which takes a `Sys` value whose memory arguments are Rust
-//! borrows: a pointer passed to the kernel therefore always comes from a live borrow with its exact
-//! length, and from a `&mut` whenever the kernel (or, for IPC, the server) may write through it.
+//! Every system call goes through `invoke`, which takes a `Sys` value whose memory arguments are
+//! Rust borrows: a pointer passed to the kernel therefore always comes from a live borrow with its
+//! exact length, and from a `&mut` whenever the kernel (or, for IPC, the server) may write through
+//! it.
+//!
+//! The kernel knows nothing about POSIX processes. `fork`, `exit`, `waitpid`, `getpid`, `kill`,
+//! process groups, sessions and signal dispositions are requests to the process server
+//! ([`crate::abi::proc`]), made with `ipc_call`, like the terminal's requests to the console
+//! server.
 
+use crate::abi::errno::EINTR;
 use crate::abi::fcntl::{F_DUPFD, PATH_MAX};
+use crate::abi::proc::*;
 use crate::abi::signal::{SA_RESTORER, SIG_DFL, SIG_IGN};
-use crate::abi::{nr, ProcInfo, PROC_INFO_LEN};
+use crate::abi::{nr, svc, upcall, ProcInfo, TaskInfo, PROC_INFO_LEN, TASK_INFO_LEN};
 use core::arch::{asm, global_asm};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// An error number from [`crate::abi::errno`] (positive).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,49 +89,6 @@ enum Sys<'a> {
         fd: u64,
         buf: &'a mut [u8],
     },
-    Exit(i32),
-    Fork,
-    /// The kernel writes the child's wait status into `status`.
-    Wait {
-        pid: i64,
-        status: &'a mut i32,
-        options: u64,
-    },
-    Kill {
-        pid: i64,
-        sig: u64,
-    },
-    KillPgrp {
-        pgid: u64,
-        sig: u64,
-    },
-    Pause,
-    /// The kernel reads the new disposition from `act` and writes the old one
-    /// to `old`.
-    SigAction {
-        sig: u64,
-        act: &'a KernelSigAction,
-        old: &'a mut KernelSigAction,
-    },
-    /// The kernel reads `set` and writes the previous mask to `old`.
-    SigProcMask {
-        how: u64,
-        set: &'a u64,
-        old: &'a mut u64,
-    },
-    SetPgid {
-        pid: u64,
-        pgid: u64,
-    },
-    GetPgid(u64),
-    SetSid,
-    GetSid(u64),
-    /// The kernel fills `buf` with serialised `ProcInfo` entries.
-    ProcList {
-        buf: &'a mut [u8],
-    },
-    GetPid,
-    GetPpid,
     Yield,
     Ioperm {
         from: u64,
@@ -158,7 +125,25 @@ enum Sys<'a> {
     IrqAck(u64),
     SvcRegister(u64),
     SvcLookup(u64),
+    SvcWait(u64),
     DebugLog(&'a [u8]),
+    TaskSelf,
+    TaskExit,
+    TaskFork(u64),
+    TaskKill(u64),
+    TaskStop(u64),
+    TaskCont(u64),
+    /// The kernel only reads `request`.
+    TaskUpcall {
+        tid: u64,
+        request: &'a [u64; upcall::WORDS],
+    },
+    /// The kernel fills `buf` with a serialised `TaskInfo`.
+    TaskInfo {
+        tid: u64,
+        buf: &'a mut [u8; TASK_INFO_LEN],
+    },
+    PowerOff,
 }
 
 fn invoke(call: Sys<'_>) -> i64 {
@@ -186,42 +171,6 @@ fn invoke(call: Sys<'_>) -> i64 {
             let (p, l) = rw(buf);
             (nr::GETDENTS64, [fd, p, l, 0])
         }
-        Sys::Exit(code) => (nr::EXIT, [code as u64, 0, 0, 0]),
-        Sys::Fork => (nr::FORK, [0; 4]),
-        Sys::Wait {
-            pid,
-            status,
-            options,
-        } => (
-            nr::WAIT4,
-            [pid as u64, status as *mut i32 as u64, options, 0],
-        ),
-        Sys::Kill { pid, sig } => (nr::KILL, [pid as u64, sig, 0, 0]),
-        Sys::KillPgrp { pgid, sig } => (nr::KILL_PGRP, [pgid, sig, 0, 0]),
-        Sys::Pause => (nr::PAUSE, [0; 4]),
-        Sys::SigAction { sig, act, old } => (
-            nr::RT_SIGACTION,
-            [
-                sig,
-                act as *const KernelSigAction as u64,
-                old as *mut KernelSigAction as u64,
-                8,
-            ],
-        ),
-        Sys::SigProcMask { how, set, old } => (
-            nr::RT_SIGPROCMASK,
-            [how, set as *const u64 as u64, old as *mut u64 as u64, 8],
-        ),
-        Sys::SetPgid { pid, pgid } => (nr::SETPGID, [pid, pgid, 0, 0]),
-        Sys::GetPgid(pid) => (nr::GETPGID, [pid, 0, 0, 0]),
-        Sys::SetSid => (nr::SETSID, [0; 4]),
-        Sys::GetSid(pid) => (nr::GETSID, [pid, 0, 0, 0]),
-        Sys::ProcList { buf } => {
-            let (p, l) = rw(buf);
-            (nr::PROC_LIST, [p, l, 0, 0])
-        }
-        Sys::GetPid => (nr::GETPID, [0; 4]),
-        Sys::GetPpid => (nr::GETPPID, [0; 4]),
         Sys::Yield => (nr::SCHED_YIELD, [0; 4]),
         Sys::Ioperm { from, num, on } => (nr::IOPERM, [from, num, on as u64, 0]),
         Sys::IpcSend { dest, a, b } => (nr::IPC_SEND, [dest, a, b, 0]),
@@ -251,10 +200,23 @@ fn invoke(call: Sys<'_>) -> i64 {
         Sys::IrqAck(line) => (nr::IRQ_ACK, [line, 0, 0, 0]),
         Sys::SvcRegister(id) => (nr::SVC_REGISTER, [id, 0, 0, 0]),
         Sys::SvcLookup(id) => (nr::SVC_LOOKUP, [id, 0, 0, 0]),
+        Sys::SvcWait(id) => (nr::SVC_WAIT, [id, 0, 0, 0]),
         Sys::DebugLog(msg) => {
             let (p, l) = ro(msg);
             (nr::DEBUG_LOG, [p, l, 0, 0])
         }
+        Sys::TaskSelf => (nr::TASK_SELF, [0; 4]),
+        Sys::TaskExit => (nr::TASK_EXIT, [0; 4]),
+        Sys::TaskFork(tid) => (nr::TASK_FORK, [tid, 0, 0, 0]),
+        Sys::TaskKill(tid) => (nr::TASK_KILL, [tid, 0, 0, 0]),
+        Sys::TaskStop(tid) => (nr::TASK_STOP, [tid, 0, 0, 0]),
+        Sys::TaskCont(tid) => (nr::TASK_CONT, [tid, 0, 0, 0]),
+        Sys::TaskUpcall { tid, request } => (nr::TASK_UPCALL, [tid, request.as_ptr() as u64, 0, 0]),
+        Sys::TaskInfo { tid, buf } => {
+            let (p, l) = rw(buf);
+            (nr::TASK_INFO, [tid, p, l, 0])
+        }
+        Sys::PowerOff => (nr::POWER_OFF, [0; 4]),
     };
     // SAFETY: Every pointer in `args` was taken from a borrow in `call`,
     // which lives until this function returns, with its exact length; it is
@@ -353,18 +315,59 @@ impl<'a> Iterator for DirEntries<'a> {
     }
 }
 
+// ---- POSIX processes (served by the process server) ----
+
+/// Most words in a request to the process server.
+const PROC_WORDS_MAX: usize = 10;
+
+/// The task id of the process server, once known (0 until then).
+static PROC_SERVER: AtomicU64 = AtomicU64::new(0);
+
+/// The task id of the process server, waiting for it to start if need be.
+fn proc_server() -> Result<u64> {
+    match PROC_SERVER.load(Ordering::Relaxed) {
+        0 => {
+            let tid = svc_wait(svc::PROC)?;
+            PROC_SERVER.store(tid, Ordering::Relaxed);
+            Ok(tid)
+        }
+        tid => Ok(tid),
+    }
+}
+
+/// Makes request `op` to the process server; `words` are its call buffer.
+///
+/// The server's answers (the words marked *out* in [`crate::abi::proc`]) are
+/// copied back into `words`.
+fn proc_call(op: u64, words: &mut [u64]) -> Result<u64> {
+    let server = proc_server()?;
+    let mut bytes = [0u8; PROC_WORDS_MAX * 8];
+    let len = words.len() * 8;
+    for (b, w) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(words.iter()) {
+        *b = w.to_ne_bytes();
+    }
+    let result = ipc_call(server, op, &mut bytes[..len]);
+    for (w, b) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        *w = u64::from_ne_bytes(*b);
+    }
+    result
+}
+
 /// Terminates the calling process with exit status `code`.
+///
+/// Without a process server to tell (it is gone, or the caller is the
+/// process server itself), the task just ends.
 pub fn exit(code: i32) -> ! {
-    invoke(Sys::Exit(code));
-    unreachable!("exit returned")
+    let _ = proc_call(OP_EXIT, &mut [code as i64 as u64]);
+    task_exit()
 }
 
 /// Creates a child process; it returns 0, the parent the child's pid.
 ///
 /// The child is a copy of the caller: same memory, same process group and
-/// session, and the same ignored signals.
+/// session, and the same signal dispositions and mask.
 pub fn fork() -> Result<u64> {
-    check(invoke(Sys::Fork))
+    proc_call(OP_FORK, &mut [])
 }
 
 /// Waits for a child to exit and reaps it, returning its pid and wait status.
@@ -374,13 +377,9 @@ pub fn fork() -> Result<u64> {
 /// Fails with `ECHILD` if there is no such child (including one that has
 /// already been waited for).
 pub fn waitpid(pid: i64, options: u64) -> Result<(u64, WaitStatus)> {
-    let mut status = 0;
-    let reaped = check(invoke(Sys::Wait {
-        pid,
-        status: &mut status,
-        options,
-    }))?;
-    Ok((reaped, WaitStatus(status)))
+    let mut words = [pid as u64, options, 0];
+    let reaped = proc_call(OP_WAIT, &mut words)?;
+    Ok((reaped, WaitStatus(words[2] as i32)))
 }
 
 /// Sends signal `sig` to a process (`pid` > 0), a process group (`pid` < 0) or
@@ -388,7 +387,7 @@ pub fn waitpid(pid: i64, options: u64) -> Result<(u64, WaitStatus)> {
 ///
 /// Signal 0 only checks whether a target exists.
 pub fn kill(pid: i64, sig: u64) -> Result<()> {
-    check(invoke(Sys::Kill { pid, sig })).map(drop)
+    proc_call(OP_KILL, &mut [pid as u64, sig]).map(drop)
 }
 
 /// Sends signal `sig` to every process in group `pgid`, including group 1.
@@ -396,7 +395,7 @@ pub fn kill(pid: i64, sig: u64) -> Result<()> {
 /// `kill(-pgid, sig)` means the same, except for group 1: `kill(-1)` is the
 /// POSIX broadcast to every process.
 pub fn kill_pgrp(pgid: u64, sig: u64) -> Result<()> {
-    check(invoke(Sys::KillPgrp { pgid, sig })).map(drop)
+    proc_call(OP_KILL_PGRP, &mut [pgid, sig]).map(drop)
 }
 
 /// Sleeps until a signal arrives.
@@ -404,17 +403,10 @@ pub fn kill_pgrp(pgid: u64, sig: u64) -> Result<()> {
 /// Returns `EINTR` after a signal handler has run. A signal whose default
 /// action applies terminates or stops the process instead.
 pub fn pause() -> Errno {
-    Errno(-invoke(Sys::Pause))
-}
-
-/// A Linux `struct sigaction`, as the kernel reads and writes it.
-#[repr(C)]
-#[derive(Default)]
-struct KernelSigAction {
-    handler: u64,
-    flags: u64,
-    restorer: u64,
-    mask: u64,
+    match proc_call(OP_PAUSE, &mut []) {
+        Err(e) => e,
+        Ok(_) => Errno(EINTR),
+    }
 }
 
 /// What a process does with a signal.
@@ -438,29 +430,20 @@ pub enum SigHandler {
 /// [`crate::abi::signal::bit`]) to block while the handler runs. The runtime
 /// supplies the restorer that returns from a handler.
 pub fn sigaction(sig: u64, handler: SigHandler, flags: u64, mask: u64) -> Result<SigHandler> {
+    // A Linux `struct sigaction`: handler, flags, restorer, mask.
     let act = match handler {
-        SigHandler::Default => KernelSigAction {
-            handler: SIG_DFL,
-            ..KernelSigAction::default()
-        },
-        SigHandler::Ignore => KernelSigAction {
-            handler: SIG_IGN,
-            ..KernelSigAction::default()
-        },
-        SigHandler::Catch(f) => KernelSigAction {
-            handler: f as usize as u64,
-            flags: flags | SA_RESTORER,
-            restorer: __haisuli_sigreturn as *const () as usize as u64,
+        SigHandler::Default => [SIG_DFL, 0, 0, 0],
+        SigHandler::Ignore => [SIG_IGN, 0, 0, 0],
+        SigHandler::Catch(f) => [
+            f as usize as u64,
+            flags | SA_RESTORER,
+            __haisuli_sigreturn as *const () as usize as u64,
             mask,
-        },
+        ],
     };
-    let mut old = KernelSigAction::default();
-    check(invoke(Sys::SigAction {
-        sig,
-        act: &act,
-        old: &mut old,
-    }))?;
-    Ok(match old.handler {
+    let mut words = [sig, 1, act[0], act[1], act[2], act[3], 0, 0, 0, 0];
+    proc_call(OP_SIGACTION, &mut words)?;
+    Ok(match words[6] {
         SIG_DFL => SigHandler::Default,
         SIG_IGN => SigHandler::Ignore,
         // Only this runtime installs handlers, and only `extern "C" fn(i32)`s.
@@ -473,26 +456,37 @@ pub fn sigaction(sig: u64, handler: SigHandler, flags: u64, mask: u64) -> Result
 /// `how` is `SIG_BLOCK`, `SIG_UNBLOCK` or `SIG_SETMASK`; sets use the bits of
 /// [`crate::abi::signal::bit`]. SIGKILL and SIGSTOP cannot be blocked.
 pub fn sigprocmask(how: u64, set: u64) -> Result<u64> {
-    let mut old = 0;
-    check(invoke(Sys::SigProcMask {
-        how,
-        set: &set,
-        old: &mut old,
-    }))?;
-    Ok(old)
+    let mut words = [how, 1, set, 0];
+    proc_call(OP_SIGPROCMASK, &mut words)?;
+    Ok(words[3])
 }
 
-// Where every signal handler returns to: the kernel's signal frame has this
-// address as the handler's return address, and `rt_sigreturn` restores the
-// interrupted context from the rest of the frame (it never returns here).
+/// Hands the signal mask saved in a handler's frame back to the process
+/// server, which then delivers the signals that it unblocks.
+///
+/// Called only by [`__haisuli_sigreturn`].
+extern "C" fn restore_signal_mask(mask: u64) {
+    let _ = proc_call(OP_SIGRETURN, &mut [mask]);
+}
+
+// Where every signal handler returns to: the kernel's upcall frame has this
+// address as the handler's return address, and the stack pointer then points
+// at the frame's `ucontext`. The signal mask saved there goes back to the
+// process server; then `rt_sigreturn` restores the interrupted registers from
+// the frame (it never returns here). The `call` keeps the SysV alignment: the
+// kernel leaves the stack pointer 16-byte aligned at this point.
 global_asm!(
     ".pushsection .text.__haisuli_sigreturn, \"ax\"",
     ".global __haisuli_sigreturn",
     "__haisuli_sigreturn:",
+    "    mov rdi, [rsp + {uc_sigmask}]",
+    "    call {restore}",
     "    mov eax, {nr}",
     "    syscall",
     "    ud2",
     ".popsection",
+    uc_sigmask = const upcall::UC_SIGMASK,
+    restore = sym restore_signal_mask,
     nr = const nr::RT_SIGRETURN,
 );
 
@@ -504,35 +498,38 @@ extern "C" {
 
 /// Puts process `pid` (0 = the caller) into process group `pgid` (0 = `pid`).
 pub fn setpgid(pid: u64, pgid: u64) -> Result<()> {
-    check(invoke(Sys::SetPgid { pid, pgid })).map(drop)
+    proc_call(OP_SETPGID, &mut [pid, pgid]).map(drop)
 }
 
 /// Returns the process group of `pid` (0 = the caller).
 pub fn getpgid(pid: u64) -> Result<u64> {
-    check(invoke(Sys::GetPgid(pid)))
+    proc_call(OP_GETPGID, &mut [pid])
 }
 
 /// Makes the caller the leader of a new session and process group.
 pub fn setsid() -> Result<u64> {
-    check(invoke(Sys::SetSid))
+    proc_call(OP_SETSID, &mut [])
 }
 
 /// Returns the session of `pid` (0 = the caller).
 pub fn getsid(pid: u64) -> Result<u64> {
-    check(invoke(Sys::GetSid(pid)))
+    proc_call(OP_GETSID, &mut [pid])
 }
+
+/// Most processes [`proc_list`] reports.
+pub const PROC_LIST_MAX: usize = 64;
 
 /// Lists the processes of the system into `out`, returning how many it wrote.
 pub fn proc_list(out: &mut [ProcInfo]) -> Result<usize> {
-    let mut buf = [0u8; PROC_INFO_LEN * 16];
+    let mut buf = [0u8; PROC_INFO_LEN * PROC_LIST_MAX];
     let len = (out.len() * PROC_INFO_LEN).min(buf.len());
-    let n = check(invoke(Sys::ProcList {
-        buf: &mut buf[..len],
-    }))? as usize;
-    for (i, entry) in out.iter_mut().enumerate().take(n) {
-        let mut one = [0u8; PROC_INFO_LEN];
-        one.copy_from_slice(&buf[i * PROC_INFO_LEN..(i + 1) * PROC_INFO_LEN]);
-        *entry = ProcInfo::from_bytes(&one);
+    let n = ipc_call(proc_server()?, OP_LIST, &mut buf[..len])? as usize;
+    for (entry, bytes) in out
+        .iter_mut()
+        .zip(buf.as_chunks::<PROC_INFO_LEN>().0)
+        .take(n)
+    {
+        *entry = ProcInfo::from_bytes(bytes);
     }
     Ok(n)
 }
@@ -554,17 +551,19 @@ impl WaitStatus {
     }
 }
 
-/// Returns the calling process's id.
+/// Returns the calling process's id (0 if the process server cannot say).
 pub fn getpid() -> u64 {
-    invoke(Sys::GetPid) as u64
+    proc_call(OP_GETPID, &mut []).unwrap_or(0)
 }
 
 /// Returns the process id of the caller's parent (0 for boot modules).
 pub fn getppid() -> u64 {
-    invoke(Sys::GetPpid) as u64
+    proc_call(OP_GETPPID, &mut []).unwrap_or(0)
 }
 
-/// Lets the other ready processes run.
+// ---- Tasks ----
+
+/// Lets the other ready tasks run.
 pub fn sched_yield() {
     invoke(Sys::Yield);
 }
@@ -657,12 +656,68 @@ pub fn svc_register(id: u64) -> Result<()> {
     check(invoke(Sys::SvcRegister(id))).map(drop)
 }
 
-/// Returns the pid of the process providing service `id`.
+/// Returns the task providing service `id`.
 pub fn svc_lookup(id: u64) -> Result<u64> {
     check(invoke(Sys::SvcLookup(id)))
+}
+
+/// Returns the task providing service `id`, waiting until it registers.
+pub fn svc_wait(id: u64) -> Result<u64> {
+    check(invoke(Sys::SvcWait(id)))
 }
 
 /// Writes to the kernel debug log, which never blocks.
 pub fn debug_log(msg: &[u8]) {
     invoke(Sys::DebugLog(msg));
+}
+
+// ---- Task control (the process server's mechanisms) ----
+
+/// Returns the calling task's id (the kernel's, not a POSIX pid).
+pub fn task_self() -> u64 {
+    invoke(Sys::TaskSelf) as u64
+}
+
+/// Ends the calling task at once; the kernel tells the process server.
+pub fn task_exit() -> ! {
+    invoke(Sys::TaskExit);
+    unreachable!("task_exit returned")
+}
+
+/// Creates a copy of task `tid`, which is blocked in a call to the caller,
+/// and returns the copy's id (task manager only).
+pub fn task_fork(tid: u64) -> Result<u64> {
+    check(invoke(Sys::TaskFork(tid)))
+}
+
+/// Ends task `tid` (task manager only).
+pub fn task_kill(tid: u64) -> Result<()> {
+    check(invoke(Sys::TaskKill(tid))).map(drop)
+}
+
+/// Stops scheduling task `tid` (task manager only).
+pub fn task_stop(tid: u64) -> Result<()> {
+    check(invoke(Sys::TaskStop(tid))).map(drop)
+}
+
+/// Schedules the stopped task `tid` again (task manager only).
+pub fn task_cont(tid: u64) -> Result<()> {
+    check(invoke(Sys::TaskCont(tid))).map(drop)
+}
+
+/// Makes task `tid` enter a handler (task manager only; see [`crate::abi::upcall`]).
+pub fn task_upcall(tid: u64, request: &[u64; upcall::WORDS]) -> Result<()> {
+    check(invoke(Sys::TaskUpcall { tid, request })).map(drop)
+}
+
+/// Reports what task `tid` is doing.
+pub fn task_info(tid: u64) -> Result<TaskInfo> {
+    let mut buf = [0u8; TASK_INFO_LEN];
+    check(invoke(Sys::TaskInfo { tid, buf: &mut buf }))?;
+    Ok(TaskInfo::from_bytes(&buf))
+}
+
+/// Powers the machine off (privileged tasks only).
+pub fn power_off() -> Result<()> {
+    check(invoke(Sys::PowerOff)).map(drop)
 }
