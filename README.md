@@ -5,24 +5,26 @@ A tiny, bare-bones **microkernel** for **x86_64**, written in **Rust**, with a
 nightly features: just `core`, inline assembly, and a Multiboot v1 header.
 
 > Status: v0.1. It provides virtual memory, tasks, IPC and user-space drivers;
-> POSIX processes and signals with job control are implemented by a user-space
-> process server, and the system boots into an interactive console served by a
-> user-space console server. It is **not** yet a full POSIX system: there is no
-> `execve` and no libc, and the file system is a RAM disk.
+> POSIX processes, `execve` and signals with job control are implemented by a
+> user-space process server, which loads programs from the file system, and the
+> system boots into an interactive console served by a user-space console
+> server. It is **not** yet a full POSIX system: there is no libc, and the file
+> system is a RAM disk.
 
 ## What the kernel does (and deliberately doesn't)
 
 | In the kernel (mechanism)                             | In user space (policy)                      |
 |-------------------------------------------------------|---------------------------------------------|
-| Physical memory manager (bitmap frame allocator)      | **Process server**: POSIX processes (`user/proc`): pids, `fork`, `exit`, `wait4`, zombies, `getpid`, process groups and sessions, signals |
-| Virtual memory: 4-level paging, per-task spaces       | **Console server**: COM1 driver, line discipline and the job control terminal (`user/console`) |
+| Physical memory manager (bitmap frame allocator)      | **Process server**: POSIX processes (`user/proc`): pids, `fork`, `execve`, `exit`, `wait4`, zombies, `getpid`, process groups and sessions, signals; starts the system servers listed in `/etc/servers` |
+| Virtual memory: 4-level paging, per-task spaces       | **Console server**: COM1 driver, line discipline and the job control terminal (`user/console`, run from `/sbin/console`) |
 | Tasks, kernel stacks, context switch, scheduler       | **init**: motd, then a job control shell (`user/init`) |
 | Task control for the task manager: copy, end, stop, continue, upcalls | Job control policy: who is in the foreground, what Ctrl-C means |
 | `mmap` (anonymous)                                    | Shell redirections (`>`, `>>`, `<`, `2>&1`) |
 | RAM file system (the unpacked ramdisk), file descriptors | Planned: VFS + file system servers       |
 | IPC: async notifications + synchronous calls with data transfer | Planned: libc (musl port) on the ABI |
 | IRQ forwarding, per-task I/O-port permissions         | Planned: more device drivers                |
-| ELF loader for boot modules; well-known service registry |                                          |
+| ELF loader: boot modules, and programs from the file system (argv/envp on the stack) | Programs in `/bin` (`user/coreutils`) |
+| Well-known service registry                           |                                             |
 | Exceptions -> end the task, report it to the task manager |                                         |
 
 The kernel contains no device drivers apart from a write-only debug log on
@@ -53,6 +55,7 @@ kernel/            the kernel
   pmm.rs           Physical frame allocator (Multiboot memory map)
   vmm.rs           Paging: map, translate, clone (task_fork), destroy, user-memory copies
   elf.rs           ELF64 loader for user programs
+  program.rs       a program's address space: its image, stack and arguments
   fs.rs            RAM file system (the unpacked ramdisk), open file descriptions
   task.rs          Task table, scheduler, task control, upcalls, mmap, IPC, services
   upcall.rs        The frame that enters a handler (Linux signal frame layout)
@@ -64,13 +67,15 @@ user/rt/           user runtime: entry point, syscall wrappers, POSIX process ca
                    (requests to the process server), print!, panics
 user/proc/         process server: POSIX processes and signals
   src/signals.rs   dispositions, default actions, signal sets
-user/console/      console server
+user/console/      console server (/sbin/console)
+user/coreutils/    programs for /bin: echo, true, false
 user/init/         init (pid 1): /etc/motd, then a job control shell
   src/words.rs     command line words: quotes, `$?`, `&`, redirection operators
   src/redirect.rs  applying (and undoing) redirections
   src/traps.rs     the shell's signal handling and `trap`
 user/user.ld       linker script for user programs
-rootfs/            contents of the boot ramdisk (rootfs/etc/motd = /etc/motd)
+rootfs/            contents of the boot ramdisk (rootfs/etc/motd = /etc/motd), besides
+                   the programs in /sbin and /bin, which the build adds
 test/              tests (see below)
 ```
 
@@ -93,7 +98,8 @@ make them safe:
   other shared kernel state is atomics). On this single CPU it can only be
   found held through re-entrant use, which panics instead of creating
   aliased `&mut`.
-* `user/rt`: the `syscall` instruction and the start-up code. The wrappers
+* `user/rt`: the `syscall` instruction and the start-up code, which reads
+  the arguments only within the initial stack area. The wrappers
   pass the kernel only pointers taken from borrows of the right length and
   mutability (`&mut` whenever the kernel or an IPC server may write). A
   `write()` buffer can be a shared borrow because the kernel enforces that
@@ -110,15 +116,26 @@ compiler-builtins for `memcpy` and friends instead of defining them itself.
 
 ### Boot
 
-The boot loader loads the kernel and a list of **boot modules**. Every module
-that is an ELF file is started as a task, in order: init, the console server
-and the process server get task ids 1, 2 and 3. The process server adopts the
-boot tasks as processes under the same ids, so init is pid 1. Boot-module
-tasks are *privileged*: they may use `ioperm`, `irq_bind`, `svc_register` and
-`power_off`. Copies made with `task_fork` (forked children) are not
-privileged. A module that is not an ELF file is the **ramdisk**, a ustar
-archive: the kernel unpacks it into its RAM file system (see *Files* below),
-so `/etc/motd` is an ordinary file that init opens.
+The boot loader loads the kernel and a list of **boot modules**: only what it
+takes to load programs from the file system. Every module that is an ELF file
+is started as a task, in order: init and the process server get task ids 1
+and 2. The process server adopts the boot tasks as processes under the same
+ids, so init is pid 1. A module that is not an ELF file is the **ramdisk**, a
+ustar archive: the kernel unpacks it into its RAM file system (see *Files*
+below), so `/etc/motd` is an ordinary file that init opens, and the programs
+in `/sbin` and `/bin` are ordinary files too.
+
+The other servers are not critical to booting, so they come from the file
+system: the process server starts the **system servers** listed in
+`/etc/servers`, one path per line. Today that is the console server,
+`/sbin/console`, which becomes pid 3. Like a boot module, a system server has
+no parent and leads its own session and process group. init waits for the
+console while it starts: a terminal `read` or `write` waits for the console
+service to register.
+
+Boot modules and system servers are *privileged*: they may use `ioperm`,
+`irq_bind`, `svc_register` and `power_off`. Nothing else is: neither copies
+made with `task_fork` (forked children) nor programs started with `execve`.
 
 When init exits, the process server powers the machine off.
 
@@ -179,6 +196,8 @@ There are no process calls: `fork`, `exit`, `wait4`, `getpid`, `kill`,
 | 0x1015 | `task_upcall(tid,&[u64;6])`       | task manager; enter a handler on the way to user mode   |
 | 0x1016 | `task_info(tid,buf,len)`          | a `TaskInfo`: running, blocked or stopped; its name     |
 | 0x1017 | `power_off()`                     | privileged                                              |
+| 0x1018 | `task_exec(tid,blk,len,flags)`    | task manager; a task blocked in a call to it runs a program from the file system |
+| 0x1019 | `task_spawn(blk,len,flags)`       | task manager; a program from the file system in a new task |
 
 Task ids are the kernel's; pids are the process server's. IPC addresses
 tasks. The *task manager* is whichever task registered as service 2, the
@@ -226,6 +245,9 @@ few `u64` words per request:
   reparents the orphans to init and completes the parent's `wait4`.
 * `wait4` and `pause` are answered later: the server keeps the call pending,
   so it never blocks on a client.
+* `execve`: the server has the kernel replace the caller's program with one
+  from the file system (`task_exec`; see *Programs*), and resets the caught
+  signals to their default action.
 * `getpid`, `getppid`, `setpgid`, `getpgid`, `setsid`, `getsid`, `kill`, the
   terminal's `kill_pgrp` and the listing that `ps` shows are answered from
   the table.
@@ -233,11 +255,48 @@ few `u64` words per request:
 When init exits, the process server powers the machine off. The process
 server itself cannot be signalled (`kill` fails with `EPERM`).
 
+### Programs
+
+`execve(path, argv, envp)` runs a program from the file system: a static
+x86_64 ELF executable. The runtime sends the process server an *argument
+block* (`abi::exec`: the path, the arguments and the environment, at most
+4 KiB), and the server passes it to the kernel's `task_exec`. The kernel reads
+the file, builds a new address space (the image, a 32 KiB stack and the
+arguments), and only then replaces the task's old one, so a failed `execve`
+returns to the caller: `ENOENT`, `EACCES` for a directory, `ENOEXEC` for a
+file that is not a program, `E2BIG` for too many arguments. The program starts
+with the System V initial stack, as on Linux: `argc`, `argv`, `envp` and an
+empty auxiliary vector; the runtime hands them to `main` as `StartInfo::args()`
+and `env()`.
+
+The process keeps its pid, parent, process group, session, file descriptors
+(so redirections carry over), signal mask and ignored signals. It loses its
+signal handlers, and with them its upcall, and the kernel-side state of the
+old program: I/O permissions, IRQs, services, messages, and privileges.
+`task_spawn` is the same for a new task; it is how the process server starts
+the system servers, with the `PRIVILEGED` flag, which only a privileged task
+may ask for and which `execve` never passes.
+
+The shell runs a command that is not built in as a program: the file it
+names if it contains a `/`, or else the file of that name in `/bin` (there is
+no `PATH` variable yet). If there is no such file, the shell says so itself
+(status 127); otherwise a child runs it (status 126 if it cannot).
+
+```
+haisuli# /bin/echo hello world
+hello world
+[proc] pid 4 (echo) exited (wait status 0x0)
+haisuli# false
+[proc] pid 4 (false) exited (wait status 0x100)
+haisuli# echo $?
+1
+```
+
 ### Files
 
 The kernel keeps a small RAM file system, filled at boot from the boot
 ramdisk and writable from then on, like Linux's initramfs: up to 64 files and
-directories, of up to 64 KiB each, in page frames from the frame allocator.
+directories, of up to 128 KiB each, in page frames from the frame allocator.
 Paths are normalised (`//`, `.` and `..`), and there is no current directory,
 so a relative path starts at the root. Files can be created (in an existing
 directory), written, appended to and truncated; there is no `unlink`,
@@ -358,7 +417,8 @@ usually lacks the `x86_64-unknown-none` target; rustup installs it
 automatically from `rust-toolchain.toml`.
 
 ```sh
-make          # build kernel + user programs, pack rootfs/ into build/initrd.tar
+make          # build kernel + user programs, pack rootfs/ and the programs
+              # for /sbin and /bin into build/initrd.tar
 make run      # boot in QEMU with an interactive console on your terminal
 ```
 
@@ -373,13 +433,12 @@ the bare-metal target too; outputs land in `target/x86_64-unknown-none/`.
 
 Why the `objcopy` step? QEMU's `-kernel` loader only accepts 32-bit ELF files;
 the kernel itself switches to long mode in `kernel/arch/boot.rs`.
-QEMU passes the boot modules with `-initrd "build/init,build/console,build/proc,build/initrd.tar"`.
+QEMU passes the boot modules with `-initrd "build/init,build/proc,build/initrd.tar"`.
 With GRUB you can boot the 64-bit ELF directly:
 
 ```
 multiboot /boot/haisulios
 module    /boot/init init
-module    /boot/console console
 module    /boot/proc proc
 module    /boot/initrd.tar initrd
 ```
@@ -399,13 +458,13 @@ module    /boot/initrd.tar initrd
 ```
 HaisuliOS 0.1.0 - x86_64 microkernel
 [pmm] 32364 frames free (126 MiB)
-[kernel] started pid 1 (init): 67 KiB image
-[kernel] started pid 2 (console): 31 KiB image
-[kernel] started pid 3 (proc): 39 KiB image
-[kernel] ramdisk "initrd.tar": 10 KiB
+[kernel] started task 1 (init): 71 KiB image
+[kernel] started task 2 (proc): 44 KiB image
+[kernel] ramdisk "initrd.tar": 120 KiB
 [kernel] entering user space
-[console] serving COM1 (IRQ 4)
+[proc] started pid 3 (console) from /sbin/console
 [proc] serving POSIX processes
+[console] serving COM1 (IRQ 4)
 
   _   _       _           _ _  ___  ____
  ...                                          (the contents of /etc/motd)
@@ -422,6 +481,7 @@ commands:
   wait [pid...]     wait for background jobs
   trap [cmd sig...] run cmd on a signal ('' ignores, - resets)
   exit [status]     leave the shell and power off
+  program [args...] run a program in /bin (or give its path)
 end a command with & to run it in the background; $? is its status
 redirect with > file, >> file, < file, 2> file and 2>&1
 haisuli# pause &
@@ -429,8 +489,8 @@ haisuli# pause &
 haisuli# ps
   PID  PPID  PGID   SID STAT NAME
     1     0     1     1 R    init
-    2     0     2     2 S    console
-    3     0     3     3 R    proc
+    2     0     2     2 R    proc
+    3     0     3     3 S    console
     4     1     4     1 S    init
 haisuli# kill 4
 [proc] pid 4 (init) exited (wait status 0xf)
@@ -474,6 +534,7 @@ test/test_boot.py         boot messages, /etc/motd shown before the first prompt
 test/test_commands.py     help, echo, ls, cat, unknown commands, odd input
 test/test_line_editing.py echo, Backspace, Ctrl-U/C, escape sequences, long lines
 test/test_exit.py         exit and Ctrl-D power the machine off
+test/test_exec.py         programs from the file system: execve, /bin, /sbin/console
 test/test_process.py      signals, process groups/sessions, waitpid semantics
 test/test_process_server.py  explicit ("process-server"): process management lives in the
                           process server (pids, exit statuses, zombies), not the kernel
@@ -535,8 +596,10 @@ HaisuliOS is licensed under the GNU General Public License, version 2 only
 * Single CPU, no locking. Kernel stacks are static (max 16 tasks). A zombie
   takes no task, only a record in the process server, which keeps up to 64
   processes, zombies included.
-* No `exec`: programs can only be started as boot modules. Boot-module
-  memory is not reclaimed after the programs are loaded.
+* Programs are static ELF executables of up to 128 KiB (the file system's
+  limit), with at most 4 KiB of arguments and environment. There is no
+  `PATH`, no close-on-exec and no `#!` scripts. Boot-module memory is not
+  reclaimed after the programs are loaded.
 * The kernel debug log and the console server share COM1 (output only on
   the kernel's side), so kernel messages can interleave with console output.
 * Signal handlers run only when a process returns from a system call. With
@@ -555,11 +618,13 @@ HaisuliOS is licensed under the GNU General Public License, version 2 only
   children it knows about, so such a zombie keeps its record in the process
   server (though no kernel resources).
 * Stopping a server that the rest of the system depends on (for instance
-  `kill -STOP 2`, the console) leaves nothing runnable; the kernel reports
-  the deadlock and powers off.
+  `kill -STOP 3`, the console) leaves nothing runnable; the kernel reports
+  the deadlock and powers off. Nothing restarts a system server that dies.
 * Syscalls validate every user pointer against the page tables, but
-  "privileged" (boot module or not) is the only permission model; there are
-  no capabilities yet, and no file permissions either.
+  "privileged" (boot modules and the servers in `/etc/servers`, or not) is
+  the only permission model; there are no capabilities yet, and no file
+  permissions either: anyone may write `/etc/servers` or `/sbin`, though that
+  only matters at the next boot, which starts from a fresh ramdisk.
 
 ## Roadmap toward POSIX
 
@@ -567,7 +632,7 @@ HaisuliOS is licensed under the GNU General Public License, version 2 only
    system calls, which is enough only while scheduling is cooperative; with
    preemption, returns from interrupts need the same `return_to_user` step.)
 2. Higher-half kernel, kernel heap, copy-on-write `fork`.
-3. `execve` (the ELF loader exists), loading programs from the file system.
+3. More programs in `/bin`, moving commands out of the shell; a `PATH`.
 4. Capability-based IPC endpoints; shared memory / page grants.
 5. More user-space servers: a VFS, with the RAM file system moving out of the
    kernel into a file system server; then port musl libc.

@@ -44,7 +44,7 @@ const USAGE_BITS: u64 = PageFlag::bits(&[PageFlag::Accessed, PageFlag::Dirty]);
 
 pub(crate) const USER_BASE: u64 = 0x0000_0080_0000_0000;
 pub(crate) const MMAP_BASE: u64 = 0x0000_0100_0000_0000;
-pub(crate) const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
+pub(crate) const USER_STACK_TOP: u64 = haisuli_abi::USER_STACK_TOP;
 pub(crate) const USER_LIMIT: u64 = haisuli_abi::USER_LIMIT;
 
 /// PML4 slots holding user space: the lower half of the address space,

@@ -16,9 +16,11 @@
 //! [`traps`]).
 //!
 //! Commands take POSIX redirections (`>`, `>>`, `<`, `2>&1`; see [`redirect`]) and report errors on
-//! standard error. There is no `exec` yet, so commands are built in. Most of them are quick and run in the shell
-//! itself, like the special built-ins of a POSIX shell; commands that wait for something (see
-//! [`runs_in_child`]) always run in a child, so that they can be signalled.
+//! standard error. A command that is not built in runs a program from the file system: one named
+//! by its path, or by its name in `/bin` ([`program_path`]), in a child that `execve`s it. Most
+//! built-in commands are quick and run in the shell itself, like the special built-ins of a POSIX
+//! shell; commands that wait for something (see [`runs_in_child`]) always run in a child, so that
+//! they can be signalled.
 
 #![no_std]
 #![no_main]
@@ -26,7 +28,7 @@
 
 use core::fmt::Write;
 use haisuli_rt::abi::errno::{self, ECHILD, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, ESRCH};
-use haisuli_rt::abi::fcntl::{O_DIRECTORY, O_RDONLY};
+use haisuli_rt::abi::fcntl::{O_DIRECTORY, O_RDONLY, PATH_MAX};
 use haisuli_rt::abi::proc_state;
 use haisuli_rt::abi::signal::{self, NSIG, SIGINT, SIGTERM};
 use haisuli_rt::abi::{ProcInfo, Termination};
@@ -45,6 +47,14 @@ const PROMPT: &str = "haisuli# ";
 const MAX_JOBS: usize = 8;
 /// Status of a command that could not be run, as POSIX prescribes.
 const STATUS_NOT_FOUND: i32 = 127;
+/// Status of a program that was found but could not be run, as POSIX prescribes.
+const STATUS_NOT_EXECUTABLE: i32 = 126;
+/// Where the shell looks for a program named without a path (`PATH`).
+const PROGRAM_DIR: &str = "/bin/";
+/// The built-in commands.
+const BUILTINS: [&str; 10] = [
+    "help", "echo", "ls", "cat", "ps", "pause", "kill", "wait", "trap", "exit",
+];
 
 fn main(_: haisuli_rt::StartInfo) -> i32 {
     match sys::open(MOTD, O_RDONLY) {
@@ -343,6 +353,7 @@ impl Shell {
                 println!("  wait [pid...]     wait for background jobs");
                 println!("  trap [cmd sig...] run cmd on a signal ('' ignores, - resets)");
                 println!("  exit [status]     leave the shell and power off");
+                println!("  program [args...] run a program in /bin (or give its path)");
                 println!("end a command with & to run it in the background; $? is its status");
                 println!("redirect with > file, >> file, < file, 2> file and 2>&1");
                 Outcome::status(0)
@@ -374,8 +385,15 @@ impl Shell {
                 exit: true,
             },
             cmd => {
-                eprintln!("{}: command not found (try 'help')", cmd);
-                Outcome::status(STATUS_NOT_FOUND)
+                let mut path = [0u8; PATH_MAX];
+                match program_path(cmd, &mut path) {
+                    // Only ever in a child (see `runs_in_child`).
+                    Some(path) => Outcome::status(run_program(path, words)),
+                    None => {
+                        eprintln!("{}: command not found (try 'help')", cmd);
+                        Outcome::status(STATUS_NOT_FOUND)
+                    }
+                }
             }
         }
     }
@@ -543,9 +561,46 @@ fn cat_one(fd: u64, name: &str) -> i32 {
 /// Commands that always run in a child process.
 ///
 /// `pause` waits for a signal, which only makes sense for a process that is
-/// not the shell: as a job it can be stopped, continued and killed.
+/// not the shell: as a job it can be stopped, continued and killed. A program
+/// replaces the process that runs it. (A command that is neither built in nor
+/// a program fails in the shell itself.)
 fn runs_in_child(command: &str) -> bool {
     command == "pause"
+        || (!BUILTINS.contains(&command) && program_path(command, &mut [0; PATH_MAX]).is_some())
+}
+
+/// The file of the program that `command` names, if it exists: the command
+/// itself if it contains a `/`, or else the command in [`PROGRAM_DIR`].
+///
+/// The path is put together in `buf`.
+fn program_path<'b>(command: &str, buf: &'b mut [u8; PATH_MAX]) -> Option<&'b str> {
+    let (dir, name) = if command.contains('/') {
+        ("", command)
+    } else {
+        (PROGRAM_DIR, command)
+    };
+    let len = dir.len() + name.len();
+    if command.is_empty() || len > buf.len() {
+        return None;
+    }
+    buf[..dir.len()].copy_from_slice(dir.as_bytes());
+    buf[dir.len()..len].copy_from_slice(name.as_bytes());
+    let path = core::str::from_utf8(&buf[..len]).ok()?;
+    let fd = sys::open(path, O_RDONLY).ok()?;
+    let _ = sys::close(fd);
+    Some(path)
+}
+
+/// Runs the program at `path` with arguments `words`, in place of the calling
+/// process; returns the status to exit with if it cannot be run.
+fn run_program(path: &str, words: &[&str]) -> i32 {
+    let e = sys::execve(path, words, &[]);
+    eprintln!("{}: {}", words[0], errno::describe(e.0));
+    if e.0 == ENOENT {
+        STATUS_NOT_FOUND
+    } else {
+        STATUS_NOT_EXECUTABLE
+    }
 }
 
 /// `kill [-s signal | -signal] pid...`: sends a signal.

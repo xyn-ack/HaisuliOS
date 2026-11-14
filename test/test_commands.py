@@ -17,6 +17,7 @@ commands:
   wait [pid...]     wait for background jobs
   trap [cmd sig...] run cmd on a signal ('' ignores, - resets)
   exit [status]     leave the shell and power off
+  program [args...] run a program in /bin (or give its path)
 end a command with & to run it in the background; $? is its status
 redirect with > file, >> file, < file, 2> file and 2>&1
 """
@@ -59,13 +60,13 @@ def test_echo_passes_utf8_through(sh):
 
 
 def test_ls_lists_the_root_directory(sh):
-    assert sh.run("ls") == "etc/\n"
-    assert sh.run("ls /") == "etc/\n"
+    assert sh.run("ls") == "bin/\netc/\nsbin/\n"
+    assert sh.run("ls /") == "bin/\netc/\nsbin/\n"
 
 
 def test_ls_accepts_different_path_spellings(sh):
     for path in ["/etc", "etc", "etc/", "/etc/", "./etc", "//etc"]:
-        assert sh.run(f"ls {path}") == "motd\n", path
+        assert sh.run(f"ls {path}") == "motd\nservers\n", path
 
 
 def test_ls_reports_a_missing_directory(sh):

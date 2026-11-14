@@ -10,13 +10,18 @@ IMG     := build/haisulios.elf32
 OBJCOPY ?= objcopy
 QEMU    ?= qemu-system-x86_64
 
-# Boot modules, in order: the first program is init (pid 1), then the console
-# server and the process server (which implements POSIX processes). The ramdisk
-# is a ustar archive of rootfs/ (it provides /etc/motd), which the kernel
-# unpacks into its RAM file system.
-PROGRAMS := build/init build/console build/proc
+# Boot modules, in order: init (pid 1) and the process server, which implements
+# POSIX processes and exec: what it takes to load programs from the file system.
+# Everything else is in the ramdisk, a ustar archive that the kernel unpacks
+# into its RAM file system: rootfs/ (/etc/motd, /etc/servers), the system
+# servers in /sbin (started by the process server, see /etc/servers) and the
+# programs in /bin.
+PROGRAMS := build/init build/proc
 RAMDISK  := build/initrd.tar
-MODULES  := build/init,build/console,build/proc,$(RAMDISK)
+MODULES  := build/init,build/proc,$(RAMDISK)
+# Programs in the ramdisk, by directory.
+SBIN     := console
+BIN      := echo true false
 
 # COM1 on the terminal, multiplexed with the QEMU monitor: Ctrl-C and other
 # keys go to HaisuliOS, Ctrl-A X quits QEMU, Ctrl-A C toggles the monitor.
@@ -46,9 +51,15 @@ build/%: build
 	mkdir -p build
 	cp $(REL)/$* $@
 
-$(RAMDISK): $(shell find rootfs)
-	mkdir -p build
-	tar --format=ustar -C rootfs -cf $@ .
+# The file system: rootfs/ plus the programs. Sorted, so that directories list
+# in the same order everywhere.
+$(RAMDISK): build $(shell find rootfs)
+	rm -rf build/rootfs
+	mkdir -p build/rootfs/sbin build/rootfs/bin
+	cp -R rootfs/. build/rootfs/
+	cp $(addprefix $(REL)/,$(SBIN)) build/rootfs/sbin/
+	cp $(addprefix $(REL)/,$(BIN)) build/rootfs/bin/
+	tar --format=ustar --sort=name --owner=0 --group=0 -C build/rootfs -cf $@ .
 
 # Interactive console on stdio. The kernel powers QEMU off via isa-debug-exit
 # when init exits (QEMU's exit status is then 1; that's normal).

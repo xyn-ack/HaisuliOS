@@ -210,7 +210,7 @@ def test_exit_status_of_the_last_command_is_in_dollar_question(sh):
 
 def test_wait_returns_the_exit_status_of_a_background_job(sh):
     job = start(sh, "exit 7")
-    assert job.pid > 2, "pids 1 and 2 are init and the console server"
+    assert job.pid > 3, "pids 1 to 3 are init, the process server and the console server"
     assert wait_status(sh, job.pid) == 7
     assert logged_wait_status(sh, job) == 7 << 8
 
@@ -241,7 +241,8 @@ def test_a_child_can_be_waited_for_only_once(sh):
 
 
 def test_wait_for_a_process_that_is_not_a_child_fails(sh):
-    assert wait_status(sh, 2) == STATUS_UNKNOWN  # The console server, a child of no one.
+    assert wait_status(sh, 2) == STATUS_UNKNOWN  # The process server, a child of no one.
+    assert wait_status(sh, 3) == STATUS_UNKNOWN  # The console server, which it started.
     assert wait_status(sh, 1) == STATUS_UNKNOWN  # The shell itself.
     assert wait_status(sh, 15) == STATUS_UNKNOWN  # No such process.
     assert run(sh, "echo ok") == "ok\n"
