@@ -4,14 +4,22 @@
 Checks that the kernel starts init and the process server, that the process server starts the
 console server from the file system, and that init shows /etc/motd.
 """
+import os
 import re
 
 from haisuli import PROMPT, read_rootfs
 
 
+def version():
+    """The version in the top-level Cargo.toml: the kernel's (and the project's)."""
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Cargo.toml"),
+              encoding="utf-8") as f:
+        return re.search(r'^version = "([^"]+)"$', f.read(), re.M)[1]
+
+
 def test_kernel_starts_init_and_console_server(sh):
     out = sh.boot_output
-    assert out.startswith("HaisuliOS 0.1.0 - x86_64 microkernel\n")
+    assert out.startswith(f"HaisuliOS {version()} - x86_64 microkernel\n")
     # The kernel starts tasks; the process server makes processes of them.
     # The kernel unpacks the ramdisk into its file system; init is not handed a copy.
     assert re.search(r"^\[kernel\] started task 1 \(init\): \d+ KiB image$", out, re.M)

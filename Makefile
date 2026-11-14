@@ -21,7 +21,7 @@ RAMDISK  := build/initrd.tar
 MODULES  := build/init,build/proc,$(RAMDISK)
 # Programs in the ramdisk, by directory.
 SBIN     := console
-BIN      := echo true false
+BIN      := echo true false probe_test
 
 # COM1 on the terminal, multiplexed with the QEMU monitor: Ctrl-C and other
 # keys go to HaisuliOS, Ctrl-A X quits QEMU, Ctrl-A C toggles the monitor.

@@ -1,0 +1,116 @@
+# Changelog
+
+What changed in each version of HaisuliOS. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the goals and the
+roadmap are in [TODO.md](TODO.md).
+
+## 0.2.0
+
+POSIX process management moves out of the kernel into a user-space process
+server, and programs load from the file system. The kernel now knows only
+*tasks*: it provides mechanisms, and the process server builds processes,
+signals and `execve` on top of them. The servers that booting does not need
+come from the file system too.
+
+### Added
+
+- The **process server** (`user/proc`), a boot module (pid 2). It keeps the
+  process table and implements, on top of the kernel's tasks: pids (separate
+  from kernel task ids), parents and children, `fork`, `execve`, `exit` and
+  `wait4`, zombies and wait statuses, `getpid` and `getppid`, process groups
+  and sessions (`setpgid`, `getpgid`, `setsid`, `getsid`), `kill` and the
+  terminal's `kill_pgrp`, signals (dispositions, masks, pending signals,
+  default actions, stop and continue) and the listing behind `ps`. It logs the
+  end of every process (`[proc] pid N (name) exited (wait status 0x...)`) and
+  powers the machine off when init exits. Its protocol is `abi::proc`; the
+  user runtime keeps the same API and turns the calls into requests to it.
+- Kernel **task control** for the *task manager*, the task registered as
+  service 2 (the process server): `task_fork`, `task_kill`, `task_stop`,
+  `task_cont`, `task_upcall`, `task_exec` and `task_spawn`, with reports of
+  tasks that end by themselves (`KMSG_TASK_EXIT`, `KMSG_TASK_FAULT`). Also
+  `task_info`, `task_self`, `task_exit`, `svc_wait` and `power_off`.
+- **Upcalls** (`task_upcall`): the kernel mechanism under signal handlers. The
+  kernel enters a handler with a Linux `rt_sigframe` on the way back to user
+  mode, ends an interruptible wait with `EINTR`, and can make the interrupted
+  call again (`SA_RESTART`).
+- **`execve`**: static ELF programs run from the file system, with `argv`
+  and `envp` on the System V initial stack (`StartInfo::args()` and `env()`
+  in the runtime). Argument blocks are `abi::exec`; new error numbers `E2BIG`
+  and `ENOEXEC`.
+- The shell runs a command that is not built in as a program: by its path,
+  or by its name in `/bin` (status 127 if there is none, 126 if it cannot
+  run). `help` lists this.
+- Programs in `/bin`: `echo`, `true` and `false` (`user/coreutils`), and the
+  test program `probe_test` (`user/probe_test`).
+- `/etc/servers`: the system servers that the process server starts at boot,
+  privileged. Today that is `/sbin/console`.
+- Tests: `test_process_server.py` (explicit tests, run with
+  `make check TEST_EXPLICIT="process-server"`), `test_exec.py` and
+  `test_probe.py`, which runs `/bin/probe_test` for what the shell cannot
+  reach (`SA_RESTART`, faults, `task_exit`, back-to-back signals, a race of
+  `pause` in the process server, `execve` semantics, 1000 `execve`s in a row).
+- Test runner: *explicit* tests (`EXPLICIT = "name"` in a test file), which
+  run only with `--explicit name` / `TEST_EXPLICIT`; `Machine.allow()` for
+  tests that cause a crash on purpose; `Machine.wait_exit()` waits for the
+  last console output.
+- `CHANGELOG.md`, `TODO.md`, `docs/ARCHITECTURE.md` and `docs/TESTING.md`, split out of
+  the README, which keeps the overview.
+
+### Changed
+
+- The kernel's process table is a task table (`kernel/process.rs` became
+  `kernel/task.rs`); of `kernel/signal.rs` only the frame of an upcall is
+  left (`kernel/upcall.rs`); `kernel/program.rs` builds the address space of a
+  program.
+- Boot modules: init and the process server (`build/init,build/proc,build/initrd.tar`).
+  The console server is no longer one: the process server starts it from
+  `/sbin/console`, as pid 3, with no parent. Jobs get pids from 4 on.
+- The ramdisk contains the programs of `/bin` and `/sbin` besides `rootfs/`,
+  packed in sorted order.
+- The kernel's boot log says `started task N` (was `started pid N`). Exits
+  are logged by the process server, not the kernel; shutting down logs
+  `[proc] init exited - shutting down` and `[kernel] powering off` (was
+  `[kernel] init exited - shutting down`).
+- A zombie no longer holds one of the kernel's 16 task slots: it is only a
+  record in the process server, which keeps up to 64 processes.
+- `kill -0` of a zombie succeeds, as POSIX says. The process server cannot be
+  signalled (`EPERM`).
+- Privileges: boot modules and the servers in `/etc/servers` are privileged;
+  forked children and programs started with `execve` never are.
+- Files may be up to 128 KiB (was 64 KiB).
+- `ps` lists up to 64 processes (was 16).
+- A user-space panic names the task: `[task N] panic: ...` (was `[pid N]`).
+- The kernel's banner takes its version from `Cargo.toml`.
+
+### Removed
+
+- The kernel's system calls of POSIX process management, now requests to the
+  process server: `rt_sigaction` (13), `rt_sigprocmask` (14), `pause` (34),
+  `getpid` (39), `fork` (57), `exit` (60), `wait4` (61), `kill` (62),
+  `setpgid` (109), `getppid` (110), `setsid` (112), `getpgid` (121),
+  `getsid` (124), `proc_list` (0x100B) and `kill_pgrp` (0x100C). The kernel
+  answers them with `ENOSYS`.
+- The unused source files `kernel/process/group.rs` and
+  `kernel/process/signal.rs`.
+
+## 0.1.0
+
+The first version: a microkernel with POSIX processes in the kernel.
+
+- Kernel: Multiboot v1 boot with its own switch to 64-bit mode, a bitmap
+  frame allocator, 4-level paging with a private address space per process
+  and W^X, a cooperative round-robin scheduler, and an ELF loader for boot
+  modules. Unsafe code is confined to `kernel/arch` and `kernel/sync.rs`.
+- Processes in the kernel: `fork`, `exit`, `wait4`, `getpid`, `getppid`,
+  process groups and sessions, and signals with POSIX job control (handlers
+  with a Linux signal frame, masks, stop and continue, `SA_RESTART`).
+- IPC: asynchronous notifications and synchronous calls whose servers copy
+  data from and to the client's buffer, as far as the call allows; IRQ
+  forwarding and I/O-port permissions for user-space drivers; well-known
+  services.
+- A RAM file system filled from the boot ramdisk, with POSIX file
+  descriptors and open file descriptions.
+- User space: the console server (COM1 driver, line discipline, job control
+  terminal) and init, which shows `/etc/motd` and runs a job control shell
+  with redirections and `trap`. Both are boot modules.
+- Tests that boot QEMU and drive the shell (`make check`).

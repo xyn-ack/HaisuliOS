@@ -2,7 +2,8 @@
 """Program tests: execve runs programs from the file system.
 
 The shell runs a command that is not built in as a program: the file it names, or the file of that
-name in /bin, run in a child with `execve`. The programs in /bin are `echo`, `true` and `false`.
+name in /bin, run in a child with `execve`. The programs in /bin are `echo`, `true` and `false`,
+and `probe_test`, the test program of `test_probe.py`.
 A program keeps its process's pid and file descriptors, and it never runs privileged: only the
 system servers that the process server starts at boot (those in /etc/servers) do. That is how the
 console server runs, from /sbin/console.

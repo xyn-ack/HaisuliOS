@@ -59,6 +59,7 @@ class Machine:
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._held_cr = ""  # A trailing CR whose LF may still be on its way.
         self._mark = 0  # The start of the output not yet consumed by a test.
+        self._allowed = set()  # Failure markers that the test expects (see `allow`).
         self._cond = threading.Condition()
         self._eof = False
         cmd = [
@@ -190,8 +191,15 @@ class Machine:
             except OSError:
                 pass
 
+    def allow(self, marker):
+        """Let the console show `marker`, one of the FAILURE_MARKERS, because the test makes
+        that happen on purpose (e.g. a process that faults)."""
+        assert marker in FAILURE_MARKERS, marker
+        self._allowed.add(marker)
+
     def check_healthy(self):
-        """Fail if the kernel or a process reported a crash."""
+        """Fail if the kernel or a process reported a crash (other than those allowed)."""
         text = self.transcript
         for marker in FAILURE_MARKERS:
-            assert marker not in text, f"console shows {marker!r}"
+            if marker not in self._allowed:
+                assert marker not in text, f"console shows {marker!r}"
