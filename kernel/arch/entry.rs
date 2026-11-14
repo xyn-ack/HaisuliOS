@@ -70,6 +70,34 @@ impl TrapFrame {
             self.ss,
         ]
     }
+
+    /// The frame that [`words`](Self::words) returned.
+    pub(crate) fn from_words(w: &[u64; Self::WORDS]) -> TrapFrame {
+        let [r15, r14, r13, r12, r11, r10, r9, r8, rbp, rdi, rsi, rdx, rcx, rbx, rax, rip, cs, rflags, rsp, ss] =
+            *w;
+        TrapFrame {
+            r15,
+            r14,
+            r13,
+            r12,
+            r11,
+            r10,
+            r9,
+            r8,
+            rbp,
+            rdi,
+            rsi,
+            rdx,
+            rcx,
+            rbx,
+            rax,
+            rip,
+            cs,
+            rflags,
+            rsp,
+            ss,
+        }
+    }
 }
 
 /// Stack contents when `idt::exception_handler` is called (lowest address first).
@@ -230,10 +258,10 @@ irq_common:
 
 /// Single CPU, so one scratch slot for the user rsp is enough.
 static SYSCALL_USER_RSP: AtomicU64 = AtomicU64::new(0);
-/// Kernel stack top of the running process.
+/// Kernel stack top of the running task.
 static SYSCALL_KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
 
-/// Kernel stack to switch to on `syscall` (the running process's).
+/// Kernel stack to switch to on `syscall` (the running task's).
 pub(crate) fn set_syscall_stack(top: u64) {
     SYSCALL_KERNEL_RSP.store(top, Ordering::Relaxed);
 }
@@ -296,7 +324,7 @@ syscall_entry:
     jmp trap_return
 
 # Pop a TrapFrame and return to user mode. Also the first "return address"
-# of every new process (see context::init).
+# of every new task (see context::init).
 .global trap_return
 trap_return:
     pop r15

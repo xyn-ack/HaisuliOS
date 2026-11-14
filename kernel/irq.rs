@@ -4,18 +4,18 @@
 //!
 //! Drives the legacy 8259 PICs and forwards interrupts to user-space drivers as IPC notifications.
 //!
-//! The kernel contains no device drivers. A privileged process binds an IRQ line (`irq_bind`); when
+//! The kernel contains no device drivers. A privileged task binds an IRQ line (`irq_bind`); when
 //! the line fires, the kernel masks it, acknowledges the PIC and posts a `[PID_KERNEL, KMSG_IRQ,
 //! line]` notification to the owner. The driver services its device and re-enables the line with
 //! `irq_ack`. Lines without an owner stay masked.
 //!
 //! Interrupts are only ever enabled in user mode and while the scheduler idles
-//! ([`crate::process::schedule`]), never elsewhere in the kernel.
+//! ([`crate::task::schedule`]), never elsewhere in the kernel.
 
 use crate::arch::cpu::Device::{self, Pic1, Pic2, PostCode};
 use crate::arch::entry::{stub_address, IRQ_STUBS};
 use crate::arch::x86::Exception;
-use crate::{idt, process};
+use crate::{idt, task};
 use core::sync::atomic::{AtomicU64, Ordering};
 use haisuli_abi::errno::{EBUSY, EINVAL, EPERM};
 
@@ -68,7 +68,7 @@ const ICW4_8086: u8 = 0x01;
 /// A mask that disables every line of a PIC.
 const ALL_MASKED: u8 = 0xFF;
 
-/// The pid owning each line (0 = unbound).
+/// The task owning each line (0 = unbound).
 static OWNER: [AtomicU64; LINES] = [const { AtomicU64::new(0) }; LINES];
 
 /// Short delay between PIC initialisation words (write to an unused port).
@@ -154,26 +154,26 @@ pub(crate) extern "C" fn irq_dispatch(line: u64) {
     end_of_interrupt(Pic1);
     let owner = OWNER[line as usize].load(Ordering::Relaxed);
     if owner != 0 {
-        process::irq_notify(owner, line);
+        task::irq_notify(owner, line);
     }
 }
 
-/// Returns the pid owning `line`, or 0.
+/// Returns the task owning `line`, or 0.
 pub(crate) fn owner(line: usize) -> u64 {
     OWNER[line].load(Ordering::Relaxed)
 }
 
-/// Routes IRQ `line` to the calling, privileged process (the `irq_bind` system call).
+/// Routes IRQ `line` to the calling, privileged task (the `irq_bind` system call).
 pub(crate) fn bind(line: u64) -> i64 {
     if line >= LINES as u64 || line == Line::Cascade as u64 {
         return -EINVAL;
     }
-    if !process::current_privileged() {
+    if !task::current_privileged() {
         return -EPERM;
     }
-    let me = process::current_pid();
+    let me = task::current_tid();
     let owner = OWNER[line as usize].load(Ordering::Relaxed);
-    if owner != 0 && owner != me && process::is_alive(owner) {
+    if owner != 0 && owner != me && task::is_alive(owner) {
         return -EBUSY;
     }
     OWNER[line as usize].store(me, Ordering::Relaxed);
@@ -186,17 +186,17 @@ pub(crate) fn ack(line: u64) -> i64 {
     if line >= LINES as u64 {
         return -EINVAL;
     }
-    if owner(line as usize) != process::current_pid() {
+    if owner(line as usize) != task::current_tid() {
         return -EPERM;
     }
     set_masked(line, false);
     0
 }
 
-/// Unbind and mask every line owned by `pid` (it is exiting).
-pub(crate) fn release_all(pid: u64) {
+/// Unbind and mask every line owned by task `tid` (it has ended).
+pub(crate) fn release_all(tid: u64) {
     for (line, owner) in OWNER.iter().enumerate() {
-        if owner.load(Ordering::Relaxed) == pid {
+        if owner.load(Ordering::Relaxed) == tid {
             owner.store(0, Ordering::Relaxed);
             set_masked(line as u64, true);
         }

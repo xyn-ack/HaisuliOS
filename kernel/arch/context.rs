@@ -2,7 +2,7 @@
 
 //! Kernel contexts.
 //!
-//! Kernel stacks and context switching, with one context per process slot.
+//! Kernel stacks and context switching, with one context per task slot.
 //!
 //! A suspended context is a saved kernel stack pointer. Only this module writes them: [`init`]
 //! builds a fresh stack that returns to user mode, and [`switch_to`] saves the running context
@@ -11,7 +11,7 @@
 //! interface is safe.
 
 use super::entry::TrapFrame;
-use crate::process::MAX_PROCS;
+use crate::task::MAX_TASKS;
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -23,19 +23,19 @@ const CALLEE_SAVED: usize = 6;
 /// address `switch_context` returns to.
 const SWITCH_FRAME_WORDS: usize = CALLEE_SAVED + 1;
 
-/// Kernel stack of one process slot.
+/// Kernel stack of one task slot.
 ///
 /// Atomics give interior mutability: Rust code writes a new stack's initial
 /// frames, and the CPU uses it as a stack.
 #[repr(C, align(16))]
 struct KernelStack([AtomicU64; KSTACK_WORDS]);
 
-static STACKS: [KernelStack; MAX_PROCS] =
-    [const { KernelStack([const { AtomicU64::new(0) }; KSTACK_WORDS]) }; MAX_PROCS];
+static STACKS: [KernelStack; MAX_TASKS] =
+    [const { KernelStack([const { AtomicU64::new(0) }; KSTACK_WORDS]) }; MAX_TASKS];
 /// Saved stack pointer of each suspended context.
-static SAVED_RSP: [AtomicU64; MAX_PROCS] = [const { AtomicU64::new(0) }; MAX_PROCS];
+static SAVED_RSP: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
 /// Whether `SAVED_RSP[slot]` holds a context that can be resumed.
-static RESUMABLE: [AtomicBool; MAX_PROCS] = [const { AtomicBool::new(false) }; MAX_PROCS];
+static RESUMABLE: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TASKS];
 /// Slot whose context is running; NONE while still on the boot stack.
 static RUNNING: AtomicUsize = AtomicUsize::new(NONE);
 const NONE: usize = usize::MAX;
@@ -46,7 +46,7 @@ extern "C" {
     fn trap_return();
 }
 
-// A new process's stack is crafted so the final `ret` lands in
+// A new task's stack is crafted so the final `ret` lands in
 // `trap_return`, which pops a TrapFrame and iretq's to ring 3.
 global_asm!(
     r#"
@@ -75,6 +75,31 @@ switch_context:
 /// Top of `slot`'s kernel stack (where the CPU puts a user-mode trap frame).
 pub(crate) fn stack_top(slot: usize) -> u64 {
     STACKS[slot].0.as_ptr() as u64 + KSTACK_SIZE as u64
+}
+
+/// The user registers of `slot`, which is suspended in a system call.
+///
+/// `syscall_entry` saves them in a [`TrapFrame`] at the very top of the kernel
+/// stack, and they stay there until the call returns.
+///
+/// # Panics
+///
+/// Panics if `slot` is the running context or has no context to resume.
+pub(crate) fn user_frame(slot: usize) -> TrapFrame {
+    assert!(
+        RUNNING.load(Ordering::Relaxed) != slot && RESUMABLE[slot].load(Ordering::Relaxed),
+        "slot {} is not suspended",
+        slot
+    );
+    let stack = &STACKS[slot].0;
+    let mut words = [0; TrapFrame::WORDS];
+    for (w, saved) in words
+        .iter_mut()
+        .zip(&stack[KSTACK_WORDS - TrapFrame::WORDS..])
+    {
+        *w = saved.load(Ordering::Relaxed);
+    }
+    TrapFrame::from_words(&words)
 }
 
 /// Prepares `slot` to enter user mode with the registers in `frame` the next

@@ -622,7 +622,7 @@ fn kill(args: &[&str]) -> i32 {
 
 /// `ps`: lists every process with its job control state.
 fn ps() -> i32 {
-    let mut procs = [ProcInfo::default(); 16];
+    let mut procs = [ProcInfo::default(); sys::PROC_LIST_MAX];
     let n = match sys::proc_list(&mut procs) {
         Ok(n) => n,
         Err(e) => {

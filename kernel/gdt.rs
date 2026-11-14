@@ -2,12 +2,12 @@
 
 //! Global descriptor table.
 //!
-//! Sets up the GDT and the TSS, including each process's I/O-permission bitmap.
+//! Sets up the GDT and the TSS, including each task's I/O-permission bitmap.
 //!
 //! The layout ([`Selector`]) is dictated by the STAR MSR of SYSCALL/SYSRET: kernel code must be
 //! followed by kernel data, and user data by user code.
 //!
-//! The TSS carries an I/O-permission bitmap for ports `0..IO_PORTS`, loaded per process on every
+//! The TSS carries an I/O-permission bitmap for ports `0..IO_PORTS`, loaded per task on every
 //! context switch: this is how user-space drivers get access to exactly the device registers they
 //! were granted (`ioperm`). Ports at or above `IO_PORTS` lie beyond the TSS limit and always fault.
 
@@ -21,12 +21,12 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 use haisuli_abi::IO_PORTS;
 
-/// Size of the per-process I/O bitmap: one bit per port, 1 = access denied.
+/// Size of the per-task I/O bitmap: one bit per port, 1 = access denied.
 pub(crate) const IO_BITMAP_BYTES: usize = (IO_PORTS / 8) as usize;
 pub(crate) type IoBitmap = [u8; IO_BITMAP_BYTES];
 /// A bitmap byte denying all of its 8 ports.
 const DENY_8_PORTS: u8 = 0xFF;
-/// Bitmap denying every port (the default for each process).
+/// Bitmap denying every port (the default for each task).
 pub(crate) const IO_DENY_ALL: IoBitmap = [DENY_8_PORTS; IO_BITMAP_BYTES];
 
 /// The GDT's descriptors, by selector (byte offset in the GDT).
@@ -173,7 +173,7 @@ pub(crate) fn set_kernel_stack(top: u64) {
     TSS.lock().rsp0 = top;
 }
 
-/// Install the I/O permissions of the process about to run.
+/// Install the I/O permissions of the task about to run.
 pub(crate) fn set_io_bitmap(bitmap: &IoBitmap) {
     TSS.lock().io_bitmap = *bitmap;
 }

@@ -8,7 +8,7 @@
 //! NX, loads a temporary GDT and calls `boot_entry`, which calls [`crate::kmain`].
 //!
 //! These page tables stay in use as the *kernel half* of every address space: PML4\[0\] is shared by
-//! all processes, and user space lives in PML4\[1..256\]. The top-level table is a Rust static so the
+//! all tasks, and user space lives in PML4\[1..256\]. The top-level table is a Rust static so the
 //! rest of the kernel can read it without unsafe code; the assembly refers to it (and to the Rust
 //! entry point) with `sym` operands.
 

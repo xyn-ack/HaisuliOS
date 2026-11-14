@@ -10,16 +10,13 @@ IMG     := build/haisulios.elf32
 OBJCOPY ?= objcopy
 QEMU    ?= qemu-system-x86_64
 
-# Boot modules, in order: the first program is init (pid 1). The ramdisk is
-# a ustar archive of rootfs/ (it provides /etc/motd), which the kernel unpacks
-# into its RAM file system.
-PROGRAMS := build/init build/console
+# Boot modules, in order: the first program is init (pid 1), then the console
+# server and the process server (which implements POSIX processes). The ramdisk
+# is a ustar archive of rootfs/ (it provides /etc/motd), which the kernel
+# unpacks into its RAM file system.
+PROGRAMS := build/init build/console build/proc
 RAMDISK  := build/initrd.tar
-MODULES  := build/init,build/console,$(RAMDISK)
-
-# Programs that only tests boot, as extra boot modules (see EXTRA_MODULES in
-# test/run_tests.py).
-TEST_PROGRAMS := build/proctest
+MODULES  := build/init,build/console,build/proc,$(RAMDISK)
 
 # COM1 on the terminal, multiplexed with the QEMU monitor: Ctrl-C and other
 # keys go to HaisuliOS, Ctrl-A X quits QEMU, Ctrl-A C toggles the monitor.
@@ -63,12 +60,12 @@ debug: all
 
 # Boots a fresh QEMU per test and drives the shell over the serial console.
 # Pass runner options with TEST_ARGS, e.g. make check TEST_ARGS="-v echo".
-# Tests of an explicit target (work in progress, expected to fail) run only
-# when TEST_EXPLICIT names the target exactly, and then only they run, e.g.
-# make check TEST_EXPLICIT="process-server".
-check: all $(TEST_PROGRAMS)
+# Explicit tests (a test file with EXPLICIT = "name", e.g. for a feature still
+# being written) only run when named exactly, e.g.
+# make check TEST_EXPLICIT="process-server"; then only they run.
+check: all
 	$(PYTHON) test/run_tests.py --qemu $(QEMU) --kernel $(IMG) --modules "$(MODULES)" \
-		$(foreach target,$(TEST_EXPLICIT),--explicit "$(target)") $(TEST_ARGS)
+		$(foreach name,$(TEST_EXPLICIT),--explicit "$(name)") $(TEST_ARGS)
 
 # Formatting, as in the Linux kernel (Documentation/rust/coding-guidelines.rst).
 rustfmt:

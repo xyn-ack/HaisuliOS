@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
 """Shell exit tests.
 
-Checks that leaving the shell makes init exit and the kernel power the machine off.
+Checks that leaving the shell makes init exit and the process server power the machine off.
 """
 
 # QEMU's isa-debug-exit device makes QEMU exit with (code << 1) | 1; the
@@ -10,8 +10,9 @@ QEMU_STATUS_POWER_OFF = 1
 
 
 def assert_powered_off(sh, wait_status):
-    sh.expect(f"[kernel] pid 1 (init) exited (wait status {wait_status})\n")
-    sh.expect("[kernel] init exited - shutting down\n")
+    # The process server reports the end of init, and powers the machine off.
+    sh.expect(f"[proc] pid 1 (init) exited (wait status {wait_status})\n")
+    sh.expect("[proc] init exited - shutting down\n")
     assert sh.wait_exit() == QEMU_STATUS_POWER_OFF
 
 

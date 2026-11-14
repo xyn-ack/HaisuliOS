@@ -44,17 +44,15 @@ class Config:
 
     qemu = "qemu-system-x86_64"
     kernel = "build/haisulios.elf32"
-    modules = "build/init,build/console,build/initrd.tar"
+    modules = "build/init,build/console,build/proc,build/initrd.tar"
     timeout = 15.0  # Seconds to wait for any expected output.
 
 
 class Machine:
     """One QEMU instance running HaisuliOS, booted to the first prompt."""
 
-    def __init__(self, config=Config, extra_modules=()):
-        """Boots QEMU with the configured boot modules, followed by `extra_modules` (paths)."""
+    def __init__(self, config=Config):
         self.config = config
-        modules = ",".join([config.modules, *extra_modules])
         # Everything the console printed so far, decoded, with the terminal's
         # CR LF line ends turned into LF.
         self._text = ""
@@ -66,7 +64,7 @@ class Machine:
         cmd = [
             config.qemu,
             "-kernel", config.kernel,
-            "-initrd", modules,
+            "-initrd", config.modules,
             "-m", "128M",
             "-serial", "stdio",
             "-monitor", "none",
@@ -169,12 +167,16 @@ class Machine:
         return echo, output
 
     def wait_exit(self, timeout=None):
-        """Wait for QEMU to terminate; returns its exit status."""
+        """Wait for QEMU to terminate; returns its exit status.
+
+        Afterwards the transcript holds everything the console printed."""
         timeout = self.config.timeout if timeout is None else timeout
         try:
-            return self.proc.wait(timeout)
+            code = self.proc.wait(timeout)
         except subprocess.TimeoutExpired:
             raise Timeout(f"QEMU still running after {timeout}s")
+        self._reader.join(timeout)
+        return code
 
     def close(self):
         if self.proc.poll() is None:

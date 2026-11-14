@@ -1,155 +1,221 @@
 # SPDX-License-Identifier: GPL-2.0
-"""Process server tests: POSIX processes are managed by a user-space server, not by the kernel.
+"""Process server tests: POSIX process management moves out of the kernel.
 
-These tests describe the process server before it exists, so they are expected to fail until it
-is implemented. They form the explicit target `process-server`, which `make check` leaves out:
-run them with `make check TEST_EXPLICIT="process-server"`.
+These tests were written before the process server existed (test first). They are explicit tests:
+`make check` skips them, and
 
-A true microkernel knows nothing about POSIX processes. `fork`, `exit`, `wait4`, `getpid` and
-`getppid` (process ids, parents and children, exit statuses and zombies) move into a process
-server, a boot module like the console server, and programs reach it over IPC through the runtime
-(`user/rt`), as they would through a libc. What the tests expect:
+    make check TEST_EXPLICIT="process-server"
 
-* The kernel starts the process server as a boot module called `proc`, and `ps` lists it as a
-  live process.
-* The kernel's system call table no longer has the Linux-numbered `getpid` (39), `getppid` (110),
-  `wait4` (61), `fork` (57) and `exit` (60): they fail with `-ENOSYS` (-38).
-* The runtime's `fork`, `exit`, `waitpid`, `getpid` and `getppid` still work, for every program.
+runs them (and only them). Now that the server works, removing `EXPLICIT` makes them ordinary
+tests of `make check`.
 
-The shell's view of processes must not change either; the rest of the test suite (`make check`)
-covers that.
+A microkernel should provide mechanisms only: address spaces, execution contexts, scheduling, IPC.
+Pids, parents and children, `fork`, `exit` statuses and `wait4`, zombies, `getpid` and `getppid`,
+process groups and sessions are POSIX concepts. They move into a user-space *process server*, just
+as the console server took the terminal out of the kernel (MINIX calls its version the process
+manager, PM). Programs keep making the same calls. The runtime turns them into IPC calls to the
+server, and the server uses kernel mechanisms to carry them out.
 
-The kernel's side is checked by a probe, `user/proctest`, which these tests boot as an extra boot
-module (there is no `exec`). It makes those system calls directly and through the runtime, and
-reports what happened on the kernel debug log, one `[proctest] what = value` line each, ending
-with `[proctest] done = yes`. It only reports; the tests below decide what is right.
+The shell cannot see where a call is served, so the tests check what a user can see:
+
+* The server is a boot module named `proc`. `ps` lists it as a process of its own, a child of no
+  one (PPID 0) like the other boot modules. init is still pid 1.
+* Like the console server, it announces itself on the debug log with a line starting with
+  `[proc] serving`.
+* Exit statuses belong to the server, not the kernel. The server logs the end of every process as
+  `[proc] pid N (name) exited (wait status 0x...)` with its POSIX wait status, in the format that
+  the kernel used before. The kernel's log never mentions a wait status.
+* A zombie is only the server's record of an exit status that the parent has not collected yet.
+  It holds no kernel resources, so more zombies can exist than the kernel has process slots.
+* The rest of the behaviour stays the same: `test_process.py` covers fork, wait and signal
+  semantics, and reads the exit statuses from the `[proc]` lines too.
 """
 import re
 import time
 
-from haisuli import PROMPT
+from haisuli import PROMPT, Timeout
 
+# Run by `make check TEST_EXPLICIT="process-server"` only (see run_tests.py).
 EXPLICIT = "process-server"
-EXTRA_MODULES = ("build/proctest",)
 
-# The boot module name of the process server.
+# The name of the process server's program, as `ps` shows it and as it tags its log lines.
 SERVER = "proc"
 
-# Linux errno values, as in abi/src/lib.rs.
-ECHILD = 10
-ENOSYS = 38
+SIGKILL = 9
 
-# The code the probe's child exits with (CHILD_EXIT_CODE in user/proctest), and its wait status.
-CHILD_EXIT_CODE = 42
-CHILD_WAIT_STATUS = CHILD_EXIT_CODE << 8
+# The number of tasks the kernel has room for (`MAX_TASKS` in kernel/task.rs). A zombie used to
+# hold one of them until it was reaped, back when the kernel implemented processes.
+KERNEL_PROCESS_SLOTS = 16
 
-# Linux x86_64 system call numbers of the calls the kernel must not implement any more.
-SYSCALLS = {"getpid": 39, "getppid": 110, "wait4": 61, "fork": 57, "exit": 60}
+# QEMU's isa-debug-exit device makes QEMU exit with (code << 1) | 1. The kernel writes code 0
+# when it shuts down normally.
+QEMU_STATUS_POWER_OFF = 1
 
-# The kernel debug log shares the console, so a probe line can start in the middle of a line.
-PROBE_LINE = re.compile(r"\[proctest\] ([^=\n]+?) = ([^\n]*)\n")
-PROBE_DONE = "[proctest] done = yes\n"
+# The kernel and the process server log to the same serial line as the console server, so their
+# lines can appear anywhere in the output, even in the middle of an echoed command line.
+LOG_LINE = re.compile(rf"\[(?:kernel|{SERVER})\] [^\n]*\n")
 
-KERNEL_LINE = re.compile(r"\[kernel\] [^\n]*\n")
+# Job status notices ("[1]+ Done  exit 7") that a shell may print before a prompt, maybe after an
+# empty line. Unlike the "[1] 3" of `cmd &`, the job number is not followed by a pid.
+JOB_NOTICE = re.compile(r"^\n?\[\d+\][+-]? *[^\d\s][^\n]*\n", re.M)
+
+
+class Job:
+    """A background job: its pid, and where the console transcript stood when it started."""
+
+    def __init__(self, pid, since):
+        self.pid = pid
+        self.since = since
 
 
 # ---- helpers ------------------------------------------------------------------
 
 
-def probe(sh):
-    """Waits for the probe to finish and returns its report as {what: value}."""
-    deadline = time.monotonic() + sh.config.timeout
-    while PROBE_DONE not in sh.transcript:
-        if time.monotonic() > deadline:
-            started = "[proctest]" in sh.transcript
-            raise AssertionError(
-                "the probe did not finish" if started else "the probe (user/proctest) never ran")
-        time.sleep(0.05)
-    return dict(PROBE_LINE.findall(sh.transcript))
-
-
-def number(report, what, base=10):
-    """The probe's report on `what`, which must be a number."""
-    value = report.get(what)
-    assert value is not None, f"the probe did not report {what!r}: {report}"
+def run(sh, line):
+    """Like `sh.run()`, but ignores log lines and job status notices."""
+    sh.send(line + "\r")
     try:
-        return int(value, base)
-    except ValueError:
-        raise AssertionError(f"{what}: {value}") from None
+        chunk = LOG_LINE.sub("", sh.expect(PROMPT))[: -len(PROMPT)]
+    except Timeout:
+        assert "init exited" not in sh.transcript, f"`{line}` made the shell exit"
+        raise
+    return JOB_NOTICE.sub("", chunk.partition("\n")[2])
 
 
-def assert_not_in_kernel(sh, call):
-    """Checks that the kernel answered the probe's direct `call` with -ENOSYS."""
-    report = probe(sh)
-    result = number(report, f"kernel {call}")
-    assert result == -ENOSYS, (
-        f"the kernel still implements {call}(): system call {SYSCALLS[call]} returned {result}, "
-        f"not -ENOSYS ({-ENOSYS})")
+def status(sh):
+    """The shell's `$?`."""
+    out = run(sh, "echo $?")
+    assert re.fullmatch(r"\d+\n", out), f"`echo $?` printed {out!r}"
+    return int(out)
+
+
+def start(sh, command):
+    """Starts `command &` and returns the job."""
+    since = len(sh.transcript)
+    out = run(sh, f"{command} &")
+    m = re.search(r"^\[\d+\] (\d+)$", out, re.M)
+    assert m, f"`{command} &` should print the job number and pid ('[1] 3'), printed {out!r}"
+    return Job(int(m[1]), since)
+
+
+def wait_status(sh, pid):
+    """Runs `wait pid` and returns its status."""
+    out = run(sh, f"wait {pid}")
+    assert out == "", f"`wait {pid}` printed {out!r}"
+    return status(sh)
 
 
 def ps(sh):
-    """The `ps` listing as a list of {column: value} rows."""
-    sh.send("ps\r")
-    out = KERNEL_LINE.sub("", sh.expect(PROMPT))[: -len(PROMPT)].partition("\n")[2]
+    """The `ps` listing as {pid: {column: value}}."""
+    out = run(sh, "ps")
     lines = out.splitlines()
-    assert lines, "`ps` printed nothing"
-    header = lines[0].split()
-    return [dict(zip(header, line.split())) for line in lines[1:] if line.strip()]
+    for i, line in enumerate(lines):
+        header = line.split()
+        if {"PID", "PPID", "NAME"} <= set(header):
+            break
+    else:
+        raise AssertionError(f"`ps` should print a header with PID, PPID and NAME: {out!r}")
+    procs = {}
+    for line in lines[i + 1:]:
+        if line.strip():
+            row = dict(zip(header, line.split()))
+            assert row.get("PID", "").isdigit(), f"bad `ps` line {line!r} in {out!r}"
+            procs[int(row["PID"])] = row
+    return procs
 
 
-# ---- the process server is a boot module ----------------------------------------
+def wait_for_log(sh, pattern, since, what):
+    """Waits until the transcript from position `since` on matches `pattern`; returns the match.
+
+    Log lines are not tied to any prompt, so this polls the transcript instead of consuming it.
+    """
+    deadline = time.monotonic() + sh.config.timeout
+    while True:
+        m = pattern.search(sh.transcript, since)
+        if m:
+            return m
+        assert time.monotonic() < deadline, f"no {what} on the console"
+        time.sleep(0.05)
 
 
-def test_the_kernel_starts_the_process_server(sh):
-    assert re.search(rf"^\[kernel\] started pid \d+ \({SERVER}\): \d+ KiB image$",
-                     sh.boot_output, re.M), "the process server was not started at boot"
+def server_wait_status(sh, job):
+    """Waits until the process server has logged the end of `job`; returns the wait status.
+
+    Pids are reused, so only the log since the job started counts.
+    """
+    pattern = re.compile(
+        rf"\[{SERVER}\] pid {job.pid} \(\S+\) exited \(wait status (0x[0-9a-f]+)\)$", re.M)
+    m = wait_for_log(sh, pattern, job.since, f"[{SERVER}] line for the exit of pid {job.pid}")
+    return int(m[1], 16)
+
+
+def kernel_wait_statuses(sh):
+    """Kernel log lines that mention a wait status (there should be none)."""
+    return re.findall(r"\[kernel\][^\n]*wait status[^\n]*", sh.transcript)
+
+
+# ---- the server ---------------------------------------------------------------
+
+
+def test_the_process_server_announces_itself(sh):
+    # Like "[console] serving COM1 (IRQ 4)". It may come after the first prompt.
+    wait_for_log(sh, re.compile(rf"^\[{SERVER}\] serving\b", re.M), 0,
+                 f"'[{SERVER}] serving' line")
 
 
 def test_ps_lists_the_process_server(sh):
-    rows = [row for row in ps(sh) if row.get("NAME") == SERVER]
-    assert len(rows) == 1, f"`ps` should list one {SERVER!r} process: {rows}"
-    assert rows[0]["STAT"][0] in "RS", f"the process server should be alive: {rows[0]}"
+    procs = ps(sh)
+    servers = [row for row in procs.values() if row.get("NAME") == SERVER]
+    assert len(servers) == 1, f"`ps` should list one {SERVER!r} process: {procs}"
+    assert servers[0]["PPID"] == "0", f"a boot module is a child of no one: {servers[0]}"
+    assert procs.get(1, {}).get("NAME") == "init", f"init should still be pid 1: {procs}"
 
 
-# ---- the kernel knows nothing about POSIX processes -----------------------------
+# ---- exit statuses --------------------------------------------------------------
 
 
-def test_the_kernel_has_no_getpid(sh):
-    assert_not_in_kernel(sh, "getpid")
+def test_the_process_server_reports_an_exit_status(sh):
+    job = start(sh, "exit 7")
+    assert wait_status(sh, job.pid) == 7
+    assert server_wait_status(sh, job) == 7 << 8
 
 
-def test_the_kernel_has_no_getppid(sh):
-    assert_not_in_kernel(sh, "getppid")
+def test_the_process_server_reports_a_death_by_signal(sh):
+    job = start(sh, "pause")
+    # SIGKILL cannot be caught, so it does not matter whether the job is in pause() yet.
+    assert run(sh, f"kill -KILL {job.pid}") == ""
+    assert wait_status(sh, job.pid) == 128 + SIGKILL
+    assert server_wait_status(sh, job) == SIGKILL
 
 
-def test_the_kernel_has_no_wait4(sh):
-    assert_not_in_kernel(sh, "wait4")
+def test_the_process_server_reports_the_exit_of_init(sh):
+    sh.send("exit 3\r")
+    sh.expect(f"[{SERVER}] pid 1 (init) exited (wait status {3 << 8:#x})\n")
+    # Init exiting still shuts the system down.
+    assert sh.wait_exit() == QEMU_STATUS_POWER_OFF
 
 
-def test_the_kernel_has_no_fork(sh):
-    assert_not_in_kernel(sh, "fork")
+def test_the_kernel_log_never_mentions_a_wait_status(sh):
+    # Every way a process can end: exit, a signal, and init itself.
+    job = start(sh, "exit 1")
+    assert wait_status(sh, job.pid) == 1
+    job = start(sh, "pause")
+    run(sh, f"kill -KILL {job.pid}")
+    assert wait_status(sh, job.pid) == 128 + SIGKILL
+    sh.send("exit\r")
+    assert sh.wait_exit() == QEMU_STATUS_POWER_OFF
+    leaks = kernel_wait_statuses(sh)
+    assert not leaks, f"the kernel knows about wait statuses: {leaks}"
 
 
-def test_the_kernel_has_no_exit(sh):
-    # The probe tries it in a child. If the kernel's `exit` works, the child is gone before it can
-    # report, and only its wait status is left.
-    report = probe(sh)
-    assert "kernel exit" in report, (
-        "the kernel still implements exit(): the child calling it exited with wait status "
-        f"{report.get('kernel exit child status', report.get('kernel exit child'))}")
-    assert_not_in_kernel(sh, "exit")
+# ---- zombies --------------------------------------------------------------------
 
 
-# ---- the runtime still has POSIX processes --------------------------------------
-
-
-def test_a_program_forks_waits_and_exits_through_the_runtime(sh):
-    report = probe(sh)
-    parent, child = number(report, "pid"), number(report, "fork")
-    assert child > 0 and child != parent, f"fork() returned {child} to pid {parent}"
-    assert number(report, "child getpid") == child
-    assert number(report, "child getppid") == parent
-    assert number(report, "wait pid") == child
-    assert number(report, "wait status", 16) == CHILD_WAIT_STATUS
-    # Reaped, so no longer a child.
-    assert report.get("second wait") == f"error {ECHILD}", report.get("second wait")
+def test_zombies_do_not_take_up_kernel_process_slots(sh):
+    # Each job exits while the shell waits at its next prompt. Nobody reaps it, so it stays a
+    # zombie. The kernel has room for KERNEL_PROCESS_SLOTS processes. init, the console server
+    # and the process server take three of them, so these zombies cannot all be kernel processes.
+    jobs = [start(sh, f"exit {n}") for n in range(1, KERNEL_PROCESS_SLOTS + 1)]
+    # Each zombie keeps its own exit status until it is waited for.
+    for n, job in enumerate(jobs, 1):
+        assert wait_status(sh, job.pid) == n, f"job {n} (pid {job.pid})"

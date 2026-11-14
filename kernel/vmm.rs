@@ -4,11 +4,11 @@
 //!
 //! Manages 4-level x86_64 page tables and all access to user memory.
 //!
-//! Address-space layout (every process):
+//! Address-space layout (every task):
 //!
 //! ```text
 //! PML4[0]        kernel: identity map of the first 1 GiB (shared, supervisor only)
-//! PML4[1..256]   user space (private per process, 4 KiB pages only)
+//! PML4[1..256]   user space (private per task, 4 KiB pages only)
 //!
 //! 0x0000_0080_0000_0000  USER_BASE       program image
 //! 0x0000_0100_0000_0000  MMAP_BASE       anonymous mmap() region
@@ -38,14 +38,14 @@ const INDEX_BITS: u32 = 9;
 const PAGE_SHIFT: u32 = 12;
 /// Table levels: 0 is the PML4, then the PDPT, the page directory and the page table.
 const LEVELS: usize = 4;
-/// The bits a process may not keep when its pages are copied: the CPU's
+/// The bits a task may not keep when its pages are copied: the CPU's
 /// record of use, which starts afresh for the copy.
 const USAGE_BITS: u64 = PageFlag::bits(&[PageFlag::Accessed, PageFlag::Dirty]);
 
 pub(crate) const USER_BASE: u64 = 0x0000_0080_0000_0000;
 pub(crate) const MMAP_BASE: u64 = 0x0000_0100_0000_0000;
 pub(crate) const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
-pub(crate) const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+pub(crate) const USER_LIMIT: u64 = haisuli_abi::USER_LIMIT;
 
 /// PML4 slots holding user space: the lower half of the address space,
 /// except slot 0, the shared kernel mapping.
@@ -308,7 +308,7 @@ fn for_each_user_page(pml4: u64, mut f: impl FnMut(u64, u64)) {
     }
 }
 
-/// Deep-copy all user pages (used by fork; no copy-on-write yet).
+/// Deep-copy all user pages (used by `task_fork`; no copy-on-write yet).
 pub(crate) fn clone_user_space(src: u64) -> Option<u64> {
     let dst = new_address_space()?;
     let mut ok = true;

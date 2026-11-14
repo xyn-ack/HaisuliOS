@@ -6,14 +6,19 @@
 //!
 //! Sharing one crate means the two sides cannot drift apart. System calls use the `syscall`
 //! instruction: `rax` holds the number, the arguments are in `rdi rsi rdx r10 r8 r9` and the result
-//! comes back in `rax` (a negative errno on failure). POSIX calls use the Linux x86_64 numbers;
-//! HaisuliOS-native calls start at 0x1000.
+//! comes back in `rax` (a negative errno on failure). File and memory calls use the Linux x86_64
+//! numbers; HaisuliOS-native calls start at 0x1000. POSIX processes are not system calls: they are
+//! the process server's protocol, [`proc`].
 
 #![no_std]
 
 /// System call numbers.
+///
+/// The kernel implements mechanisms only. POSIX process management (`fork`, `exit`, `wait4`,
+/// `getpid`, process groups, signals...) is not a system call: the process server implements it,
+/// and programs reach it through the [`proc`] protocol.
 pub mod nr {
-    // The POSIX subset, with Linux x86_64 numbers.
+    // Files and memory, with Linux x86_64 numbers.
 
     /// `(fd, buf, len)`: reads from a file, or from the terminal (the console server).
     pub const READ: u64 = 0;
@@ -27,59 +32,23 @@ pub mod nr {
     pub const CLOSE: u64 = 3;
     /// `(addr, len, prot, flags, fd, offset)`: maps anonymous memory; the kernel picks the address.
     pub const MMAP: u64 = 9;
-    /// `()`: lets the other ready processes run.
+    /// `()`: lets the other ready tasks run.
     pub const SCHED_YIELD: u64 = 24;
     /// `(fd)`: duplicates `fd` onto the lowest free descriptor.
     pub const DUP: u64 = 32;
     /// `(fd, newfd)`: makes `newfd` a copy of `fd`, closing it first if needed.
     pub const DUP2: u64 = 33;
-    /// `()`: returns the caller's process id.
-    pub const GETPID: u64 = 39;
-    /// `()`: creates a copy of the caller, which returns 0 in the child.
-    pub const FORK: u64 = 57;
-    /// `(code)`: terminates the caller with exit status `code`.
-    pub const EXIT: u64 = 60;
-    /// `(pid, status, options, rusage)`: waits for a child to exit.
+    /// `()`: returns from an upcall (a signal handler), restoring the interrupted context.
     ///
-    /// `pid` > 0 waits for that child, -1 for any, 0 for the caller's process
-    /// group and < -1 for process group `-pid`. `options` takes
-    /// [`WNOHANG`](super::WNOHANG).
-    pub const WAIT4: u64 = 61;
-    /// `()`: returns the process id of the caller's parent.
-    pub const GETPPID: u64 = 110;
-    /// `(sig, act, oldact, sigsetsize)`: sets the disposition of signal `sig`.
-    ///
-    /// `act` and `oldact` are Linux `struct sigaction`s. A handler needs
-    /// `SA_RESTORER` and a restorer that calls [`RT_SIGRETURN`].
-    pub const RT_SIGACTION: u64 = 13;
-    /// `(how, set, oldset, sigsetsize)`: changes the set of blocked signals.
-    pub const RT_SIGPROCMASK: u64 = 14;
-    /// `()`: returns from a signal handler, restoring the interrupted context.
-    ///
-    /// Only a handler's restorer may call it, with the stack as the kernel
-    /// left it (pointing at the signal frame's `ucontext`).
+    /// Only an upcall's restorer may call it, with the stack as the kernel left it (pointing at
+    /// the frame's `ucontext`; see [`TASK_UPCALL`]).
     pub const RT_SIGRETURN: u64 = 15;
-    /// `()`: sleeps until a signal terminates the process or a handler runs.
-    pub const PAUSE: u64 = 34;
-    /// `(pid, sig)`: sends signal `sig`, or checks for the target if `sig` is 0.
-    ///
-    /// `pid` > 0 signals that process, 0 the caller's process group, < -1
-    /// process group `-pid` and -1 every process the caller may signal.
-    pub const KILL: u64 = 62;
-    /// `(pid, pgid)`: puts process `pid` (0 = the caller) into process group `pgid`.
-    pub const SETPGID: u64 = 109;
-    /// `()`: makes the caller the leader of a new session and process group.
-    pub const SETSID: u64 = 112;
-    /// `(pid)`: returns the process group of `pid` (0 = the caller).
-    pub const GETPGID: u64 = 121;
-    /// `(pid)`: returns the session of `pid` (0 = the caller).
-    pub const GETSID: u64 = 124;
     /// `(fd, cmd, arg)`: only `F_DUPFD` (duplicate onto the lowest free
     /// descriptor that is at least `arg`).
     pub const FCNTL: u64 = 72;
     /// `(from, num, turn_on)`: grants (or revokes) I/O ports `from..from + num`.
     ///
-    /// Only privileged processes may use it, for ports below [`IO_PORTS`](super::IO_PORTS).
+    /// Only privileged tasks may use it, for ports below [`IO_PORTS`](super::IO_PORTS).
     pub const IOPERM: u64 = 173;
     /// `(fd, buf, len)`: reads directory entries (Linux `struct linux_dirent64`).
     ///
@@ -88,26 +57,26 @@ pub mod nr {
 
     // HaisuliOS-native microkernel calls.
 
-    /// `(dest_pid, word0, word1)`: sends an asynchronous, non-blocking notification.
+    /// `(dest, word0, word1)`: sends an asynchronous, non-blocking notification to task `dest`.
     pub const IPC_SEND: u64 = 0x1000;
     /// `(*mut [u64; 3])`: waits for a message and fills in `[sender, word0, word1]`.
     pub const IPC_RECV: u64 = 0x1001;
-    /// `(dest_pid, op, buf, len)`: sends a synchronous request.
+    /// `(dest, op, buf, len)`: sends a synchronous request to task `dest`.
     ///
     /// Blocks until the server replies and returns the server's reply status.
     /// The server may read and write `buf[..len]` with [`IPC_READ`] /
     /// [`IPC_WRITE`] while the call is pending.
     pub const IPC_CALL: u64 = 0x1002;
-    /// `(client_pid, status)`: completes a received call.
+    /// `(client, status)`: completes a received call.
     ///
     /// The client's [`IPC_CALL`] returns `status`.
     pub const IPC_REPLY: u64 = 0x1003;
-    /// `(client_pid, offset, dst, len)`: copies from the client's call buffer.
+    /// `(client, offset, dst, len)`: copies from the client's call buffer.
     ///
     /// Fails with `-EACCES` if the call does not let the server read the buffer
     /// (see [`console`](super::console)).
     pub const IPC_READ: u64 = 0x1004;
-    /// `(client_pid, offset, src, len)`: copies into the client's call buffer.
+    /// `(client, offset, src, len)`: copies into the client's call buffer.
     ///
     /// Fails with `-EACCES` if the call does not let the server write the buffer
     /// (see [`console`](super::console)).
@@ -118,23 +87,44 @@ pub mod nr {
     pub const IRQ_ACK: u64 = 0x1007;
     /// `(service_id)`: registers the (privileged) caller as a well-known service.
     pub const SVC_REGISTER: u64 = 0x1008;
-    /// `(service_id)`: returns the pid of a registered service, or `-ESRCH`.
+    /// `(service_id)`: returns the task id of a registered service, or `-ESRCH`.
     pub const SVC_LOOKUP: u64 = 0x1009;
-    /// `(buf, len)`: fills `buf` with one [`ProcInfo`](super::ProcInfo) per process.
-    ///
-    /// Returns the number of processes reported; `ps` is built on it.
-    pub const PROC_LIST: u64 = 0x100B;
-    /// `(pgid, sig)`: sends signal `sig` to every process in group `pgid`.
-    ///
-    /// What the terminal needs (Linux's tty driver calls the kernel's
-    /// `kill_pgrp()` for it): `kill(-pgid)` cannot address process group 1,
-    /// init's, because `kill(-1)` signals every process.
-    pub const KILL_PGRP: u64 = 0x100C;
     /// `(buf, len)`: writes to the kernel debug log.
     ///
     /// It never blocks, so servers and panic messages, which must not depend on
     /// the console, can always use it.
     pub const DEBUG_LOG: u64 = 0x100A;
+    /// `(service_id)`: like [`SVC_LOOKUP`], but waits until the service is registered.
+    ///
+    /// Boot modules start in any order, so a client may ask before its server is up.
+    pub const SVC_WAIT: u64 = 0x100D;
+    /// `()`: returns the caller's task id.
+    pub const TASK_SELF: u64 = 0x100E;
+    /// `()`: ends the calling task.
+    ///
+    /// The task manager is told with [`KMSG_TASK_EXIT`](super::KMSG_TASK_EXIT). Programs end
+    /// through the process server instead (its `OP_EXIT`); this is for when there is none.
+    pub const TASK_EXIT: u64 = 0x1010;
+    /// `(tid)`: creates a copy of task `tid`, which must be blocked in a call to the caller.
+    ///
+    /// The copy gets a copy of the address space, the registers and the file descriptors, but no
+    /// privileges; its pending call returns 0. Returns the new task's id. Task manager only.
+    pub const TASK_FORK: u64 = 0x1011;
+    /// `(tid)`: ends task `tid` at once. Task manager only.
+    pub const TASK_KILL: u64 = 0x1012;
+    /// `(tid)`: stops scheduling task `tid`, wherever it is. Task manager only.
+    pub const TASK_STOP: u64 = 0x1013;
+    /// `(tid)`: schedules a stopped task again. Task manager only.
+    pub const TASK_CONT: u64 = 0x1014;
+    /// `(tid, *const [u64; upcall::WORDS])`: makes task `tid` enter a handler.
+    ///
+    /// See [`upcall`](super::upcall). Fails with `-EBUSY` while an earlier upcall for the task
+    /// has not been entered yet. Task manager only.
+    pub const TASK_UPCALL: u64 = 0x1015;
+    /// `(tid, buf, len)`: fills `buf` with a [`TaskInfo`](super::TaskInfo) about task `tid`.
+    pub const TASK_INFO: u64 = 0x1016;
+    /// `()`: powers the machine off. Privileged tasks only.
+    pub const POWER_OFF: u64 = 0x1017;
 }
 
 /// Error numbers (Linux values), returned negated.
@@ -269,13 +259,109 @@ pub mod fcntl {
 }
 
 /// Messages and calls whose sender is `PID_KERNEL` come from the kernel itself
-/// (no user process can have pid 0, so such messages cannot be forged).
+/// (no task has id 0, so such messages cannot be forged).
 pub const PID_KERNEL: u64 = 0;
 
 /// Kernel notification: `[PID_KERNEL, KMSG_IRQ, irq_line]`.
 ///
 /// The line stays masked until the handler calls [`nr::IRQ_ACK`].
 pub const KMSG_IRQ: u64 = 1;
+
+/// Kernel notification to the task manager: `[PID_KERNEL, KMSG_TASK_EXIT, tid]`.
+///
+/// Task `tid` ended itself with [`nr::TASK_EXIT`]; it is gone. The kernel does not reuse the id
+/// before the task manager has received this.
+pub const KMSG_TASK_EXIT: u64 = 2;
+
+/// Kernel notification to the task manager: `[PID_KERNEL, KMSG_TASK_FAULT, tid]`.
+///
+/// Task `tid` caused a CPU exception (or an upcall frame could not be used), so the kernel ended
+/// it; it is gone. As for [`KMSG_TASK_EXIT`], the id is not reused before this is received.
+pub const KMSG_TASK_FAULT: u64 = 3;
+
+/// The first address above user space.
+///
+/// Code and stacks of user tasks, and so upcall handlers, must be below it.
+pub const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+
+/// Upcalls: the kernel mechanism under POSIX signal handlers.
+///
+/// [`nr::TASK_UPCALL`] takes [`WORDS`] words: `[handler, restorer, arg, sender, mask, flags]`.
+/// When the task next returns to user mode, the kernel pushes a Linux x86_64 signal frame
+/// (`struct rt_sigframe`) below its stack pointer and enters `handler(arg, &siginfo, &ucontext)`,
+/// returning to `restorer`. `siginfo.si_signo` is `arg` and `si_pid` is `sender`. The kernel does
+/// not interpret `mask`: it stores it as the frame's `uc_sigmask`, for the restorer to hand back
+/// to whoever manages signal masks. The restorer ends with [`nr::RT_SIGRETURN`], which restores
+/// the registers saved in the frame.
+///
+/// Posting an upcall also ends an interruptible wait of the task (`ipc_recv`, `svc_wait` or a
+/// terminal `read`) with `-EINTR`.
+pub mod upcall {
+    /// Words in an upcall request.
+    pub const WORDS: usize = 6;
+    /// Flag: if the system call the task returns from fails with `-EINTR`, make it again after
+    /// the handler (POSIX `SA_RESTART`).
+    pub const RESTART: u64 = 1;
+    /// Where `uc_sigmask` (the `mask` of the request) is, counted from the `ucontext`.
+    ///
+    /// When the handler returns to the restorer, the stack pointer points at the `ucontext`.
+    pub const UC_SIGMASK: usize = 296;
+}
+
+/// What a task is doing, as [`TaskInfo::state`] reports it.
+pub mod task_state {
+    /// Running, or ready to run.
+    pub const READY: u64 = 1;
+    /// Blocked in the kernel: waiting for a message, a reply or a service.
+    pub const BLOCKED: u64 = 2;
+    /// Stopped with [`TASK_STOP`](super::nr::TASK_STOP).
+    pub const STOPPED: u64 = 3;
+}
+
+/// What [`nr::TASK_INFO`] reports about a task.
+///
+/// It is serialised as [`TASK_INFO_LEN`] bytes, so that neither side needs unsafe code to move it
+/// across the system call boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskInfo {
+    /// One of [`task_state`].
+    pub state: u64,
+    /// Whether an upcall waits to be entered: the task has not returned to user mode since the
+    /// upcall was requested.
+    pub upcall: bool,
+    /// The program name, NUL-padded.
+    pub name: [u8; PROC_NAME_LEN],
+}
+
+/// Serialised size of a [`TaskInfo`].
+pub const TASK_INFO_LEN: usize = 2 * 8 + PROC_NAME_LEN;
+
+impl TaskInfo {
+    /// Serialises the entry.
+    pub fn to_bytes(&self) -> [u8; TASK_INFO_LEN] {
+        let mut b = [0u8; TASK_INFO_LEN];
+        b[..8].copy_from_slice(&self.state.to_ne_bytes());
+        b[8..16].copy_from_slice(&(self.upcall as u64).to_ne_bytes());
+        b[16..].copy_from_slice(&self.name);
+        b
+    }
+
+    /// Parses an entry written by [`to_bytes`](Self::to_bytes).
+    pub fn from_bytes(b: &[u8; TASK_INFO_LEN]) -> TaskInfo {
+        let word = |i: usize| {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&b[i * 8..i * 8 + 8]);
+            u64::from_ne_bytes(w)
+        };
+        let mut name = [0u8; PROC_NAME_LEN];
+        name.copy_from_slice(&b[16..]);
+        TaskInfo {
+            state: word(0),
+            upcall: word(1) != 0,
+            name,
+        }
+    }
+}
 
 /// Signal numbers and dispositions (the Linux x86_64 values).
 pub mod signal {
@@ -424,7 +510,7 @@ impl Termination {
 pub mod proc_state {
     /// Runnable or running (`ps` shows `R`).
     pub const RUNNING: u64 = 1;
-    /// Blocked in the kernel, e.g. in `pause` or IPC (`ps` shows `S`).
+    /// Blocked, e.g. in `pause`, `wait` or IPC (`ps` shows `S`).
     pub const SLEEPING: u64 = 2;
     /// Stopped by a signal (`ps` shows `T`).
     pub const STOPPED: u64 = 3;
@@ -432,7 +518,7 @@ pub mod proc_state {
     pub const ZOMBIE: u64 = 4;
 }
 
-/// One process in the listing that [`nr::PROC_LIST`] returns.
+/// One process in the listing that the process server's [`proc::OP_LIST`] returns.
 ///
 /// It is serialised as [`PROC_INFO_LEN`] bytes, so that neither side needs
 /// unsafe code to move it across the system call boundary.
@@ -629,6 +715,12 @@ pub const IO_PORTS: u64 = 0x400;
 pub mod svc {
     /// Console / TTY server. `read(0)` and `write(1|2)` are routed to it.
     pub const CONSOLE: u64 = 1;
+    /// The process server, which implements POSIX processes (see [`proc`](super::proc)).
+    ///
+    /// The kernel makes the task registered under this id its *task manager*: the only task that
+    /// may use the task control calls (`TASK_FORK`, `TASK_KILL`, ...), and the one it tells when
+    /// a task ends by itself.
+    pub const PROC: u64 = 2;
     /// Number of service slots (ids are `1..MAX`).
     pub const MAX: u64 = 8;
 }
@@ -655,4 +747,68 @@ pub mod console {
     /// The terminal sends Ctrl-C's `SIGINT` to that group, and interrupts its
     /// pending reads; this is the `tcsetpgrp()` of HaisuliOS.
     pub const OP_SET_FG_PGRP: u64 = 3;
+}
+
+/// Process server protocol (`IPC_CALL` operations to the [`svc::PROC`] service).
+///
+/// POSIX process management lives in this user-space server, not in the kernel: process ids,
+/// parents and children, `fork`, exit statuses and `wait4`, zombies, process groups and sessions,
+/// and signals. The user runtime turns the POSIX calls into these requests.
+///
+/// The call buffer of every request is an array of native-endian `u64` words, whose meaning is
+/// listed with each operation; words marked *out* are written by the server. The reply is the
+/// POSIX call's result, or a negative errno. The calls take the same arguments as their Linux
+/// counterparts and follow the same rules; pids are the server's, not kernel task ids.
+pub mod proc {
+    /// `[]`: the caller's pid.
+    pub const OP_GETPID: u64 = 1;
+    /// `[]`: the pid of the caller's parent (0 for boot modules).
+    pub const OP_GETPPID: u64 = 2;
+    /// `[]`: creates a child; replies with its pid, and the child's call returns 0.
+    pub const OP_FORK: u64 = 3;
+    /// `[code]`: terminates the caller with exit status `code`; there is no reply.
+    pub const OP_EXIT: u64 = 4;
+    /// `[pid, options, status (out)]`: waits for a child, as `wait4`.
+    ///
+    /// `pid` > 0 waits for that child, -1 for any, 0 for the caller's process group and < -1
+    /// for process group `-pid`; `options` takes [`WNOHANG`](super::WNOHANG). Replies with the
+    /// child's pid (0 if `WNOHANG` found none) and stores its POSIX wait status in `status`.
+    pub const OP_WAIT: u64 = 5;
+    /// `[pid, sig]`: sends a signal, as `kill` (signal 0 checks that the target exists).
+    pub const OP_KILL: u64 = 6;
+    /// `[pgid, sig]`: sends `sig` to process group `pgid`, even group 1.
+    ///
+    /// What the terminal needs (Linux's tty driver calls the kernel's `kill_pgrp()` for it):
+    /// `kill(-pgid)` cannot address process group 1, init's, because `kill(-1)` signals every
+    /// process.
+    pub const OP_KILL_PGRP: u64 = 7;
+    /// `[]`: sleeps until a signal handler is about to run (`pause`).
+    ///
+    /// Then replies 0, which the runtime reports as `pause`'s `EINTR`. Not `-EINTR`: the kernel
+    /// restarts a call that fails with `EINTR` after a `SA_RESTART` handler, and POSIX never
+    /// restarts `pause`.
+    pub const OP_PAUSE: u64 = 8;
+    /// `[sig, set, handler, flags, restorer, mask, old handler (out), old flags (out),
+    /// old restorer (out), old mask (out)]`: `rt_sigaction`.
+    ///
+    /// The new disposition (a Linux `struct sigaction`) only applies if `set` is 1. A handler
+    /// needs `SA_RESTORER`: the restorer hands the frame's mask back with [`OP_SIGRETURN`], then
+    /// makes the kernel's `RT_SIGRETURN` call.
+    pub const OP_SIGACTION: u64 = 9;
+    /// `[how, set?, set, old (out)]`: `rt_sigprocmask`; `set` only applies if `set?` is 1.
+    pub const OP_SIGPROCMASK: u64 = 10;
+    /// `[mask]`: a handler has returned; restores the signal mask saved in its frame.
+    pub const OP_SIGRETURN: u64 = 11;
+    /// `[pid, pgid]`: `setpgid`.
+    pub const OP_SETPGID: u64 = 12;
+    /// `[pid]`: `getpgid`.
+    pub const OP_GETPGID: u64 = 13;
+    /// `[]`: `setsid`.
+    pub const OP_SETSID: u64 = 14;
+    /// `[pid]`: `getsid`.
+    pub const OP_GETSID: u64 = 15;
+    /// A buffer of [`ProcInfo`](super::ProcInfo) entries (out): lists the processes.
+    ///
+    /// Replies with the number of entries written; `ps` is built on it.
+    pub const OP_LIST: u64 = 16;
 }
