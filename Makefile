@@ -17,6 +17,10 @@ PROGRAMS := build/init build/console
 RAMDISK  := build/initrd.tar
 MODULES  := build/init,build/console,$(RAMDISK)
 
+# Programs that only tests boot, as extra boot modules (see EXTRA_MODULES in
+# test/run_tests.py).
+TEST_PROGRAMS := build/proctest
+
 # COM1 on the terminal, multiplexed with the QEMU monitor: Ctrl-C and other
 # keys go to HaisuliOS, Ctrl-A X quits QEMU, Ctrl-A C toggles the monitor.
 SERIAL := -chardev stdio,id=con,mux=on,signal=off -serial chardev:con -mon chardev=con
@@ -59,8 +63,12 @@ debug: all
 
 # Boots a fresh QEMU per test and drives the shell over the serial console.
 # Pass runner options with TEST_ARGS, e.g. make check TEST_ARGS="-v echo".
-check: all
-	$(PYTHON) test/run_tests.py --qemu $(QEMU) --kernel $(IMG) --modules "$(MODULES)" $(TEST_ARGS)
+# Tests of an explicit target (work in progress, expected to fail) run only
+# when TEST_EXPLICIT names the target exactly, and then only they run, e.g.
+# make check TEST_EXPLICIT="process-server".
+check: all $(TEST_PROGRAMS)
+	$(PYTHON) test/run_tests.py --qemu $(QEMU) --kernel $(IMG) --modules "$(MODULES)" \
+		$(foreach target,$(TEST_EXPLICIT),--explicit "$(target)") $(TEST_ARGS)
 
 # Formatting, as in the Linux kernel (Documentation/rust/coding-guidelines.rst).
 rustfmt:
