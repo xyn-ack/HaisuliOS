@@ -23,9 +23,10 @@
 //! statuses, process groups, sessions and signals are the business of the process server, which
 //! the kernel knows only as the *task manager*: the task registered as service [`svc::PROC`]. It
 //! alone may use the task control calls, the mechanisms that processes and signals are built on:
-//! copying a task ([`task_fork`]), ending ([`task_kill`]), stopping and continuing one, and making
-//! one enter a handler ([`task_upcall`]). A task that ends by itself (with [`end_current`]) is
-//! reported to it with a kernel notification.
+//! copying a task ([`task_fork`]), ending ([`task_kill`]), stopping and continuing one, making one
+//! enter a handler ([`task_upcall`]), and running a program from the file system, in a task
+//! ([`task_exec`]) or a new one ([`task_spawn`]). A task that ends by itself (with
+//! [`end_current`]) is reported to it with a kernel notification.
 //!
 //! All scheduler state lives in one `Table` behind a [`Lock`]. Functions take it for short,
 //! explicit scopes and always release it before switching context or idling.
@@ -34,10 +35,12 @@ use crate::arch::entry::TrapFrame;
 use crate::arch::multiboot::{self, Module};
 use crate::arch::x86::{PageFlag, RFlag};
 use crate::arch::{context, cpu};
+use crate::program::{self, Args};
 use crate::sync::{Guard, Lock};
 use crate::upcall::{Frame, SavedContext, Upcall};
 use crate::{elf, fs, gdt, irq, syscall, vmm};
 use haisuli_abi::errno::*;
+use haisuli_abi::exec::{self, ARG_MAX};
 use haisuli_abi::fcntl::{F_DUPFD, OPEN_MAX};
 use haisuli_abi::mman::{PROT_EXEC, PROT_WRITE};
 use haisuli_abi::{svc, task_state, upcall, TaskInfo, IO_PORTS, TASK_INFO_LEN};
@@ -45,7 +48,6 @@ use haisuli_abi::{KMSG_IRQ, KMSG_TASK_EXIT, KMSG_TASK_FAULT, PID_KERNEL};
 
 pub(crate) const MAX_TASKS: usize = 16;
 const MBOX_SIZE: usize = 8;
-const USER_STACK_PAGES: u64 = 8;
 const NAME_LEN: usize = 16;
 /// RFLAGS of a new task: interrupts enabled (and the reserved bit 1).
 pub(crate) const USER_RFLAGS: u64 = RFlag::bits(&[RFlag::Interrupt, RFlag::Reserved1]);
@@ -324,10 +326,8 @@ pub(crate) fn is_alive(tid: u64) -> bool {
 ///
 /// The first becomes task 1 (init). A module that is not an ELF file is the
 /// boot ramdisk, a ustar archive: it is unpacked into the file system
-/// ([`fs::init`]).
-///
-/// The log calls the task ids pids: the process server adopts the boot tasks
-/// as processes under the ids the kernel gave them.
+/// ([`fs::init`]). (The process server adopts the boot tasks as processes,
+/// with their task ids as pids.)
 pub(crate) fn spawn_boot_modules() {
     let ramdisk = multiboot::modules().find(|m| !elf::is_elf(m.data));
     fs::init(ramdisk.map_or(&[][..], |r| r.data));
@@ -336,17 +336,17 @@ pub(crate) fn spawn_boot_modules() {
         match spawn(&m) {
             Ok(tid) => {
                 crate::println!(
-                    "[kernel] started pid {} ({}): {} KiB image",
+                    "[kernel] started task {} ({}): {} KiB image",
                     tid,
                     Name::new(m.name()),
                     m.data.len().div_ceil(1024),
                 );
                 started += 1;
             }
-            Err(e) => crate::println!(
+            Err((_, why)) => crate::println!(
                 "[kernel] cannot start boot module \"{}\": {}",
                 Name::new(m.name()),
-                e
+                why
             ),
         }
     }
@@ -362,41 +362,28 @@ pub(crate) fn spawn_boot_modules() {
     }
 }
 
-fn spawn(m: &Module) -> Result<u64, &'static str> {
-    let slot = table().free_slot().ok_or("task table full")?;
-    let pml4 = vmm::new_address_space().ok_or("out of memory")?;
-    let setup = || -> Result<TrapFrame, &'static str> {
-        let entry = elf::load(pml4, m.data)?;
-        let stack = USER_STACK_PAGES * 4096;
-        let stack_flags =
-            PageFlag::bits(&[PageFlag::User, PageFlag::Writable, PageFlag::NoExecute]);
-        vmm::map_init(pml4, vmm::USER_STACK_TOP - stack, stack, &[], stack_flags)
-            .map_err(|_| "out of memory")?;
-        Ok(TrapFrame {
-            rip: entry,
-            cs: gdt::USER_CS,
-            rflags: USER_RFLAGS,
-            rsp: vmm::USER_STACK_TOP,
-            ss: gdt::USER_DS,
-            ..TrapFrame::default()
-        })
-    };
-    let frame = match setup() {
-        Ok(f) => f,
-        Err(e) => {
-            vmm::destroy_user_space(pml4);
-            return Err(e);
-        }
-    };
+/// Starts boot module `m`, with its name as its only argument.
+fn spawn(m: &Module) -> Result<u64, program::Error> {
+    let name = core::str::from_utf8(m.name()).unwrap_or("?");
+    let mut block = [0u8; 64];
+    let len = exec::build(name, &[name], &[], &mut block).map_err(|e| (e, "name too long"))?;
+    let args = Args::parse(&block[..len])?;
+    create_task(m.data, &args, true)
+}
+
+/// Starts a new task running `image` with `args`, its standard input, output
+/// and error on the terminal; returns its id.
+fn create_task(image: &[u8], args: &Args<'_>, privileged: bool) -> Result<u64, program::Error> {
+    let slot = table().free_slot().ok_or((-EAGAIN, "task table full"))?;
+    let (pml4, frame) = program::load(image, args)?;
     context::init(slot, &frame);
     let tid = slot as u64 + 1;
     table().tasks[slot] = Task {
         tid,
         state: State::Ready,
         pml4,
-        privileged: true,
-        name: Name::new(m.name()),
-        // Standard input, output and error: the terminal.
+        privileged,
+        name: Name::new(args.name()),
         fds: {
             let mut fds = [NO_FD; FDS];
             fds[..3].fill(fs::CONSOLE as u8);
@@ -826,6 +813,136 @@ pub(crate) fn task_info(tid: u64, buf: u64, len: u64) -> i64 {
         return -EFAULT;
     }
     0
+}
+
+/// Buffers for reading a program and its arguments into the kernel.
+struct ExecBuffers {
+    block: [u8; ARG_MAX],
+    image: [u8; fs::MAX_FILE],
+}
+
+/// The one set of [`ExecBuffers`]: too big for a kernel stack, and `task_exec`
+/// and `task_spawn` never run at the same time.
+static EXEC: Lock<ExecBuffers> = Lock::new(ExecBuffers {
+    block: [0; ARG_MAX],
+    image: [0; fs::MAX_FILE],
+});
+
+/// Reads the caller's argument block at `block[..len]` and the program it names
+/// from the file system, and builds the program's address space.
+///
+/// Returns the address space, the registers to start with and the program's name.
+fn load_program(block: u64, len: u64, flags: u64) -> Result<(u64, TrapFrame, Name), i64> {
+    if flags & !exec::PRIVILEGED != 0 {
+        return Err(-EINVAL);
+    }
+    if flags & exec::PRIVILEGED != 0 && !current_privileged() {
+        return Err(-EPERM);
+    }
+    if len > ARG_MAX as u64 {
+        return Err(-E2BIG);
+    }
+    let mut buffers = EXEC.lock();
+    let ExecBuffers { block: args, image } = &mut *buffers;
+    let args = &mut args[..len as usize];
+    if !vmm::copy_from_user(current_pml4(), block, args) {
+        return Err(-EFAULT);
+    }
+    let args = Args::parse(args).map_err(|(e, _)| e)?;
+    let size = fs::read_file(args.path(), image)?;
+    let (pml4, frame) = program::load(&image[..size], &args).map_err(|(e, _)| e)?;
+    Ok((pml4, frame, Name::new(args.name())))
+}
+
+/// Makes task `tid` run a program from the file system (the `task_exec` system call).
+///
+/// `tid` must be blocked in a call to the caller, the task manager, that it has
+/// received; the call is abandoned. The program replaces the task's address
+/// space. The task keeps its id and its file descriptors; it loses its
+/// privileges (unless `flags` has [`exec::PRIVILEGED`]), I/O permissions, IRQs,
+/// services, messages and upcall, and the calls it was serving fail. On error
+/// the task is left as it was.
+pub(crate) fn task_exec(tid: u64, block: u64, len: u64, flags: u64) -> i64 {
+    let slot = {
+        let t = table();
+        let slot = match t.controlled_slot(tid) {
+            Ok(slot) => slot,
+            Err(e) => return e,
+        };
+        let p = &t.tasks[slot];
+        if !(p.state == State::BlockedCall && p.call.server == t.cur().tid && p.call.received) {
+            return -EINVAL;
+        }
+        slot
+    };
+    let (pml4, frame, name) = match load_program(block, len, flags) {
+        Ok(loaded) => loaded,
+        Err(e) => return e,
+    };
+    context::init(slot, &frame);
+    let old = {
+        let mut t = table();
+        let p = &mut t.tasks[slot];
+        let old_pml4 = p.pml4;
+        *p = Task {
+            tid,
+            state: State::Ready,
+            pml4,
+            name,
+            privileged: flags & exec::PRIVILEGED != 0,
+            fds: p.fds,
+            ..Task::EMPTY
+        };
+        release_server_state(&mut t, tid);
+        old_pml4
+    };
+    irq::release_all(tid);
+    vmm::destroy_user_space(old); // The caller's address space is the active one.
+    0
+}
+
+/// Starts a program from the file system in a new task (the `task_spawn`
+/// system call); task manager only.
+///
+/// The task's standard input, output and error are the terminal. It is
+/// privileged if `flags` has [`exec::PRIVILEGED`] (which the caller must be).
+/// Returns its id.
+pub(crate) fn task_spawn(block: u64, len: u64, flags: u64) -> i64 {
+    {
+        let t = table();
+        if t.manager_slot() != Some(t.current) {
+            return -EPERM;
+        }
+        if t.free_slot().is_none() {
+            return -EAGAIN;
+        }
+    }
+    let (pml4, frame, name) = match load_program(block, len, flags) {
+        Ok(loaded) => loaded,
+        Err(e) => return e,
+    };
+    let mut t = table();
+    let Some(slot) = t.free_slot() else {
+        drop(t);
+        vmm::destroy_user_space(pml4);
+        return -EAGAIN;
+    };
+    context::init(slot, &frame);
+    let tid = slot as u64 + 1;
+    t.tasks[slot] = Task {
+        tid,
+        state: State::Ready,
+        pml4,
+        name,
+        privileged: flags & exec::PRIVILEGED != 0,
+        fds: {
+            let mut fds = [NO_FD; FDS];
+            fds[..3].fill(fs::CONSOLE as u8);
+            fds
+        },
+        ..Task::EMPTY
+    };
+    tid as i64
 }
 
 /// Powers the machine off (the `power_off` system call); privileged tasks only.

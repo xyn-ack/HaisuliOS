@@ -15,11 +15,11 @@
 //! ([`crate::abi::proc`]), made with `ipc_call`, like the terminal's requests to the console
 //! server.
 
-use crate::abi::errno::EINTR;
+use crate::abi::errno::{EINTR, EINVAL};
 use crate::abi::fcntl::{F_DUPFD, PATH_MAX};
 use crate::abi::proc::*;
 use crate::abi::signal::{SA_RESTORER, SIG_DFL, SIG_IGN};
-use crate::abi::{nr, svc, upcall, ProcInfo, TaskInfo, PROC_INFO_LEN, TASK_INFO_LEN};
+use crate::abi::{exec, nr, svc, upcall, ProcInfo, TaskInfo, PROC_INFO_LEN, TASK_INFO_LEN};
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -143,6 +143,17 @@ enum Sys<'a> {
         tid: u64,
         buf: &'a mut [u8; TASK_INFO_LEN],
     },
+    /// The kernel only reads `block`.
+    TaskExec {
+        tid: u64,
+        block: &'a [u8],
+        flags: u64,
+    },
+    /// The kernel only reads `block`.
+    TaskSpawn {
+        block: &'a [u8],
+        flags: u64,
+    },
     PowerOff,
 }
 
@@ -215,6 +226,14 @@ fn invoke(call: Sys<'_>) -> i64 {
         Sys::TaskInfo { tid, buf } => {
             let (p, l) = rw(buf);
             (nr::TASK_INFO, [tid, p, l, 0])
+        }
+        Sys::TaskExec { tid, block, flags } => {
+            let (p, l) = ro(block);
+            (nr::TASK_EXEC, [tid, p, l, flags])
+        }
+        Sys::TaskSpawn { block, flags } => {
+            let (p, l) = ro(block);
+            (nr::TASK_SPAWN, [p, l, flags, 0])
         }
         Sys::PowerOff => (nr::POWER_OFF, [0; 4]),
     };
@@ -360,6 +379,29 @@ fn proc_call(op: u64, words: &mut [u64]) -> Result<u64> {
 pub fn exit(code: i32) -> ! {
     let _ = proc_call(OP_EXIT, &mut [code as i64 as u64]);
     task_exit()
+}
+
+/// Replaces the calling process's program with the one at `path`, run with
+/// arguments `argv` (starting with its name) and environment `envp`.
+///
+/// Returns only on failure: `ENOENT` if there is no such file, `EACCES` for a
+/// directory, `ENOEXEC` if it is not a program and `E2BIG` if the arguments
+/// are too long. The process keeps its pid and file descriptors (see
+/// [`crate::abi::proc::OP_EXEC`]).
+pub fn execve(path: &str, argv: &[&str], envp: &[&str]) -> Errno {
+    let mut block = [0u8; exec::ARG_MAX];
+    let len = match exec::build(path, argv, envp, &mut block) {
+        Ok(len) => len,
+        Err(e) => return Errno(-e),
+    };
+    let server = match proc_server() {
+        Ok(server) => server,
+        Err(e) => return e,
+    };
+    match ipc_call(server, OP_EXEC, &mut block[..len]) {
+        Err(e) => e,
+        Ok(_) => Errno(EINVAL), // A success does not return.
+    }
 }
 
 /// Creates a child process; it returns 0, the parent the child's pid.
@@ -715,6 +757,18 @@ pub fn task_info(tid: u64) -> Result<TaskInfo> {
     let mut buf = [0u8; TASK_INFO_LEN];
     check(invoke(Sys::TaskInfo { tid, buf: &mut buf }))?;
     Ok(TaskInfo::from_bytes(&buf))
+}
+
+/// Makes task `tid`, blocked in a call to the caller, run the program that
+/// argument block `block` names (task manager only; see [`crate::abi::exec`]).
+pub fn task_exec(tid: u64, block: &[u8], flags: u64) -> Result<()> {
+    check(invoke(Sys::TaskExec { tid, block, flags })).map(drop)
+}
+
+/// Starts the program that argument block `block` names in a new task, and
+/// returns its id (task manager only; see [`crate::abi::exec`]).
+pub fn task_spawn(block: &[u8], flags: u64) -> Result<u64> {
+    check(invoke(Sys::TaskSpawn { block, flags }))
 }
 
 /// Powers the machine off (privileged tasks only).

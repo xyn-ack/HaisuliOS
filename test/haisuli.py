@@ -44,7 +44,7 @@ class Config:
 
     qemu = "qemu-system-x86_64"
     kernel = "build/haisulios.elf32"
-    modules = "build/init,build/console,build/proc,build/initrd.tar"
+    modules = "build/init,build/proc,build/initrd.tar"
     timeout = 15.0  # Seconds to wait for any expected output.
 
 

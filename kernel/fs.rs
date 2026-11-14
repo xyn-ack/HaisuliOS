@@ -30,10 +30,12 @@ use haisuli_abi::fcntl::*;
 /// Most nodes (files and directories, including the root) the file system holds.
 const MAX_NODES: usize = 64;
 /// Most pages of one file.
-const FILE_PAGES: usize = 16;
+const FILE_PAGES: usize = 32;
 const PAGE_SIZE: u64 = 4096;
 /// Most bytes in one file.
 const MAX_FILE_SIZE: u64 = FILE_PAGES as u64 * PAGE_SIZE;
+/// Most bytes in one file, as a buffer size (see [`read_file`]).
+pub(crate) const MAX_FILE: usize = MAX_FILE_SIZE as usize;
 /// Most open file descriptions in the system, including [`CONSOLE`].
 const MAX_OPEN: usize = 64;
 /// Bytes copied between user memory and a file at a time.
@@ -376,6 +378,25 @@ pub(crate) fn open(raw_path: &[u8], flags: u64) -> Result<usize, i64> {
         append: flags & O_APPEND != 0,
     };
     Ok(slot)
+}
+
+/// Copies the whole file at `raw_path` into `buf` and returns its size: how
+/// the kernel reads a program to run.
+///
+/// A directory is `-EACCES`, as for `execve`.
+pub(crate) fn read_file(raw_path: &[u8], buf: &mut [u8; MAX_FILE]) -> Result<usize, i64> {
+    let path = Path::parse(raw_path)?;
+    let fs = FS.lock();
+    match fs.kind_of(&path) {
+        None => Err(-ENOENT),
+        Some(Kind::Dir) => Err(-EACCES),
+        Some(_) => {
+            let node = &fs.nodes[fs.find(&path).ok_or(-ENOENT)?];
+            let size = node.size as usize;
+            node.read_at(0, &mut buf[..size]);
+            Ok(size)
+        }
+    }
 }
 
 /// Records another file descriptor referring to description `ofd`.

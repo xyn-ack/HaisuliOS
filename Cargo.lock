@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "coreutils"
+version = "0.1.0"
+dependencies = [
+ "haisuli-rt",
+]
+
+[[package]]
 name = "haisuli-abi"
 version = "0.1.0"
 

@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0
+
+[package]
+name = "coreutils"
+version = "0.1.0"
+edition = "2021"
+description = "HaisuliOS programs for /bin: echo, true, false"
+license = "GPL-2.0"
+
+[dependencies]
+haisuli-rt = { path = "../rt" }
+
+[lints]
+workspace = true

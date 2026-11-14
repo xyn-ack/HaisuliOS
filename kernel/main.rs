@@ -29,6 +29,7 @@ mod gdt;
 mod idt;
 mod irq;
 mod pmm;
+mod program;
 mod syscall;
 mod task;
 mod upcall;

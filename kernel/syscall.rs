@@ -69,6 +69,8 @@ pub(crate) extern "C" fn syscall_dispatch(f: &mut TrapFrame) {
         nr::TASK_CONT => task::task_cont(a0),
         nr::TASK_UPCALL => task::task_upcall(a0, a1),
         nr::TASK_INFO => task::task_info(a0, a1, a2),
+        nr::TASK_EXEC => task::task_exec(a0, a1, a2, a3),
+        nr::TASK_SPAWN => task::task_spawn(a0, a1, a2),
         nr::POWER_OFF => task::power_off(),
         _ => -ENOSYS,
     };

@@ -123,6 +123,18 @@ pub mod nr {
     pub const TASK_UPCALL: u64 = 0x1015;
     /// `(tid, buf, len)`: fills `buf` with a [`TaskInfo`](super::TaskInfo) about task `tid`.
     pub const TASK_INFO: u64 = 0x1016;
+    /// `(tid, block, len, flags)`: makes task `tid` run a program from the file system.
+    ///
+    /// `block[..len]` is an [argument block](super::exec) naming the program and its arguments.
+    /// `tid` must be blocked in a call to the caller, which it leaves for the new program's entry
+    /// point. The task keeps its id and its file descriptors; everything else starts afresh (see
+    /// [`exec`](super::exec)). Task manager only.
+    pub const TASK_EXEC: u64 = 0x1018;
+    /// `(block, len, flags)`: starts a program from the file system as a new task.
+    ///
+    /// As [`TASK_EXEC`], but in a new task, whose standard input, output and error are the
+    /// terminal. Returns the new task's id. Task manager only.
+    pub const TASK_SPAWN: u64 = 0x1019;
     /// `()`: powers the machine off. Privileged tasks only.
     pub const POWER_OFF: u64 = 0x1017;
 }
@@ -151,6 +163,10 @@ pub mod errno {
     pub const EACCES: i64 = 13;
     /// Bad address: memory that is not mapped, not user memory or not writable.
     pub const EFAULT: i64 = 14;
+    /// Argument list too long (an [argument block](super::exec) over `ARG_MAX`).
+    pub const E2BIG: i64 = 7;
+    /// Exec format error: not a program that this system can run.
+    pub const ENOEXEC: i64 = 8;
     /// Resource busy (e.g. an IRQ line or service that is already taken).
     pub const EBUSY: i64 = 16;
     /// File exists (`O_CREAT | O_EXCL`).
@@ -186,6 +202,8 @@ pub mod errno {
             ESRCH => "No such process",
             EINTR => "Interrupted system call",
             EIO => "Input/output error",
+            E2BIG => "Argument list too long",
+            ENOEXEC => "Exec format error",
             EBADF => "Bad file descriptor",
             ECHILD => "No child processes",
             EAGAIN => "Resource temporarily unavailable",
@@ -283,6 +301,57 @@ pub const KMSG_TASK_FAULT: u64 = 3;
 ///
 /// Code and stacks of user tasks, and so upcall handlers, must be below it.
 pub const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+
+/// The top of every task's stack, above which its arguments lie when a program starts.
+pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
+
+/// Programs: the arguments of [`nr::TASK_EXEC`], [`nr::TASK_SPAWN`] and the process server's
+/// [`proc::OP_EXEC`].
+///
+/// An *argument block* is `[argc: u64, envc: u64]` followed by NUL-terminated strings: the path
+/// of the program, then `argc` arguments, then `envc` environment strings. [`build`] makes one.
+///
+/// A program starts with the System V x86_64 initial stack, as on Linux: the stack pointer points
+/// at `argc`, followed by the `argv` pointers and a null pointer, the `envp` pointers and a null
+/// pointer, and an empty auxiliary vector (`AT_NULL`). The strings lie above them, below
+/// [`USER_STACK_TOP`](super::USER_STACK_TOP).
+pub mod exec {
+    use super::errno::{E2BIG, EINVAL};
+
+    /// Most bytes in an argument block.
+    pub const ARG_MAX: usize = 4096;
+    /// Most arguments and environment strings together.
+    pub const STRINGS_MAX: usize = 256;
+    /// Bytes before the strings: `argc` and `envc`.
+    pub const HEADER: usize = 16;
+    /// Flag: the program runs privileged (only a privileged caller may ask for it).
+    pub const PRIVILEGED: u64 = 1;
+
+    /// Writes the argument block for running `path` with `argv` and `envp` into `out`.
+    ///
+    /// Returns its length, `-E2BIG` if it does not fit or `-EINVAL` if a string contains a NUL.
+    pub fn build(path: &str, argv: &[&str], envp: &[&str], out: &mut [u8]) -> Result<usize, i64> {
+        if argv.len() + envp.len() > STRINGS_MAX || out.len() < HEADER {
+            return Err(-E2BIG);
+        }
+        out[..8].copy_from_slice(&(argv.len() as u64).to_ne_bytes());
+        out[8..HEADER].copy_from_slice(&(envp.len() as u64).to_ne_bytes());
+        let mut len = HEADER;
+        for s in core::iter::once(&path).chain(argv).chain(envp) {
+            if s.as_bytes().contains(&0) {
+                return Err(-EINVAL);
+            }
+            let end = len + s.len() + 1;
+            if end > out.len() {
+                return Err(-E2BIG);
+            }
+            out[len..end - 1].copy_from_slice(s.as_bytes());
+            out[end - 1] = 0;
+            len = end;
+        }
+        Ok(len)
+    }
+}
 
 /// Upcalls: the kernel mechanism under POSIX signal handlers.
 ///
@@ -755,8 +824,9 @@ pub mod console {
 /// parents and children, `fork`, exit statuses and `wait4`, zombies, process groups and sessions,
 /// and signals. The user runtime turns the POSIX calls into these requests.
 ///
-/// The call buffer of every request is an array of native-endian `u64` words, whose meaning is
-/// listed with each operation; words marked *out* are written by the server. The reply is the
+/// The call buffer of a request is an array of native-endian `u64` words, whose meaning is listed
+/// with each operation (except for [`OP_LIST`] and [`OP_EXEC`]); words marked *out* are written by
+/// the server. The reply is the
 /// POSIX call's result, or a negative errno. The calls take the same arguments as their Linux
 /// counterparts and follow the same rules; pids are the server's, not kernel task ids.
 pub mod proc {
@@ -811,4 +881,10 @@ pub mod proc {
     ///
     /// Replies with the number of entries written; `ps` is built on it.
     pub const OP_LIST: u64 = 16;
+    /// An [argument block](super::exec): `execve`.
+    ///
+    /// On success there is no reply: the caller runs the new program, with the same pid, process
+    /// group, session, file descriptors, signal mask and ignored signals; caught signals go back
+    /// to their default action. The program never runs privileged.
+    pub const OP_EXEC: u64 = 17;
 }

@@ -81,12 +81,12 @@ def test_a_redirection_applies_to_its_command_only(sh):
 def test_a_redirection_alone_creates_an_empty_file(sh):
     assert run(sh, "> empty") == ""
     assert run(sh, "cat empty") == ""
-    assert run(sh, "ls") == "etc/\nempty\n"
+    assert run(sh, "ls") == "bin/\netc/\nsbin/\nempty\n"
 
 
 def test_created_files_are_listed_in_their_directory(sh):
     run(sh, "echo x > /etc/notes")
-    assert run(sh, "ls /etc") == "motd\nnotes\n"
+    assert run(sh, "ls /etc") == "motd\nservers\nnotes\n"
 
 
 def test_a_large_file_survives_the_round_trip(sh):

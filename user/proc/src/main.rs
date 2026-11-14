@@ -24,6 +24,11 @@
 //!   `pause` or `wait4` it sleeps in here with `EINTR`. The restorer of every handler tells the
 //!   server when the handler returns ([`OP_SIGRETURN`]), with the signal mask to restore.
 //!
+//! - Programs: `execve` has the kernel replace the caller's program with one from the file system
+//!   (`task_exec`). At boot, the server also starts the system servers listed in [`SERVERS`]
+//!   (`task_spawn`), such as the console server: the ones that are not needed to get this far.
+//!   They run privileged, with no parent, like boot modules.
+//!
 //! Requests come as IPC calls ([`haisuli_rt::abi::proc`]); `pause` and a blocking `wait4` are
 //! answered later, so the server never blocks on a client. It never calls another server either:
 //! it logs to the kernel debug log.
@@ -34,7 +39,9 @@
 #![deny(unsafe_code)]
 
 use core::fmt::{self, Write};
-use haisuli_rt::abi::errno::{EAGAIN, ECHILD, EINTR, EINVAL, ENOSYS, EPERM, ESRCH};
+use haisuli_rt::abi::errno::{self, E2BIG, EAGAIN, ECHILD, EINTR, EINVAL, ENOSYS, EPERM, ESRCH};
+use haisuli_rt::abi::exec::{self, ARG_MAX};
+use haisuli_rt::abi::fcntl::O_RDONLY;
 use haisuli_rt::abi::proc::*;
 use haisuli_rt::abi::signal::{
     NSIG, SA_RESETHAND, SA_RESTART, SIGCONT, SIGKILL, SIGSEGV, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK,
@@ -59,6 +66,11 @@ const PID_MAX: u64 = 32767;
 const INIT_PID: u64 = 1;
 /// The most words of a request (`OP_SIGACTION`).
 const REQUEST_WORDS_MAX: usize = 10;
+/// The file listing the system servers to start at boot, one path per line.
+///
+/// They run privileged: they are the ones that drive hardware and provide the
+/// well-known services. Programs started any other way never are.
+const SERVERS: &str = "/etc/servers";
 
 /// Whether a process record is in use.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -371,6 +383,7 @@ impl Server {
                 Err(e) => e,
             }),
             OP_LIST => Some(self.list(i, len)),
+            OP_EXEC => self.exec(i, len),
             _ => Some(-ENOSYS),
         };
         if let Some(status) = result {
@@ -408,6 +421,114 @@ impl Server {
             ..Proc::UNUSED
         };
         pid as i64
+    }
+
+    /// `execve`: makes process `i` run the program that its request names.
+    ///
+    /// On success the process runs the new program, so there is no reply.
+    fn exec(&mut self, i: usize, len: u64) -> Option<i64> {
+        let client = self.procs[i].tid;
+        if len > ARG_MAX as u64 {
+            return Some(-E2BIG);
+        }
+        let mut block = [0u8; ARG_MAX];
+        let block = &mut block[..len as usize];
+        match sys::ipc_read(client, 0, block) {
+            Ok(n) if n == block.len() => {}
+            Ok(_) => return Some(-EINVAL),
+            Err(e) => return Some(-e.0),
+        }
+        // Never privileged: only the servers that the server starts are.
+        if let Err(e) = sys::task_exec(client, block, 0) {
+            return Some(-e.0);
+        }
+        let p = &mut self.procs[i];
+        // POSIX: caught signals go back to their default action (the handlers
+        // are gone with the old program); ignored ones stay ignored, and the
+        // mask and the pending signals stay.
+        for (sig, action) in p.signals.actions.iter_mut().enumerate() {
+            if action.disposition(sig as u64) == Disposition::Catch {
+                *action = SigAction::DEFAULT;
+            }
+        }
+        if let Ok(info) = sys::task_info(client) {
+            p.name = info.name;
+        }
+        self.act(i);
+        None
+    }
+
+    /// Starts the system servers listed in [`SERVERS`], one path per line.
+    ///
+    /// Lines that are empty or start with `#` are skipped.
+    fn start_servers(&mut self) {
+        let Ok(fd) = sys::open(SERVERS, O_RDONLY) else {
+            log(format_args!("[proc] no {}: no servers to start", SERVERS));
+            return;
+        };
+        let mut buf = [0u8; 1024];
+        let mut len = 0;
+        while len < buf.len() {
+            match sys::read(fd, &mut buf[len..]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => len += n,
+            }
+        }
+        let _ = sys::close(fd);
+        let Ok(text) = core::str::from_utf8(&buf[..len]) else {
+            log(format_args!("[proc] {} is not valid UTF-8", SERVERS));
+            return;
+        };
+        for path in text.lines().map(str::trim) {
+            if !path.is_empty() && !path.starts_with('#') {
+                self.start_server(path);
+            }
+        }
+    }
+
+    /// Starts the program at `path` as a privileged system server: a process of its own, with no
+    /// parent, leading its own session and process group, like a boot module.
+    fn start_server(&mut self, path: &str) {
+        let (Some(slot), Some(pid)) =
+            (self.procs.iter().position(|p| !p.exists()), self.free_pid())
+        else {
+            log(format_args!(
+                "[proc] cannot start {}: no free process",
+                path
+            ));
+            return;
+        };
+        let mut block = [0u8; ARG_MAX];
+        let started = exec::build(path, &[path], &[], &mut block)
+            .map_err(|e| -e)
+            .and_then(|len| sys::task_spawn(&block[..len], exec::PRIVILEGED).map_err(|e| e.0));
+        let tid = match started {
+            Ok(tid) => tid,
+            Err(e) => {
+                log(format_args!(
+                    "[proc] cannot start {}: {}",
+                    path,
+                    errno::describe(e)
+                ));
+                return;
+            }
+        };
+        let name = sys::task_info(tid).map_or([0; PROC_NAME_LEN], |info| info.name);
+        self.procs[slot] = Proc {
+            life: Life::Alive,
+            pid,
+            pgid: pid,
+            sid: pid,
+            tid,
+            name,
+            ..Proc::UNUSED
+        };
+        log(format_args!(
+            "[proc] started pid {} ({}) from {}",
+            pid,
+            self.procs[slot].name(),
+            path
+        ));
     }
 
     /// Ends process `i`, which becomes a zombie with wait status `how`.
@@ -903,6 +1024,8 @@ fn main(_: haisuli_rt::StartInfo) -> i32 {
         log(format_args!("[proc] svc_register failed: errno {}", e.0));
         return 1;
     }
+    // Only as the task manager may the server start tasks.
+    server.start_servers();
     log(format_args!("[proc] serving POSIX processes"));
     loop {
         match sys::ipc_recv() {
