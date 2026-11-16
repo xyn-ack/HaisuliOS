@@ -66,6 +66,19 @@ pub(crate) fn kernel_pml4() -> u64 {
     boot::kernel_pml4()
 }
 
+/// The page flags of a user mapping with the `mmap` protection `prot` (readable either way;
+/// never executable unless asked).
+pub(crate) fn user_flags(prot: u64) -> u64 {
+    let mut flags = PageFlag::User as u64;
+    if prot & haisuli_abi::mman::PROT_WRITE != 0 {
+        flags |= PageFlag::Writable as u64;
+    }
+    if prot & haisuli_abi::mman::PROT_EXEC == 0 {
+        flags |= PageFlag::NoExecute as u64;
+    }
+    flags
+}
+
 fn entry(table: u64, i: usize) -> u64 {
     phys::read_u64(table + ENTRY_SIZE * i as u64)
 }

@@ -11,8 +11,8 @@
 //! allocator frame or kernel data overlaps; every table is checked (signature, length and
 //! checksum) before it is used.
 
-use super::percpu::MAX_CPUS;
-use super::phys::{self, MAX_PHYS, PAGE_SIZE};
+use crate::arch::percpu::MAX_CPUS;
+use crate::arch::phys::{self, MAX_PHYS, PAGE_SIZE};
 
 /// Where the BIOS data area keeps the segment of the extended BIOS data area.
 const EBDA_SEGMENT_POINTER: u64 = 0x40E;

@@ -88,13 +88,6 @@ impl Device {
     }
 }
 
-/// Asks QEMU (`isa-debug-exit`) to power off.
-///
-/// This is a no-op on other machines.
-pub(crate) fn qemu_exit(code: u32) {
-    Device::DebugExit.write32(0, code);
-}
-
 // ---- Interrupts and halting -------------------------------------------------
 
 /// Stop this CPU for good.

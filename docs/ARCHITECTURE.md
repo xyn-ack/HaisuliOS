@@ -18,35 +18,57 @@ servers built on them. The [README](../README.md) has the overview and how to bu
 
 ## Source layout
 
+The kernel's hardware layer has two axes, so that another CPU architecture (ARM, say) can be
+added beside the first: `kernel/arch/` is the CPU architecture (traps, context switch, page
+tables, per-CPU data), and `kernel/platform/` is the machine around it (the boot protocol, the
+interrupt controller, the serial line, firmware tables, power). Each has one implementation per
+architecture or platform, in its own directory, selected at compile time; the rest of the kernel
+uses only what their `mod.rs` files re-export. That re-export list is the contract a new
+architecture implements; its first compiler-checked piece is the `UserRegs` trait, everything
+generic code may do with a thread's saved user registers (read the system call's number and
+arguments, set the return value, restart the call, move the stack pointer), so no generic file
+names a register. The platform may use the architecture; the architecture does not depend on
+the platform, except that the boot entry speaks the boot loader's protocol.
+
 ```
 kernel/            the kernel
   main.rs          kmain, panic handler; denies unsafe code crate-wide
-  arch/            hardware layer: the only place with unsafe Rust (besides sync.rs)
-    boot.rs        Multiboot entry, 32->64-bit switch, boot page tables (asm)
-    cpu.rs         privileged instructions; port I/O on a fixed list of devices
-    percpu.rs      each CPU's own block, through GS (swapgs on every user/kernel switch)
-    apic.rs        local APICs: the tick, IPIs, starting CPUs; the PIT as a stopwatch
-    acpi.rs        the CPUs the firmware's MADT lists
-    smp.rs         starting the other CPUs: the real-mode trampoline (asm)
-    entry.rs       exception/IRQ/syscall entry stubs, return to user mode (asm)
-    context.rs     kernel stacks, per-CPU idle contexts, context switch
-    phys.rs        physical memory access, limited to allocator-owned frames
-    multiboot.rs   boot-loader information: memory map, boot modules
-    x86.rs         names for the CPU's numbers: register bits, vectors, descriptors
+  arch/            hardware layer, the CPU architecture: one directory per architecture,
+                   selected at compile time behind one contract (see mod.rs: what it
+                   re-exports, and the UserRegs trait over the saved user registers)
+    x86_64/
+      boot.rs      Multiboot entry, 32->64-bit switch, boot page tables (asm)
+      cpu.rs       privileged instructions; port I/O on a fixed list of devices
+      percpu.rs    each CPU's own block, through GS (swapgs on every user/kernel switch)
+      apic.rs      local APICs: the tick, IPIs, starting CPUs
+      smp.rs       starting the other CPUs: the real-mode trampoline (asm)
+      entry.rs     exception/IRQ/syscall entry stubs, UserRegs, return to user mode (asm)
+      context.rs   kernel stacks, per-CPU idle contexts, context switch
+      gdt.rs       GDT + a TSS per CPU (layout chosen for SYSCALL/SYSRET), I/O bitmap
+      idt.rs       IDT: every gate; CPU exception handling
+      upcall.rs    the frame that enters a handler (Linux x86_64 signal frame layout)
+      phys.rs      physical memory access, limited to allocator-owned frames
+      x86.rs       names for the CPU's numbers: register bits, vectors, descriptors
+  platform/        hardware layer, the machine around the CPU: one directory per platform
+    pc/
+      multiboot.rs boot-loader information: memory map, boot modules
+      acpi.rs      the CPUs the firmware's MADT lists
+      pic.rs       the 8259 interrupt controllers
+      pit.rs       the 8254 timer, as a boot-time stopwatch
+      uart.rs      the COM1 16550, the serial line's transmitter
+      power.rs     powering off (QEMU's isa-debug-exit)
   sync.rs          Lock: a ticket spinlock that panics on re-entrant use
-  gdt.rs           GDT + a TSS per CPU (layout chosen for SYSCALL/SYSRET), I/O bitmap
-  idt.rs           IDT, CPU exception handling
-  irq.rs           8259 PIC, forwarding IRQs to drivers; every interrupt's dispatch
-  pmm.rs           Physical frame allocator (Multiboot memory map)
+  irq.rs           forwarding interrupt lines to drivers; every interrupt's dispatch
+  pmm.rs           Physical frame allocator (the loader's memory map)
   vmm.rs           Paging: map, translate, clone (task_fork), destroy, user-memory copies
   elf.rs           ELF64 loader for user programs
   program.rs       a program's address space: its image, stack and arguments
   fs.rs            RAM file system (the unpacked ramdisk), open file descriptions
   task.rs          Tasks and threads, the scheduler of every CPU, task control, upcalls,
                    mmap, IPC, services
-  upcall.rs        The frame that enters a handler (Linux signal frame layout)
+  upcall.rs        an upcall request (the handler to enter; the frame is the architecture's)
   syscall.rs       Syscall dispatcher (Linux-compatible numbers)
-  serial.rs        COM1 kernel debug log (and the console's transmitter), print!/println!
+  serial.rs        the kernel debug log (and the console's transmitter), print!/println!
 abi/               syscall numbers, errno values, IPC protocols, the 16550 UART's
                    registers (kernel + user)
 user/rt/           user runtime: entry point, syscall wrappers, POSIX process calls
@@ -77,18 +99,19 @@ boot loader or the hardware defines. It lives in a few small modules that
 wrap it in safe interfaces. The restrictions of those interfaces are what
 make them safe:
 
-* `kernel/arch/`: port I/O only on a fixed list of devices that cannot do
-  DMA, with bounds-checked register offsets. Physical memory access only to
-  frames the allocator owns; `phys` itself refuses anything in the kernel
-  image, in boot-loader data or below 1 MiB. A context switch only to
-  contexts that the context module itself saved, and never to one that
-  another CPU has not finished leaving. (On top of that, `vmm::map_user`
-  maps only allocator frames, so user space never sees kernel memory.) The
-  local APIC's registers only at their fixed offsets, in the page the boot
-  page tables map. Firmware tables (ACPI) only where no allocator frame or
-  kernel data lies, read-only. The CPU trampoline only in its one page of
-  conventional memory, which nothing else uses. The GS base only as a
-  pointer to the CPU's own block.
+* `kernel/arch/` and `kernel/platform/`: port I/O only on a fixed list of
+  devices that cannot do DMA, with bounds-checked register offsets. Physical
+  memory access only to frames the allocator owns; `phys` itself refuses
+  anything in the kernel image, in boot-loader data (recorded with its
+  `keep_out`) or below 1 MiB. A context switch only to contexts that the
+  context module itself saved, and never to one that another CPU has not
+  finished leaving. (On top of that, `vmm::map_user` maps only allocator
+  frames, so user space never sees kernel memory.) The local APIC's
+  registers only at their fixed offsets, in the page the boot page tables
+  map. Firmware tables (ACPI) only where no allocator frame or kernel data
+  lies, read-only. The CPU trampoline only in its one page of conventional
+  memory, which nothing else uses. The GS base only as a pointer to the
+  CPU's own block.
 * `kernel/sync.rs`: `Lock`, a ticket spinlock, which guards the task table,
   the TSSs, the file system, the serial line and the page-table changes (all
   other shared kernel state is atomics). Kernel code runs with interrupts
@@ -108,7 +131,8 @@ make them safe:
   as a `&'static mut` from a `static`: once, which an atomic flag enforces.
 
 Every other kernel module is checked by the compiler: `main.rs` sets
-`#![deny(unsafe_code)]` and allows it only for `arch` and `sync`. `init` is
+`#![deny(unsafe_code)]` and allows it only for `arch`, `platform` and
+`sync`. `init` is
 `#![forbid(unsafe_code)]`. Every unsafe block carries a `SAFETY:` comment
 (`clippy::undocumented_unsafe_blocks` is denied). The kernel also relies on
 compiler-builtins for `memcpy` and friends instead of defining them itself.

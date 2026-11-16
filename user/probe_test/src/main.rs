@@ -33,7 +33,7 @@ use haisuli_rt::abi::fcntl::{O_CREAT, O_RDONLY, O_RDWR, O_TRUNC};
 use haisuli_rt::abi::signal::{
     bit, NSIG, SA_RESTART, SIGHUP, SIGSEGV, SIGUSR1, SIGUSR2, SIG_BLOCK, SIG_SETMASK,
 };
-use haisuli_rt::abi::Termination;
+use haisuli_rt::abi::{proc_state, ProcInfo, Termination};
 use haisuli_rt::println;
 use haisuli_rt::sys::{self, Errno, SigHandler, WaitStatus};
 
@@ -158,6 +158,49 @@ fn fork_child(c: &mut Checks, child: impl FnOnce() -> i32) -> Option<u64> {
     }
 }
 
+/// The file with which the parent of `interrupted_wait` says that its next sleep is the wait
+/// (its pid follows, so that concurrent cases stay apart).
+const WAITING_PREFIX: &str = "/probe_test.waiting.";
+/// How often a waiting loop looks before it gives up.
+const PATIENCE: u32 = 100_000;
+
+/// The waiting file of the `interrupted_wait` whose parent is `pid`.
+fn waiting_file(pid: u64, buf: &mut [u8; 40]) -> &str {
+    let prefix = WAITING_PREFIX.as_bytes();
+    buf[..prefix.len()].copy_from_slice(prefix);
+    let mut num = [0u8; 20];
+    let digits = decimal(pid, &mut num);
+    let end = prefix.len() + digits.len();
+    buf[prefix.len()..end].copy_from_slice(digits.as_bytes());
+    core::str::from_utf8(&buf[..end]).unwrap_or(WAITING_PREFIX)
+}
+
+/// Waits until process `pid` sleeps in a call.
+///
+/// For `interrupted_wait`'s child: once the parent has announced the wait (the file exists, so
+/// its `fork` and the file calls, which never sleep, are behind it), the parent sleeping means
+/// it is in `waitpid`: a signal now arrives during the wait, on one CPU or several.
+fn wait_until_waiting(pid: u64) {
+    let mut buf = [0u8; 40];
+    let file = waiting_file(pid, &mut buf);
+    let mut announced = false;
+    for _ in 0..PATIENCE {
+        if !announced {
+            announced = sys::open(file, O_RDONLY).map(sys::close).is_ok();
+        } else {
+            let mut procs = [ProcInfo::default(); sys::PROC_LIST_MAX];
+            let n = sys::proc_list(&mut procs).unwrap_or(0);
+            if procs[..n]
+                .iter()
+                .any(|p| p.pid == pid && p.state == proc_state::SLEEPING)
+            {
+                return;
+            }
+        }
+        sys::sched_yield();
+    }
+}
+
 /// `restart` and `eintr`: a child signals the parent while it waits for it.
 fn interrupted_wait(c: &mut Checks, restart: bool) {
     let flags = if restart { SA_RESTART } else { 0 };
@@ -168,13 +211,20 @@ fn interrupted_wait(c: &mut Checks, restart: bool) {
     );
     let parent = sys::getpid();
     let Some(child) = fork_child(c, || {
-        yield_a_while(); // The parent waits meanwhile.
+        wait_until_waiting(parent); // The signal must arrive during the wait.
         let _ = sys::kill(parent as i64, SIGUSR1);
         yield_a_while();
         5
     }) else {
         return;
     };
+    let mut buf = [0u8; 40];
+    let announced = sys::open(waiting_file(parent, &mut buf), O_CREAT | O_RDWR).map(sys::close);
+    if announced.is_err() {
+        // Only on failure: printing sleeps in the console server, and the child takes any
+        // sleep after the announcement for the wait.
+        c.check(false, format_args!("announce the wait: {:?}", announced));
+    }
     let r = sys::waitpid(child as i64, 0);
     if restart {
         c.check(

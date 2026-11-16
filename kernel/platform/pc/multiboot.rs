@@ -8,7 +8,7 @@
 //! allocator never gets it and [`super::phys`] refuses it), so it is never written after boot and
 //! can be handed out as `&'static [u8]`.
 
-use super::x86::flags;
+use crate::arch::x86::flags;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The magic numbers of the Multiboot v1 handshake.
@@ -127,7 +127,7 @@ static INFO: AtomicU64 = AtomicU64::new(0);
 /// # Safety
 /// `mb_info` must be the address a Multiboot v1 loader passed in ebx, and the
 /// memory it describes must not have been modified since.
-pub(super) unsafe fn init(mb_info: u64) {
+pub(crate) unsafe fn init(mb_info: u64) {
     INFO.store(mb_info, Ordering::Relaxed);
 }
 
@@ -137,7 +137,7 @@ fn bytes(addr: u64, len: u64) -> &'static [u8] {
         addr != 0
             && addr
                 .checked_add(len)
-                .is_some_and(|end| end <= super::phys::MAX_PHYS)
+                .is_some_and(|end| end <= crate::arch::phys::MAX_PHYS)
     );
     // SAFETY: Callers only pass ranges taken from the information structure,
     // which `init`'s contract guarantees to be valid; all of them are listed

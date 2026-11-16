@@ -13,9 +13,10 @@
 //! that kernel code always finds its CPU's [`super::percpu`] block through GS (see there).
 
 use super::cpu;
+use super::gdt::{Selector, USER_CS, USER_DS};
 use super::percpu;
 use super::x86::{Efer, Msr, RFlag};
-use crate::gdt::{Selector, USER_CS, USER_DS};
+use crate::arch::UserRegs;
 use core::arch::global_asm;
 
 /// Saved user context; lowest address first (matches the push order of
@@ -44,6 +45,62 @@ pub(crate) struct TrapFrame {
     pub rflags: u64,
     pub rsp: u64,
     pub ss: u64,
+}
+
+/// Bytes of the `syscall` instruction, to make an interrupted call again.
+const SYSCALL_LEN: u64 = 2;
+
+/// RFLAGS of a thread entering user mode: interrupts enabled (and the reserved bit 1).
+pub(crate) const USER_RFLAGS: u64 = RFlag::bits(&[RFlag::Interrupt, RFlag::Reserved1]);
+
+// What generic code may do with the saved registers (see [`crate::arch::UserRegs`]): the
+// x86_64 system call convention, and `syscall`'s return path through rcx and r11.
+impl UserRegs for TrapFrame {
+    fn new_program(entry: u64, sp: u64) -> TrapFrame {
+        TrapFrame {
+            rip: entry,
+            cs: USER_CS,
+            rflags: USER_RFLAGS,
+            rsp: sp,
+            ss: USER_DS,
+            ..TrapFrame::default()
+        }
+    }
+
+    fn in_user_mode(&self) -> bool {
+        use super::x86::PrivilegeLevel;
+        PrivilegeLevel::of_selector(self.cs) == PrivilegeLevel::User
+    }
+
+    fn syscall_nr(&self) -> u64 {
+        self.rax
+    }
+
+    fn syscall_args(&self) -> [u64; 6] {
+        [self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9]
+    }
+
+    fn set_return(&mut self, value: i64) {
+        self.rax = value as u64;
+    }
+
+    fn returned(&self) -> i64 {
+        self.rax as i64
+    }
+
+    fn restart_syscall(&mut self, nr: u64) {
+        // Back up to the `syscall` instruction, with the number in place again.
+        self.rip = self.rip.wrapping_sub(SYSCALL_LEN);
+        self.rax = nr;
+    }
+
+    fn sp(&self) -> u64 {
+        self.rsp
+    }
+
+    fn set_sp(&mut self, sp: u64) {
+        self.rsp = sp;
+    }
 }
 
 impl TrapFrame {
@@ -210,7 +267,7 @@ isr_common:
     ud2
 .popsection
 "#,
-    handler = sym crate::idt::exception_handler,
+    handler = sym super::idt::exception_handler,
 );
 
 // ---- Hardware interrupts -----------------------------------------------------------

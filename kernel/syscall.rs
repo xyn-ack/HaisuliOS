@@ -10,7 +10,7 @@
 //! process management is not here: the process server implements it on top of the task control
 //! calls.
 
-use crate::arch::entry::{self, TrapFrame};
+use crate::arch::{entry, UserContext, UserRegs};
 use crate::fs::{self, Transfer};
 use crate::task::{self, Access, Why};
 use crate::{irq, serial, vmm};
@@ -34,9 +34,9 @@ pub(crate) fn set_kernel_stack(top: u64) {
 ///
 /// On the way back to user mode it takes the last step of [`task::return_to_user`]: the
 /// thread may end, wait, or enter its pending upcall, which redirects `f` to a handler.
-pub(crate) extern "C" fn syscall_dispatch(f: &mut TrapFrame) {
-    let nr = f.rax;
-    let (a0, a1, a2, a3) = (f.rdi, f.rsi, f.rdx, f.r10);
+pub(crate) extern "C" fn syscall_dispatch(f: &mut UserContext) {
+    let nr = f.syscall_nr();
+    let [a0, a1, a2, a3, _, _] = f.syscall_args();
     let ret: i64 = match nr {
         nr::READ => sys_read(a0, a1, a2),
         nr::WRITE => sys_write(a0, a1, a2),
@@ -81,7 +81,7 @@ pub(crate) extern "C" fn syscall_dispatch(f: &mut TrapFrame) {
         nr::POWER_OFF => task::power_off(),
         _ => -ENOSYS,
     };
-    f.rax = ret as u64;
+    f.set_return(ret);
     task::return_to_user(f, Some(nr));
 }
 

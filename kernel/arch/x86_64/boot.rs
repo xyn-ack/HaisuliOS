@@ -12,9 +12,9 @@
 //! rest of the kernel can read it without unsafe code; the assembly refers to it (and to the Rust
 //! entry point) with `sym` operands.
 
-use super::multiboot::{self, Magic, HEADER_CHECKSUM, HEADER_FLAGS};
+use super::gdt::Selector;
 use super::x86::{segment_descriptor, Cr0, Cr4, Efer, Msr, PageFlag, SegmentAccess, SegmentFlag};
-use crate::gdt::Selector;
+use crate::platform::multiboot::{self, Magic, HEADER_CHECKSUM, HEADER_FLAGS};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
