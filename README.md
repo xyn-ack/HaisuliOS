@@ -5,13 +5,14 @@ A tiny, bare-bones **microkernel** for **x86_64** (a PC) and **arm64** (QEMU's
 No external crates, no bootloader crate, no nightly features: just `core`,
 inline assembly, and a Multiboot v1 header or a Linux arm64 Image header.
 
-> Status: v0.3.1. It provides virtual memory, tasks with any number of threads,
-> a preemptive scheduler on every CPU of the machine (SMP), IPC and user-space
-> drivers; POSIX processes, `execve` and signals with job control are
+> Status: v0.4.0. It runs on x86_64 and arm64, and provides virtual memory,
+> tasks with any number of threads, a preemptive scheduler on every CPU of the
+> machine (SMP), IPC and user-space drivers, which get their devices granted by
+> the kernel; POSIX processes, `execve` and signals with job control are
 > implemented by a user-space process server, which loads programs from the file
-> system, and the system boots into an interactive console served by a
-> user-space console server. It is **not** yet a full POSIX system: there is no
-> libc, and the file system is a RAM disk.
+> system and restarts a system server that dies, and the system boots into an
+> interactive console served by a user-space console server. It is **not** yet a
+> full POSIX system: there is no libc, and the file system is a RAM disk.
 
 More documents:
 
@@ -135,12 +136,15 @@ module    /boot/initrd.tar initrd
 
 ### Expected output
 
+On arm64 (`make ARCH=aarch64 run`), the banner says `aarch64`, and the console
+is `UART0 (IRQ 1)`, QEMU `virt`'s PL011; the rest is the same.
+
 ```
-HaisuliOS 0.3.1 - x86_64 microkernel
-[pmm] 32364 frames free (126 MiB)
-[kernel] started task 1 (init): 71 KiB image
-[kernel] started task 2 (proc): 44 KiB image
-[kernel] ramdisk "initrd.tar": 120 KiB
+HaisuliOS 0.4.0 - x86_64 microkernel
+[pmm] 31924 frames free (124 MiB)
+[kernel] started task 1 (init): 72 KiB image
+[kernel] started task 2 (proc): 48 KiB image
+[kernel] ramdisk "initrd.tar": 280 KiB
 [kernel] 1 CPU online
 [kernel] entering user space
 [proc] started pid 3 (console) from /sbin/console
@@ -247,9 +251,10 @@ HaisuliOS is licensed under the GNU General Public License, version 2 only
 
 ## Known limitations
 
-By design for v0.3; [TODO.md](TODO.md) has the plans for them.
+By design for v0.4; [TODO.md](TODO.md) has the plans for them.
 
-* Identity-mapped kernel in the low 1 GiB (not higher-half); RAM above 1 GiB unused.
+* On x86_64, an identity-mapped kernel in the low 1 GiB (not higher-half, as
+  arm64's is); RAM above 1 GiB unused (on arm64, beyond the first 1 GiB of RAM).
 * Up to 16 CPUs, found in the ACPI tables (without them, only the boot CPU
   runs). One scheduler lock for all of them, and one global run queue; device
   IRQs go to the boot CPU only (through the 8259 PICs, no I/O APIC). The timer

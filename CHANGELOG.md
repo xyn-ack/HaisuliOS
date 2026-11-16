@@ -4,87 +4,101 @@ What changed in each version of HaisuliOS. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the goals and the
 roadmap are in [TODO.md](TODO.md).
 
-## Unreleased
+## 0.4.0
 
-HaisuliOS runs on arm64: `make ARCH=aarch64` builds it for QEMU's `virt` machine, and `make check
-ARCH=aarch64` passes the same tests as on x86_64, on one CPU or several. That took three steps,
-the last of which is the bring-up itself. The machine and the CPU's own devices are behind
-contracts too: generic kernel code no longer names the local APIC, the IDT, the GDT,
-the SMP start-up or the entry stubs, nor any module of the PC platform; it boots, schedules and
-takes interrupts through traits that the compiler checks, like `UserRegs` and `PageTables`. And
-the ABI and user space are ready for arm64: system call numbers per architecture, devices granted
-to drivers instead of `ioperm`, and all of user space's assembly in the runtime's `arch/`; every
-user program builds for `aarch64-unknown-none` (`make portcheck`).
+HaisuliOS runs on a second CPU architecture: arm64, on QEMU's `virt` machine. `make ARCH=aarch64`
+builds it, and `make check ARCH=aarch64` passes the same tests as on x86_64, on one CPU or
+several. Getting there took three steps. The machine and the CPU's own devices went behind
+contracts that the compiler checks, so generic kernel code no longer names the local APIC, the
+IDT, the GDT, the SMP start-up, the entry stubs or any module of the PC. The ABI and user space
+became portable: system call numbers per architecture, devices granted to drivers instead of
+`ioperm`, and all of user space's assembly in the runtime's `arch/`. Then the arm64 bring-up
+itself. On the way, the races that made tests fail now and then on several CPUs were found and
+fixed, and the process server now restarts a system server that dies.
 
 ### Added
+
+arm64:
+
+- `kernel/arch/aarch64`: a Linux arm64 Image, entered at EL1 with the device tree; the kernel in
+  `TTBR1_EL1` (its image and a linear map of physical memory) and user space in `TTBR0_EL1`, one
+  root per address space, so a new one has nothing of the kernel to copy; exception vectors that
+  save the general-purpose and FP/SIMD registers in the trap frame (the kernel's own code uses the
+  SIMD registers); `UserRegs` for `x0` to `x30`, `SP_EL0` and `ELR_EL1` (a restart backs up 4
+  bytes and puts `x0` back); the Linux arm64 signal frame, with the FP/SIMD state in its
+  `fpsimd_context`; per-CPU data in `TPIDR_EL1`; the GICv3 CPU interface (system registers) and
+  the generic timer for the tick and the reschedule IPI (SGI 0); PSCI `CPU_ON` for the other
+  CPUs and `SYSTEM_OFF` to power off.
+- `kernel/platform/qemu_virt`: the memory, the CPUs, the PSCI method, the PL011 and the GIC from
+  the device tree; the PL011 for the log; the GICv3 distributor for the device lines and each
+  CPU's redistributor; the boot modules as a ustar archive in the one initrd that the Linux boot
+  protocol has.
+- `make ARCH=x86_64|aarch64` for every target (outputs for arm64 in `build/aarch64/`), and the
+  test runner's `--arch`; what the tests may expect of each architecture is in
+  `haisuli.ARCHES`. [TODO.md](TODO.md) lists what the port leaves for later (entry at EL2, cache
+  maintenance while the MMU is off, more than 1 GiB of RAM, address space ids).
+
+The hardware layer's contracts (see [ARCHITECTURE.md](docs/ARCHITECTURE.md#source-layout)):
+
+- The architecture's `Processor` trait (for `arch::Cpu`): `init_cpu(boot_cpu, wait)` sets up a
+  CPU, `start_cpus` starts the others from the hardware ids the platform lists, `prepare_thread`
+  is the one call that prepares a CPU for a thread (on x86_64 the TSS's kernel stack and I/O
+  bitmap and the `syscall` stack), plus `wait_for_interrupt` and `halt`.
+- The architecture's `CpuInterrupts` trait: the tick and its length, the reschedule IPI (which
+  names CPUs by the kernel's index), end of interrupt. `arch::Interrupt`: the architecture's
+  interrupt entry tells `irq::dispatch` where an interrupt came from (the tick, a reschedule, a
+  platform line, or nothing), not an x86 vector.
+- The architecture's `IoPermissions` trait (for `arch::IoPorts`): a task's I/O ports, opaque to
+  generic code (the TSS's bitmap on x86_64, nothing on arm64); `PageTables::device_entry` and
+  `is_device`.
+- The platform's traits (for `platform::Board`): `Machine` (the early console, start-up delays,
+  the CPUs the firmware lists, power-off, the devices that drivers may be given), `BootInfo` (the
+  available memory, the boot loader's own data and the boot modules, without Multiboot's types)
+  and `InterruptController` (lines, mask, unmask, acknowledge, and the controller's per-CPU part,
+  such as the GIC's redistributor).
+- `make portcheck`: every user crate builds for `aarch64-unknown-none` without warnings, no
+  assembly outside `user/rt/src/arch/`, and no generic kernel file names the hardware layer's
+  insides.
+
+System calls and devices:
+
+- Devices for drivers: `device_info` (0x101B) describes a device the machine has (what it is,
+  where its registers are, its IRQ line; `abi::device`, so far `CONSOLE`), and `device_grant`
+  (0x101C) gives a privileged task its registers: I/O ports (the PC's COM1) become usable, and
+  memory-mapped registers (QEMU `virt`'s PL011) are mapped uncached into the driver, which
+  `task_fork` does not copy and which are not freed as memory. The runtime's `device` module
+  reads and writes granted registers, in the I/O port space or memory-mapped alike.
+- The console server picks its UART driver by the device's kind, the 16550 or the PL011, and
+  takes its IRQ line from the description.
+- `openat` (257 on x86_64, 56 on arm64), `dup3` (292, 24) and `fcntl(F_GETFD)`: the calls that
+  arm64 has instead of `open` and `dup2`, which the runtime now uses everywhere. A relative path
+  of `openat` starts at a directory descriptor (or at the root for `AT_FDCWD`).
+- `clock_gettime` (228 on x86_64, 113 on arm64), `CLOCK_MONOTONIC` only: the time since boot, in
+  the scheduler's ticks; the runtime's `sys::monotonic_ns`.
+
+Reliability:
 
 - System servers are kept running, like MINIX's reincarnation server: when one dies (of a signal,
   a fault or a non-zero exit status), the process server starts its program again, as a new
   process; one that keeps dying soon after it starts (6 times in a row, each within 10 s) is
   given up. Killing the console server used to take the whole system down (the shell gave up,
   or the kernel found every task blocked and powered off); now the terminal comes back.
-- `clock_gettime` (228 on x86_64, 113 on arm64), `CLOCK_MONOTONIC` only: the time since boot, in
-  the scheduler's ticks (the tick's length is part of `CpuInterrupts` now). The runtime's
-  `sys::monotonic_ns`.
-- Tests: `test_servers.py`, and `probe_test clock`.
-- arm64 (`kernel/arch/aarch64`): a Linux arm64 Image, entered at EL1 with the device tree; the
-  kernel in `TTBR1_EL1` (its image and a linear map of physical memory) and user space in
-  `TTBR0_EL1`, one root per address space, so a new one has nothing of the kernel to copy;
-  exception vectors that save the general-purpose and FP/SIMD registers in the trap frame (the
-  kernel's own code uses the SIMD registers); `UserRegs` for `x0` to `x30`, `SP_EL0` and
-  `ELR_EL1` (a restart backs up 4 bytes and puts `x0` back); the Linux arm64 signal frame, with
-  the FP/SIMD state in its `fpsimd_context`; per-CPU data in `TPIDR_EL1`; the GICv3 CPU interface
-  (system registers) and the generic timer for the tick and the reschedule IPI (SGI 0); PSCI
-  `CPU_ON` for the other CPUs and `SYSTEM_OFF` to power off.
-- QEMU's `virt` machine (`kernel/platform/qemu_virt`): the memory, the CPUs, the PSCI method, the
-  PL011 and the GIC from the device tree; the PL011 for the log; the GICv3 distributor for the
-  device lines and each CPU's redistributor; the boot modules as a ustar archive in the one
-  initrd that the Linux boot protocol has.
-- The kernel side of memory-mapped device grants: `device_grant` maps a device's registers
-  uncached into the driver, which `task_fork` does not copy and which are not freed as memory.
-  The console server drives the PL011 through it.
-- `InterruptController::init_cpu`, the controller's per-CPU part (the GIC's redistributor; the
-  PC has none); `PageTables::device_entry` and `is_device`.
-- `make ARCH=x86_64|aarch64` for every target, and the test runner's `--arch`; what the tests
-  may expect of each architecture is in `haisuli.ARCHES`.
-- `openat` (257 on x86_64, 56 on arm64), `dup3` (292, 24) and `fcntl(F_GETFD)`: the calls that
-  arm64 has instead of `open` and `dup2`, which the runtime now uses everywhere. A relative path
-  of `openat` starts at a directory descriptor (or at the root for `AT_FDCWD`).
-- Devices for drivers: `device_info` (0x101B) describes a device the machine has (what it is,
-  where its registers are, its IRQ line; `abi::device`, so far `CONSOLE`), and `device_grant`
-  (0x101C) gives a privileged task its registers. The runtime's `device` module reads and writes
-  granted registers, in the I/O port space or memory-mapped alike.
-- The console server picks its UART driver by the device's kind: the 16550 (the PC's COM1), or
-  the PL011 (arm64), and takes its IRQ line from the description.
-- `make portcheck`: every user crate builds for `aarch64-unknown-none`, no assembly outside
-  `user/rt/src/arch/`, and no generic kernel file names the hardware layer's insides.
-- The architecture's `IoPermissions` trait (for `arch::IoPorts`): a task's I/O ports, opaque to
-  generic code (the TSS's bitmap on x86_64).
-- The architecture's `Processor` trait (for `arch::Cpu`): `init_cpu(boot_cpu, wait)` sets up a
-  CPU (on x86_64 the GDT and TSS, the IDT, the local APIC and its timer, `syscall`),
-  `start_cpus` starts the others from the hardware ids the platform lists, `prepare_thread` is
-  the one call that prepares a CPU for a thread (on x86_64 the TSS's kernel stack and I/O bitmap
-  and the `syscall` stack), plus `wait_for_interrupt` and `halt`.
-- The architecture's `CpuInterrupts` trait: the tick, the reschedule IPI, end of interrupt. IPIs
-  name CPUs by the kernel's index; the APIC keeps each CPU's APIC id itself.
-- `arch::Interrupt`: the architecture's interrupt entry tells `irq::dispatch` where an interrupt
-  came from (the tick, a reschedule, a platform line, or nothing) instead of passing an x86
-  vector.
-- The platform's traits (for `platform::Board`): `Machine` (the early console, start-up delays,
-  the CPUs the firmware lists, power-off), `BootInfo` (the available memory, the boot loader's own
-  data and the boot modules, without Multiboot's types) and `InterruptController` (lines, mask,
-  unmask, acknowledge).
+
+Tests:
+
+- `test_servers.py`: a killed console server is restarted (also under the shell's `read`), Ctrl-C
+  works after that, and one that keeps dying is given up.
+- `probe_test blocked-ignored`, `files`, `devices` and `clock` (`test_probe.py`): a signal that
+  is blocked when it is sent, whether or not it is ignored then and when it is unblocked;
+  `openat` relative to a directory, `dup3`'s and `dup2`'s special cases, x86_64's `open` and
+  `dup2`; the console's description, and that an ordinary program is granted no device; the
+  monotonic clock.
+- `test_a_job_signalled_as_soon_as_it_starts_gets_the_default_action` (`test_process.py`): types
+  `kill` together with `pause &`, so that the signal arrives while the job still resets the
+  shell's actions.
 
 ### Changed
 
-- The shell survives its console server dying: a `read` that fails with `EPIPE` prompts again,
-  and the shell takes the terminal (`tcsetpgrp`) before every prompt, so that a restarted
-  console server learns the foreground process group. `tcsetpgrp` waits for the console server,
-  as terminal reads and writes do.
-- The tests that checked x86 specifics check the architecture's (the banner, the console's device
-  and IRQ, QEMU's exit status on power-off); a CPU exception's report is one log message now.
-- User programs are linked with 4 KiB segment alignment (lld's default for arm64 is 64 KiB).
-- `/etc/motd` no longer says x86_64.
 - `abi::nr` has the architecture's Linux numbers, declared side by side for x86_64 and arm64;
   `open` and `dup2` are x86_64's only. `UC_SIGMASK` (now counted from the restorer's stack
   pointer) and `O_DIRECTORY` are per architecture too; the native calls are shared.
@@ -95,16 +109,28 @@ user program builds for `aarch64-unknown-none` (`make portcheck`).
   COM1 now); `abi::pl011` has the PL011's registers.
 - Booting (`main.rs`) goes through the contracts only. The boot CPU sets itself up before the
   frame allocator and the 8259s rather than around them (interrupts are off throughout, so the
-  order does not matter to the hardware).
-- `arch::x86_64` and `platform::pc` are named only by the hardware layer: by the PC for its
-  port I/O and vectors, and by x86_64's boot entry for the Multiboot handshake.
+  order does not matter to the hardware). `arch::x86_64` and `platform::pc` are named only by
+  the hardware layer: by the PC for its port I/O and vectors, and by x86_64's boot entry for the
+  Multiboot handshake.
 - A task's pending IRQ lines are a 64-bit set (the platform says how many lines there are; the
   compiler checks that they fit).
+- The shell survives its console server dying: a `read` that fails with `EPIPE` prompts again,
+  and the shell takes the terminal (`tcsetpgrp`) before every prompt, so that a restarted
+  console server learns the foreground process group. `tcsetpgrp` waits for the console server,
+  as terminal reads and writes do.
+- A CPU exception's report is one log message, so that nothing cuts into it.
+- User programs are linked with 4 KiB segment alignment (lld's default for arm64 is 64 KiB).
+- `rust-toolchain.toml` asks for the `aarch64-unknown-none` target and `llvm-tools` (arm64's
+  image is made with `llvm-objcopy`); where the stable release lacks the target, the Makefile
+  builds arm64 with 1.98.0 (or `AARCH64_TOOLCHAIN=+<toolchain>`).
+- The tests that checked x86 specifics check the architecture's (the banner, the console's device
+  and IRQ, QEMU's exit status on power-off, a page fault's report).
+- `/etc/motd` no longer says x86_64.
 
 ### Fixed
 
 Races that made tests fail now and then when every machine had several CPUs (`make check
-TEST_ARGS="--cpus 4"`), and that two new tests now provoke on purpose:
+TEST_ARGS="--cpus 4"`):
 
 - The kernel could lose the wake-up of a thread waiting for a service to register (`svc_wait`,
   and a terminal `read` or `write` before the console server is up): it looked the service up and
@@ -126,26 +152,15 @@ TEST_ARGS="--cpus 4"`), and that two new tests now provoke on purpose:
   it meets when it is unblocked decides, as on Linux (POSIX leaves it open).
 - `echo` (the shell's and `/bin/echo`) wrote every word, and the newline, separately: a log line
   from another CPU could land in the middle of its output. It now writes its line at once.
-
-### Added (tests)
-
-- `probe_test blocked-ignored` (`test_probe.py`): what happens to a signal that is blocked when
-  it is sent, whether or not it is ignored then and when it is unblocked.
-- `probe_test files` and `probe_test devices` (`test_probe.py`): `openat` relative to a
-  directory, `dup3`'s and `dup2`'s special cases, x86_64's `open` and `dup2`, the console's
-  description, and that an ordinary program is granted no device.
-- `test_a_job_signalled_as_soon_as_it_starts_gets_the_default_action` (`test_process.py`): types
-  `kill` together with `pause &`, so that the signal arrives while the job still resets the
-  shell's actions.
+- `test_motd_appears_exactly_once` did not allow for a log line in the middle of the motd.
 
 ### Removed
 
-- `kernel/process/` (`signal.rs`, `group.rs`), dead code left over from 0.1 that no module
-  included since `kernel/process.rs` went in 0.3.1.
-- `user/init/src/jobs.rs`, `signals.rs` and `ustar.rs`, which the shell no longer included.
-- `user/proctest/`, a test program outside the workspace that nothing built (`probe_test`
-  replaced it).
 - `ioperm` (173), `IO_PORTS` and `abi::uart::{COM1, PORTS, COM1_IRQ}`: devices are granted.
+- Dead code: `kernel/process/` (`signal.rs`, `group.rs`), left over from 0.1, which no module
+  included since `kernel/process.rs` went in 0.3.1; `user/init/src/jobs.rs`, `signals.rs` and
+  `ustar.rs`, which the shell no longer included; `user/proctest/`, a test program outside the
+  workspace that nothing built (`probe_test` replaced it).
 
 ## 0.3.1
 

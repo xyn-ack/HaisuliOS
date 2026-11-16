@@ -2,7 +2,7 @@
 
 [package]
 name = "init"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "HaisuliOS init: prints /etc/motd and runs an interactive shell"
 license = "GPL-2.0"

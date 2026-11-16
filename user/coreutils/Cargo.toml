@@ -2,7 +2,7 @@
 
 [package]
 name = "coreutils"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "HaisuliOS programs for /bin: echo, true, false, nproc"
 license = "GPL-2.0"
