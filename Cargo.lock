@@ -4,53 +4,60 @@ version = 4
 
 [[package]]
 name = "console"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "haisuli-rt",
 ]
 
 [[package]]
 name = "coreutils"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "haisuli-rt",
 ]
 
 [[package]]
 name = "haisuli-abi"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "haisuli-rt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "haisuli-abi",
 ]
 
 [[package]]
 name = "haisulios"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "haisuli-abi",
 ]
 
 [[package]]
 name = "init"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "haisuli-rt",
 ]
 
 [[package]]
 name = "probe_test"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "haisuli-rt",
 ]
 
 [[package]]
 name = "proc"
-version = "0.2.0"
+version = "0.3.0"
+dependencies = [
+ "haisuli-rt",
+]
+
+[[package]]
+name = "smp_test"
+version = "0.3.0"
 dependencies = [
  "haisuli-rt",
 ]

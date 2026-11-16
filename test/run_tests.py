@@ -17,13 +17,20 @@ for the tests of a feature that is not implemented yet. Explicit tests never run
 selectors do not pick them up either: they run only with `--explicit name` (`make check
 TEST_EXPLICIT=name`), where `name` must equal the file's `EXPLICIT` exactly. Selectors then
 narrow down the explicit tests.
+
+A test runs on a machine with one CPU, unless it asks for more with the `haisuli.cpus(n)`
+decorator. `--cpus N` changes the default for the tests that do not ask. A test that asks for N
+CPUs may keep them all busy, so it also takes N of the host's CPUs (`--cpu-budget`) while it
+runs: emulated CPUs that wait for a host CPU make every timing assumption of a test wrong.
 """
 import argparse
 import concurrent.futures
+import contextlib
 import importlib.util
 import os
 import shutil
 import sys
+import threading
 import time
 import traceback
 
@@ -87,11 +94,41 @@ class Result:
         self.stderr = stderr
 
 
-def run_one(test_id, func):
+class CpuBudget:
+    """The host CPUs that the machines of the running tests may keep busy."""
+
+    def __init__(self, total):
+        self.total = max(1, total)
+        self.free = self.total
+        self.cond = threading.Condition()
+
+    @contextlib.contextmanager
+    def take(self, n):
+        """Holds `n` CPUs (at most all of them) while the block runs."""
+        n = max(1, min(n, self.total))
+        with self.cond:
+            while self.free < n:
+                self.cond.wait()
+            self.free -= n
+        try:
+            yield
+        finally:
+            with self.cond:
+                self.free += n
+                self.cond.notify_all()
+
+
+def run_one(test_id, func, budget):
+    # Only the CPUs that a test asks for itself are expected to be busy.
+    with budget.take(getattr(func, "cpus", None) or 1):
+        return run_machine(test_id, func)
+
+
+def run_machine(test_id, func):
     start = time.monotonic()
     machine = None
     try:
-        machine = haisuli.Machine()
+        machine = haisuli.Machine(cpus=getattr(func, "cpus", None))
         func(machine)
         machine.check_healthy()
         status, message = "PASS", ""
@@ -122,6 +159,11 @@ def main():
                     help="comma-separated boot modules")
     ap.add_argument("--timeout", type=float, default=haisuli.Config.timeout,
                     help="seconds to wait for expected output (default %(default)s)")
+    ap.add_argument("--cpus", type=int, metavar="N",
+                    help="CPUs of each machine whose test does not ask for a number (default 1)")
+    ap.add_argument("--cpu-budget", type=int, default=os.cpu_count() or 1, metavar="N",
+                    help="host CPUs that the tests' machines may keep busy at once "
+                         "(default %(default)s)")
     ap.add_argument("-j", "--jobs", type=int, default=min(os.cpu_count() or 1, 8),
                     help="machines to run in parallel (default %(default)s)")
     ap.add_argument("-v", "--verbose", action="store_true",
@@ -161,12 +203,14 @@ def main():
     haisuli.Config.kernel = args.kernel
     haisuli.Config.modules = args.modules
     haisuli.Config.timeout = args.timeout
+    haisuli.Config.cpus = args.cpus
 
     print(f"running {len(tests)} tests, {args.jobs} at a time")
     start = time.monotonic()
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = [pool.submit(run_one, test_id, func) for test_id, func, _ in tests]
+        budget = CpuBudget(args.cpu_budget)
+        futures = [pool.submit(run_one, test_id, func, budget) for test_id, func, _ in tests]
         for future in concurrent.futures.as_completed(futures):
             r = future.result()
             results.append(r)

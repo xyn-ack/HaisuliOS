@@ -5,14 +5,18 @@
 //! Every way into and out of the kernel: exception, interrupt and system call entry stubs.
 //!
 //! The stubs save the interrupted state and call ordinary (safe) Rust handlers, which they
-//! reference with `sym` operands: [`crate::idt::exception_handler`], [`crate::irq::irq_dispatch`]
-//! and [`crate::syscall::syscall_dispatch`]. `trap_return` is the common way back to user mode.
+//! reference with `sym` operands: [`crate::idt::exception_handler`],
+//! [`crate::irq::interrupt_dispatch`] and [`crate::syscall::syscall_dispatch`]. `trap_return` is
+//! the common way back to user mode after a system call.
+//!
+//! Every entry from user mode executes `swapgs` first, and every return to user mode last, so
+//! that kernel code always finds its CPU's [`super::percpu`] block through GS (see there).
 
 use super::cpu;
+use super::percpu;
 use super::x86::{Efer, Msr, RFlag};
 use crate::gdt::{Selector, USER_CS, USER_DS};
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Saved user context; lowest address first (matches the push order of
 /// `syscall_entry` and the pop order of `trap_return`).
@@ -133,12 +137,25 @@ stub_table!(
 );
 
 stub_table!(
-    /// Entry stubs for hardware interrupt lines 0..15.
+    /// Entry stubs for hardware interrupt vectors 32..48 (the PICs' lines 0..15).
     IRQ_STUBS: [
-        irq_stub0, irq_stub1, irq_stub2, irq_stub3, irq_stub4, irq_stub5, irq_stub6,
-        irq_stub7, irq_stub8, irq_stub9, irq_stub10, irq_stub11, irq_stub12, irq_stub13,
-        irq_stub14, irq_stub15,
+        irq_stub32, irq_stub33, irq_stub34, irq_stub35, irq_stub36, irq_stub37, irq_stub38,
+        irq_stub39, irq_stub40, irq_stub41, irq_stub42, irq_stub43, irq_stub44, irq_stub45,
+        irq_stub46, irq_stub47,
     ]
+);
+
+stub_table!(
+    /// Entry stubs for the local APIC's vectors: the timer, the reschedule IPI and spurious
+    /// interrupts (see [`super::apic`]), in that order.
+    APIC_STUBS: [irq_stub240, irq_stub241, irq_stub255]
+);
+
+// The stubs' names (and the `.irp` list below) spell out the APIC's vectors.
+const _: () = assert!(
+    super::apic::TIMER_VECTOR == 240
+        && super::apic::RESCHEDULE_VECTOR == 241
+        && super::apic::SPURIOUS_VECTOR == 255
 );
 
 extern "C" {
@@ -182,6 +199,10 @@ isr\n:
 .endr
 
 isr_common:
+    test byte ptr [rsp + 24], 3 # from user mode (the CPL of the saved cs)?
+    jz 1f
+    swapgs
+1:
     cld
     mov rdi, rsp                # &ExceptionFrame
     sub rsp, 8                  # keep the SysV 16-byte alignment at the call
@@ -194,25 +215,28 @@ isr_common:
 
 // ---- Hardware interrupts -----------------------------------------------------------
 
-// The CPU has pushed ss, rsp, rflags, cs, rip (no error code). Save every
-// general-purpose register: the interrupted code may be user mode or the
-// kernel's idle loop, and neither expects anything to change.
+// The CPU has pushed ss, rsp, rflags, cs, rip (no error code). The stub saves
+// rax and passes the vector in it; the common part saves the other registers,
+// which makes a `TrapFrame`. Every register is restored: the interrupted code
+// may be user mode or the kernel's idle loop, and neither expects anything to
+// change. From user mode, the handler may switch to another thread before it
+// returns (preemption), so it gets the frame.
 global_asm!(
     r#"
 .macro IRQ_STUB n
 .global irq_stub\n
 irq_stub\n:
-    push \n
+    push rax
+    mov eax, \n
     jmp irq_common
 .endm
 
 .pushsection .text
-.irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+.irp n, 32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,240,241,255
     IRQ_STUB \n
 .endr
 
 irq_common:
-    push rax
     push rbx
     push rcx
     push rdx
@@ -227,11 +251,18 @@ irq_common:
     push r13
     push r14
     push r15
+    test byte ptr [rsp + 16*8], 3  # from user mode (the CPL of the saved cs)?
+    jz 1f
+    swapgs
+1:
     cld
-    mov rdi, [rsp + 15*8]       # line number pushed by the stub
-    sub rsp, 8                  # 16-byte alignment for the call
+    mov edi, eax                # the vector
+    mov rsi, rsp                # &mut TrapFrame (20 words: rsp stays 16-byte aligned)
     call {dispatch}
-    add rsp, 8
+    test byte ptr [rsp + 16*8], 3
+    jz 2f
+    swapgs
+2:
     pop r15
     pop r14
     pop r13
@@ -247,23 +278,17 @@ irq_common:
     pop rcx
     pop rbx
     pop rax
-    add rsp, 8                  # drop the line number
     iretq
 .popsection
 "#,
-    dispatch = sym crate::irq::irq_dispatch,
+    dispatch = sym crate::irq::interrupt_dispatch,
 );
 
 // ---- System calls ----------------------------------------------------------------
 
-/// Single CPU, so one scratch slot for the user rsp is enough.
-static SYSCALL_USER_RSP: AtomicU64 = AtomicU64::new(0);
-/// Kernel stack top of the running task.
-static SYSCALL_KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
-
-/// Kernel stack to switch to on `syscall` (the running task's).
+/// Kernel stack to switch to on `syscall` on this CPU (the running thread's).
 pub(crate) fn set_syscall_stack(top: u64) {
-    SYSCALL_KERNEL_RSP.store(top, Ordering::Relaxed);
+    percpu::set_syscall_stack(top);
 }
 
 /// STAR: `syscall` loads the kernel code segment from bits 32..48 (and the
@@ -282,7 +307,7 @@ const _: () = {
 /// runs with them off) and the direction flag (the ABI wants it clear).
 const SYSCALL_CLEARS: u64 = RFlag::bits(&[RFlag::Trap, RFlag::Interrupt, RFlag::Direction]);
 
-/// Enables the `syscall` instruction and points it at `syscall_entry`.
+/// Enables the `syscall` instruction on this CPU and points it at `syscall_entry`.
 pub(crate) fn init_syscalls() {
     let efer = cpu::rdmsr(Msr::Efer) | Efer::Syscall as u64;
     cpu::wrmsr(Msr::Efer, efer);
@@ -297,10 +322,11 @@ global_asm!(
 .pushsection .text
 .global syscall_entry
 syscall_entry:
-    mov [rip + {user_rsp}], rsp
-    mov rsp, [rip + {kernel_rsp}]
+    swapgs
+    mov gs:[{user_rsp}], rsp
+    mov rsp, gs:[{kernel_rsp}]
     push {user_ss}                             # ss
-    push qword ptr [rip + {user_rsp}]          # rsp
+    push qword ptr gs:[{user_rsp}]             # rsp
     push r11                                   # rflags
     push {user_cs}                             # cs
     push rcx                                   # rip
@@ -324,7 +350,7 @@ syscall_entry:
     jmp trap_return
 
 # Pop a TrapFrame and return to user mode. Also the first "return address"
-# of every new task (see context::init).
+# of every new thread (see context::init).
 .global trap_return
 trap_return:
     pop r15
@@ -342,11 +368,12 @@ trap_return:
     pop rcx
     pop rbx
     pop rax
+    swapgs
     iretq
 .popsection
 "#,
-    user_rsp = sym SYSCALL_USER_RSP,
-    kernel_rsp = sym SYSCALL_KERNEL_RSP,
+    user_rsp = const percpu::USER_RSP,
+    kernel_rsp = const percpu::KERNEL_RSP,
     user_ss = const USER_DS,
     user_cs = const USER_CS,
     dispatch = sym crate::syscall::syscall_dispatch,

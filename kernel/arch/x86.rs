@@ -119,6 +119,8 @@ flags! {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub(crate) enum Msr {
+    /// IA32_APIC_BASE: the local APIC's physical address and global enable bit.
+    ApicBase = 0x1B,
     /// IA32_EFER: extended features (see [`Efer`]).
     Efer = 0xC000_0080,
     /// IA32_STAR: the segment selectors of `syscall` / `sysret`.
@@ -127,6 +129,11 @@ pub(crate) enum Msr {
     LStar = 0xC000_0082,
     /// IA32_FMASK: the RFLAGS bits that `syscall` clears.
     SfMask = 0xC000_0084,
+    /// IA32_GS_BASE: the GS segment base. In the kernel, this CPU's [`super::percpu`] block.
+    GsBase = 0xC000_0101,
+    /// IA32_KERNEL_GS_BASE: what `swapgs` exchanges with [`Msr::GsBase`] (the user GS base,
+    /// while in the kernel).
+    KernelGsBase = 0xC000_0102,
 }
 
 flags! {
@@ -276,6 +283,10 @@ flags! {
         Writable = 1 << 1,
         /// U/S: user mode may access it.
         User = 1 << 2,
+        /// PWT: write-through caching.
+        WriteThrough = 1 << 3,
+        /// PCD: caching disabled (device registers).
+        CacheDisable = 1 << 4,
         /// A: set by the CPU when the entry is used.
         Accessed = 1 << 5,
         /// D: set by the CPU when the page is written.

@@ -2,7 +2,7 @@
 
 [package]
 name = "probe_test"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "HaisuliOS test program: process and signal mechanisms that the shell cannot reach"
 license = "GPL-2.0"

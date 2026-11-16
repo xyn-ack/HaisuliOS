@@ -36,6 +36,7 @@ pub(crate) fn kernel_pml4_entry() -> u64 {
 
 /// First Rust code, on the boot stack in 64-bit mode.
 extern "C" fn boot_entry(mb_info: u32, magic: u32) -> ! {
+    super::percpu::init(0); // Before anything that takes a lock.
     if magic == Magic::Loader as u32 {
         // SAFETY: A Multiboot loader passed `mb_info` in ebx, and the boot
         // code above has not touched memory outside the kernel image.
@@ -53,6 +54,27 @@ const HUGE_PAGE_ENTRY: u64 =
 const HUGE_PAGE_SHIFT: u32 = 21;
 /// Entries per page table.
 const TABLE_ENTRIES: u32 = 512;
+
+/// The physical (= virtual) address of the local APIC's registers: the architectural default,
+/// which [`super::apic`] checks the CPU really uses.
+pub(crate) const APIC_BASE: u64 = 0xFEE0_0000;
+/// The page-directory entry that maps the 2 MiB around [`APIC_BASE`]: device registers, so
+/// uncached; kernel only, and never executed.
+const APIC_PAGE_ENTRY: u64 = APIC_BASE
+    | PageFlag::bits(&[
+        PageFlag::Present,
+        PageFlag::Writable,
+        PageFlag::Huge,
+        PageFlag::WriteThrough,
+        PageFlag::CacheDisable,
+    ]);
+/// The upper half of [`APIC_PAGE_ENTRY`] (the 32-bit code writes it in two halves): the
+/// no-execute bit.
+const APIC_PAGE_ENTRY_HIGH: u32 = (PageFlag::NoExecute as u64 >> 32) as u32;
+/// The PDPT entry (1 GiB each) that covers [`APIC_BASE`].
+const APIC_PDPT_INDEX: u64 = APIC_BASE >> 30;
+/// The page-directory entry (2 MiB each) that covers [`APIC_BASE`].
+const APIC_PD_INDEX: u64 = (APIC_BASE >> HUGE_PAGE_SHIFT) & (TABLE_ENTRIES as u64 - 1);
 
 /// The temporary GDT's code segment: 64-bit kernel code (long mode ignores
 /// the base and limit; the GDT proper comes from [`crate::gdt`]).
@@ -94,6 +116,7 @@ global_asm!(
 .balign 4096
 boot_pdpt: .skip 4096
 boot_pd:   .skip 4096
+boot_pd_apic: .skip 4096
 .balign 16
 .skip 16384
 boot_stack_top:
@@ -127,6 +150,13 @@ _start:
     incl %ecx
     cmpl ${table_entries}, %ecx
     jne  .Lboot_fill_pd
+
+    # The local APIC's registers, in the 3-4 GiB range.
+    movl $boot_pd_apic, %eax
+    orl  ${table_entry}, %eax
+    movl %eax, boot_pdpt + {apic_pdpt_index} * 8
+    movl ${apic_entry}, boot_pd_apic + {apic_pd_index} * 8
+    movl ${apic_entry_high}, boot_pd_apic + {apic_pd_index} * 8 + 4
 
     movl ${pml4}, %eax
     movl %eax, %cr3
@@ -185,6 +215,10 @@ long_mode_entry:
     huge_entry = const HUGE_PAGE_ENTRY,
     huge_shift = const HUGE_PAGE_SHIFT,
     table_entries = const TABLE_ENTRIES,
+    apic_pdpt_index = const APIC_PDPT_INDEX,
+    apic_pd_index = const APIC_PD_INDEX,
+    apic_entry = const APIC_PAGE_ENTRY as u32,
+    apic_entry_high = const APIC_PAGE_ENTRY_HIGH,
     cr4_pae = const Cr4::bits(&[Cr4::PhysicalAddressExtension]),
     msr_efer = const Msr::Efer as u32,
     efer_lme_nxe = const Efer::bits(&[Efer::LongMode, Efer::NoExecute]),

@@ -2,7 +2,7 @@
 
 [package]
 name = "haisulios"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "HaisuliOS - a tiny x86_64 microkernel written in Rust"
 license = "GPL-2.0"
@@ -20,7 +20,7 @@ haisuli-abi = { path = "abi" }
 # modules. `cargo build` alone builds only the kernel; use
 # `cargo build --workspace` (or `make`) to build everything.
 [workspace]
-members = ["abi", "user/rt", "user/init", "user/console", "user/proc", "user/coreutils", "user/probe_test"]
+members = ["abi", "user/rt", "user/init", "user/console", "user/proc", "user/coreutils", "user/probe_test", "user/smp_test"]
 
 # The Linux kernel's Rust lints (`rust_common_flags` in its top-level Makefile),
 # as far as they exist on stable Rust, plus documented unsafe blocks.

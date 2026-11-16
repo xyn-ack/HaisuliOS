@@ -7,11 +7,16 @@
 //! The layout ([`Selector`]) is dictated by the STAR MSR of SYSCALL/SYSRET: kernel code must be
 //! followed by kernel data, and user data by user code.
 //!
+//! Every CPU has a TSS of its own (the kernel stack for interrupts from user mode, and the
+//! double-fault stack), described by its own pair of GDT entries after the segments; they all
+//! share the one GDT.
+//!
 //! The TSS carries an I/O-permission bitmap for ports `0..IO_PORTS`, loaded per task on every
 //! context switch: this is how user-space drivers get access to exactly the device registers they
 //! were granted (`ioperm`). Ports at or above `IO_PORTS` lie beyond the TSS limit and always fault.
 
 use crate::arch::cpu;
+use crate::arch::percpu::{self, MAX_CPUS};
 use crate::arch::x86::{
     segment_descriptor, system_descriptor, PrivilegeLevel, SegmentAccess, SegmentFlag,
     SystemSegment,
@@ -48,8 +53,14 @@ pub(crate) enum Selector {
     UserData = 0x18,
     /// 64-bit user code.
     UserCode = 0x20,
-    /// The TSS, a 16-byte descriptor that takes two entries.
+    /// The boot CPU's TSS, a 16-byte descriptor that takes two entries; the other CPUs' follow
+    /// (see [`tss_selector`]).
     Tss = 0x28,
+}
+
+/// The selector of CPU `cpu`'s TSS.
+const fn tss_selector(cpu: usize) -> u16 {
+    Selector::Tss as u16 + (cpu * 2 * Selector::ENTRY_SIZE) as u16
 }
 
 impl Selector {
@@ -100,19 +111,22 @@ struct Tss {
 const IO_BITMAP_OFFSET: u16 = core::mem::offset_of!(Tss, io_bitmap) as u16;
 const _: () = assert!(IO_BITMAP_OFFSET == 104);
 
-static TSS: Lock<Tss> = Lock::new(Tss {
-    _r0: 0,
-    rsp0: 0,
-    _rsp12: [0; 2],
-    _r1: 0,
-    ist1: 0,
-    _ist: [0; 6],
-    _r2: 0,
-    _r3: 0,
-    iopb: IO_BITMAP_OFFSET,
-    io_bitmap: IO_DENY_ALL,
-    io_bitmap_end: DENY_8_PORTS,
-});
+/// Each CPU's TSS. Only its own CPU changes it, but the lock keeps the `&mut` unique.
+static TSS: [Lock<Tss>; MAX_CPUS] = [const {
+    Lock::new(Tss {
+        _r0: 0,
+        rsp0: 0,
+        _rsp12: [0; 2],
+        _r1: 0,
+        ist1: 0,
+        _ist: [0; 6],
+        _r2: 0,
+        _r3: 0,
+        iopb: IO_BITMAP_OFFSET,
+        io_bitmap: IO_DENY_ALL,
+        io_bitmap_end: DENY_8_PORTS,
+    })
+}; MAX_CPUS];
 
 /// The largest segment limit (20 bits), in 4 KiB units with
 /// [`SegmentFlag::Granularity4K`]: the whole address space.
@@ -149,8 +163,8 @@ pub(crate) const fn data_segment(dpl: PrivilegeLevel) -> u64 {
     segment_descriptor(access | user, flags, MAX_LIMIT)
 }
 
-/// Entries in the GDT: up to the TSS, which takes two.
-const GDT_ENTRIES: usize = Selector::Tss.index() + 2;
+/// Entries in the GDT: the segments, then two for each CPU's TSS.
+const GDT_ENTRIES: usize = Selector::Tss.index() + 2 * MAX_CPUS;
 
 static GDT: [AtomicU64; GDT_ENTRIES] = {
     let mut gdt = [const { AtomicU64::new(0) }; GDT_ENTRIES];
@@ -163,33 +177,32 @@ static GDT: [AtomicU64; GDT_ENTRIES] = {
     gdt
 };
 
-/// Separate stack for double faults ([`DOUBLE_FAULT_IST`]), used only by the CPU.
+/// Separate stacks for double faults ([`DOUBLE_FAULT_IST`]), one per CPU, used only by the CPU.
 #[repr(C, align(16))]
 struct Stack([AtomicU64; 1024]);
-static DOUBLE_FAULT_STACK: Stack = Stack([const { AtomicU64::new(0) }; 1024]);
+static DOUBLE_FAULT_STACKS: [Stack; MAX_CPUS] =
+    [const { Stack([const { AtomicU64::new(0) }; 1024]) }; MAX_CPUS];
 
-/// Stack the CPU switches to on a user->kernel interrupt/exception.
+/// Stack this CPU switches to on a user->kernel interrupt/exception.
 pub(crate) fn set_kernel_stack(top: u64) {
-    TSS.lock().rsp0 = top;
+    TSS[percpu::index()].lock().rsp0 = top;
 }
 
-/// Install the I/O permissions of the task about to run.
+/// Install the I/O permissions of the task about to run on this CPU.
 pub(crate) fn set_io_bitmap(bitmap: &IoBitmap) {
-    TSS.lock().io_bitmap = *bitmap;
+    TSS[percpu::index()].lock().io_bitmap = *bitmap;
 }
 
+/// Loads the GDT and this CPU's TSS; every CPU calls it once, with its own index.
 pub(crate) fn init() {
-    TSS.lock().ist1 = DOUBLE_FAULT_STACK.0.as_ptr() as u64 + size_of::<Stack>() as u64;
+    let cpu = percpu::index();
+    let tss = &TSS[cpu];
+    tss.lock().ist1 = DOUBLE_FAULT_STACKS[cpu].0.as_ptr() as u64 + size_of::<Stack>() as u64;
 
-    let base = TSS.addr();
     let limit = (size_of::<Tss>() - 1) as u32;
-    let [low, high] = system_descriptor(SystemSegment::AvailableTss64, base, limit);
-    GDT[Selector::Tss.index()].store(low, Ordering::Relaxed);
-    GDT[Selector::Tss.index() + 1].store(high, Ordering::Relaxed);
-    cpu::load_gdt(
-        &GDT,
-        KERNEL_CS as u16,
-        KERNEL_DS as u16,
-        Selector::Tss.with_rpl(PrivilegeLevel::Kernel) as u16,
-    );
+    let [low, high] = system_descriptor(SystemSegment::AvailableTss64, tss.addr(), limit);
+    let index = tss_selector(cpu) as usize / Selector::ENTRY_SIZE;
+    GDT[index].store(low, Ordering::Relaxed);
+    GDT[index + 1].store(high, Ordering::Relaxed);
+    cpu::load_gdt(&GDT, KERNEL_CS as u16, KERNEL_DS as u16, tss_selector(cpu));
 }

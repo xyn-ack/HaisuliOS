@@ -686,8 +686,8 @@ fn ps() -> i32 {
         }
     };
     println!(
-        "{:>5} {:>5} {:>5} {:>5} {:<4} {}",
-        "PID", "PPID", "PGID", "SID", "STAT", "NAME"
+        "{:>5} {:>5} {:>5} {:>5} {:<4} {:>3} {}",
+        "PID", "PPID", "PGID", "SID", "STAT", "THR", "NAME"
     );
     for p in &procs[..n] {
         let stat = match p.state {
@@ -698,12 +698,13 @@ fn ps() -> i32 {
             _ => "?",
         };
         println!(
-            "{:>5} {:>5} {:>5} {:>5} {:<4} {}",
+            "{:>5} {:>5} {:>5} {:>5} {:<4} {:>3} {}",
             p.pid,
             p.ppid,
             p.pgid,
             p.sid,
             stat,
+            p.threads,
             p.name()
         );
     }

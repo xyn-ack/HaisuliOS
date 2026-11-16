@@ -9,12 +9,18 @@
 //! line]` notification to the owner. The driver services its device and re-enables the line with
 //! `irq_ack`. Lines without an owner stay masked.
 //!
-//! Interrupts are only ever enabled in user mode and while the scheduler idles
-//! ([`crate::task::schedule`]), never elsewhere in the kernel.
+//! The PICs deliver to the boot CPU only (through its local APIC's LINT0). The local APICs'
+//! own interrupts, the scheduler's tick and the reschedule IPI, arrive here too
+//! ([`interrupt_dispatch`]); on the way back to user mode, any of them may preempt the thread or
+//! make it enter an upcall, exactly as the end of a system call does.
+//!
+//! Interrupts are only ever enabled in user mode and while a CPU idles
+//! ([`crate::task::idle`]), never elsewhere in the kernel.
 
+use crate::arch::apic::{self, RESCHEDULE_VECTOR, SPURIOUS_VECTOR, TIMER_VECTOR};
 use crate::arch::cpu::Device::{self, Pic1, Pic2, PostCode};
-use crate::arch::entry::{stub_address, IRQ_STUBS};
-use crate::arch::x86::Exception;
+use crate::arch::entry::{stub_address, TrapFrame, APIC_STUBS, IRQ_STUBS};
+use crate::arch::x86::{Exception, PrivilegeLevel};
 use crate::{idt, task};
 use core::sync::atomic::{AtomicU64, Ordering};
 use haisuli_abi::errno::{EBUSY, EINVAL, EPERM};
@@ -105,6 +111,12 @@ pub(crate) fn init() {
     for (line, &stub) in IRQ_STUBS.iter().enumerate() {
         idt::set_handler(VECTOR_BASE + line, stub_address(stub));
     }
+    for (vector, &stub) in [TIMER_VECTOR, RESCHEDULE_VECTOR, SPURIOUS_VECTOR]
+        .iter()
+        .zip(APIC_STUBS.iter())
+    {
+        idt::set_handler(*vector as usize, stub_address(stub));
+    }
 }
 
 /// The PIC that `line` belongs to, and its bit in that PIC's registers.
@@ -135,8 +147,26 @@ fn end_of_interrupt(pic: Device) {
     pic.write8(Register::Command as u16, Command::EndOfInterrupt as u8);
 }
 
-/// Called (with interrupts disabled) by the IRQ stubs in `arch::entry`.
-pub(crate) extern "C" fn irq_dispatch(line: u64) {
+/// Called (with interrupts disabled) by the interrupt stubs in `arch::entry`, with the vector
+/// and the interrupted registers.
+pub(crate) extern "C" fn interrupt_dispatch(vector: u64, f: &mut TrapFrame) {
+    let pic_vectors = VECTOR_BASE as u64..(VECTOR_BASE + LINES) as u64;
+    match vector {
+        v if pic_vectors.contains(&v) => pic_interrupt(v - VECTOR_BASE as u64),
+        v if v == TIMER_VECTOR as u64 => {
+            apic::end_of_interrupt();
+            task::tick();
+        }
+        v if v == RESCHEDULE_VECTOR as u64 => apic::end_of_interrupt(),
+        _ => {} // Spurious: no end of interrupt.
+    }
+    if PrivilegeLevel::of_selector(f.cs) == PrivilegeLevel::User {
+        task::return_to_user(f, None);
+    }
+}
+
+/// PIC line `line` fired.
+fn pic_interrupt(line: u64) {
     // Spurious interrupts (raised without being in service) must not be
     // acknowledged on their own PIC.
     if line == Line::MasterSpurious as u64 && !in_service(Line::MasterSpurious) {

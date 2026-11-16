@@ -4,8 +4,8 @@
 //!
 //! Everything a HaisuliOS program needs to start, make system calls, print and panic.
 //!
-//! It provides the program entry point ([`entry!`]), system calls ([`sys`]), buffered console
-//! output ([`print!`] / [`println!`]) and a panic handler. Programs are `#![no_std]`, `#![no_main]`
+//! It provides the program entry point ([`entry!`]), system calls ([`sys`]), threads
+//! ([`thread`]), buffered console output ([`print!`] / [`println!`]) and a panic handler. Programs are `#![no_std]`, `#![no_main]`
 //! static executables linked at `USER_BASE` by `user/user.ld`.
 
 #![no_std]
@@ -14,6 +14,7 @@ pub use haisuli_abi as abi;
 
 pub mod io;
 pub mod sys;
+pub mod thread;
 
 /// What a new program is started with: its arguments and environment.
 ///

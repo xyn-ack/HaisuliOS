@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0
+
+[package]
+name = "smp_test"
+version = "0.3.0"
+edition = "2021"
+description = "HaisuliOS test program: multiple CPUs and threads"
+license = "GPL-2.0"
+
+[dependencies]
+haisuli-rt = { path = "../rt" }
+
+[lints]
+workspace = true

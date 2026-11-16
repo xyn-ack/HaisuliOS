@@ -9,6 +9,11 @@
 //! comes back in `rax` (a negative errno on failure). File and memory calls use the Linux x86_64
 //! numbers; HaisuliOS-native calls start at 0x1000. POSIX processes are not system calls: they are
 //! the process server's protocol, [`proc`].
+//!
+//! A *task* is an address space with one or more *threads*. Both have ids from the same range: a
+//! task's id is the id of the thread it started with (its *leader*), and stays its id after that
+//! thread has ended, until the task ends. IPC addresses tasks; calls are made, received and
+//! answered by threads.
 
 #![no_std]
 
@@ -32,7 +37,7 @@ pub mod nr {
     pub const CLOSE: u64 = 3;
     /// `(addr, len, prot, flags, fd, offset)`: maps anonymous memory; the kernel picks the address.
     pub const MMAP: u64 = 9;
-    /// `()`: lets the other ready tasks run.
+    /// `()`: lets the other ready threads run.
     pub const SCHED_YIELD: u64 = 24;
     /// `(fd)`: duplicates `fd` onto the lowest free descriptor.
     pub const DUP: u64 = 32;
@@ -55,11 +60,40 @@ pub mod nr {
     /// Returns the number of bytes filled, 0 at the end of the directory.
     pub const GETDENTS64: u64 = 217;
 
+    // Threads and CPUs, with Linux x86_64 numbers.
+
+    /// `(flags, stack, parent_tid, child_tid, tls)`: starts a thread in the caller's task.
+    ///
+    /// `flags` must be [`clone::THREAD_FLAGS`](super::clone::THREAD_FLAGS) (new processes come
+    /// from the process server's `fork`); the other arguments but `stack` are ignored. The new
+    /// thread shares the task's address space, file descriptors and everything else; it returns
+    /// 0 from this call on `stack`, with every other register as the caller had it. The caller
+    /// gets the new thread's id. Fails with `-EAGAIN` when no thread slot is free.
+    pub const CLONE: u64 = 56;
+    /// `(status)`: ends the calling thread (Linux `exit`, not `exit_group`).
+    ///
+    /// When the last thread of a task ends, the task ends as with [`TASK_EXIT`]. Programs end
+    /// their process through the process server instead (its `OP_EXIT`), which ends every thread.
+    pub const EXIT: u64 = 60;
+    /// `()`: the calling thread's id.
+    pub const GETTID: u64 = 186;
+    /// `(pid, len, mask)`: writes the set of CPUs the caller may run on (every online CPU, one
+    /// bit each) to `mask[..len]`.
+    ///
+    /// `pid` must be 0 (the caller: the kernel knows no pids). Returns the bytes written (8).
+    pub const SCHED_GETAFFINITY: u64 = 204;
+    /// `(cpu, node, cache)`: stores the number of the CPU the caller runs on (from 0) in `*cpu`,
+    /// and 0 in `*node`; either pointer may be null, `cache` is ignored.
+    pub const GETCPU: u64 = 309;
+
     // HaisuliOS-native microkernel calls.
 
     /// `(dest, word0, word1)`: sends an asynchronous, non-blocking notification to task `dest`.
     pub const IPC_SEND: u64 = 0x1000;
-    /// `(*mut [u64; 3])`: waits for a message and fills in `[sender, word0, word1]`.
+    /// `(*mut [u64; 4])`: waits for a message and fills in `[sender, word0, word1, task]`.
+    ///
+    /// For a call, `sender` is the calling thread (the one to reply to) and `task` its task; for
+    /// a notification both are the sending task (0 for the kernel).
     pub const IPC_RECV: u64 = 0x1001;
     /// `(dest, op, buf, len)`: sends a synchronous request to task `dest`.
     ///
@@ -67,7 +101,7 @@ pub mod nr {
     /// The server may read and write `buf[..len]` with [`IPC_READ`] /
     /// [`IPC_WRITE`] while the call is pending.
     pub const IPC_CALL: u64 = 0x1002;
-    /// `(client, status)`: completes a received call.
+    /// `(client, status)`: completes a received call; `client` is the calling thread.
     ///
     /// The client's [`IPC_CALL`] returns `status`.
     pub const IPC_REPLY: u64 = 0x1003;
@@ -100,35 +134,40 @@ pub mod nr {
     pub const SVC_WAIT: u64 = 0x100D;
     /// `()`: returns the caller's task id.
     pub const TASK_SELF: u64 = 0x100E;
-    /// `()`: ends the calling task.
+    /// `()`: ends the calling task, every thread of it.
     ///
     /// The task manager is told with [`KMSG_TASK_EXIT`](super::KMSG_TASK_EXIT). Programs end
     /// through the process server instead (its `OP_EXIT`); this is for when there is none.
     pub const TASK_EXIT: u64 = 0x1010;
-    /// `(tid)`: creates a copy of task `tid`, which must be blocked in a call to the caller.
+    /// `(thread)`: creates a copy of the task of `thread`, which must be blocked in a call to
+    /// the caller.
     ///
-    /// The copy gets a copy of the address space, the registers and the file descriptors, but no
-    /// privileges; its pending call returns 0. Returns the new task's id. Task manager only.
+    /// The copy gets a copy of the address space and the file descriptors, but no privileges,
+    /// and one thread: a copy of `thread`, whose pending call returns 0. Returns the new task's
+    /// id. Task manager only.
     pub const TASK_FORK: u64 = 0x1011;
-    /// `(tid)`: ends task `tid` at once. Task manager only.
+    /// `(tid)`: ends task `tid` at once, every thread of it, wherever they run. Task manager
+    /// only.
     pub const TASK_KILL: u64 = 0x1012;
-    /// `(tid)`: stops scheduling task `tid`, wherever it is. Task manager only.
+    /// `(tid)`: stops scheduling the threads of task `tid`, wherever they are. Task manager only.
     pub const TASK_STOP: u64 = 0x1013;
     /// `(tid)`: schedules a stopped task again. Task manager only.
     pub const TASK_CONT: u64 = 0x1014;
-    /// `(tid, *const [u64; upcall::WORDS])`: makes task `tid` enter a handler.
+    /// `(tid, *const [u64; upcall::WORDS])`: makes a thread of task `tid` enter a handler.
     ///
     /// See [`upcall`](super::upcall). Fails with `-EBUSY` while an earlier upcall for the task
     /// has not been entered yet. Task manager only.
     pub const TASK_UPCALL: u64 = 0x1015;
     /// `(tid, buf, len)`: fills `buf` with a [`TaskInfo`](super::TaskInfo) about task `tid`.
     pub const TASK_INFO: u64 = 0x1016;
-    /// `(tid, block, len, flags)`: makes task `tid` run a program from the file system.
+    /// `(thread, block, len, flags)`: makes the task of `thread` run a program from the file
+    /// system.
     ///
     /// `block[..len]` is an [argument block](super::exec) naming the program and its arguments.
-    /// `tid` must be blocked in a call to the caller, which it leaves for the new program's entry
-    /// point. The task keeps its id and its file descriptors; everything else starts afresh (see
-    /// [`exec`](super::exec)). Task manager only.
+    /// `thread` must be blocked in a call to the caller, which it leaves for the new program's
+    /// entry point; the task's other threads end. The task keeps its id and its file
+    /// descriptors; everything else starts afresh (see [`exec`](super::exec)). Task manager
+    /// only.
     pub const TASK_EXEC: u64 = 0x1018;
     /// `(block, len, flags)`: starts a program from the file system as a new task.
     ///
@@ -137,6 +176,29 @@ pub mod nr {
     pub const TASK_SPAWN: u64 = 0x1019;
     /// `()`: powers the machine off. Privileged tasks only.
     pub const POWER_OFF: u64 = 0x1017;
+    /// `(buf, len)`: sends `buf[..len]` as it is out of the serial line that the kernel's debug
+    /// log uses (COM1). Privileged tasks only.
+    ///
+    /// The kernel is the line's one transmitter: what one call sends never mixes with the
+    /// kernel's log lines, nor with the output of other CPUs. The console server sends the
+    /// terminal's output this way (it still drives the rest of the UART itself).
+    pub const SERIAL_WRITE: u64 = 0x101A;
+}
+
+/// The flags of [`nr::CLONE`] (Linux values).
+pub mod clone {
+    /// Share the address space.
+    pub const CLONE_VM: u64 = 0x100;
+    /// Share the file system information (root, current directory).
+    pub const CLONE_FS: u64 = 0x200;
+    /// Share the file descriptors.
+    pub const CLONE_FILES: u64 = 0x400;
+    /// Share the signal dispositions.
+    pub const CLONE_SIGHAND: u64 = 0x800;
+    /// Be a thread of the same process.
+    pub const CLONE_THREAD: u64 = 0x1_0000;
+    /// A thread of the caller's task: what HaisuliOS's `clone` does, and all it does.
+    pub const THREAD_FLAGS: u64 = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
 }
 
 /// Error numbers (Linux values), returned negated.
@@ -363,14 +425,18 @@ pub mod exec {
 /// to whoever manages signal masks. The restorer ends with [`nr::RT_SIGRETURN`], which restores
 /// the registers saved in the frame.
 ///
-/// Posting an upcall also ends an interruptible wait of the task (`ipc_recv`, `svc_wait` or a
-/// terminal `read`) with `-EINTR`.
+/// Posting an upcall also ends an interruptible wait of the thread that takes it (`ipc_recv`,
+/// `svc_wait` or a terminal `read`) with `-EINTR`. The thread enters the handler when it next
+/// returns to user mode: at the end of a system call, or of an interrupt.
 pub mod upcall {
     /// Words in an upcall request.
     pub const WORDS: usize = 6;
     /// Flag: if the system call the task returns from fails with `-EINTR`, make it again after
     /// the handler (POSIX `SA_RESTART`).
     pub const RESTART: u64 = 1;
+    /// Flag: `tid` names a thread of the task, the one to enter the handler. Otherwise the kernel
+    /// picks one: a thread in an interruptible wait, else one that is running or ready, else any.
+    pub const THREAD: u64 = 2;
     /// Where `uc_sigmask` (the `mask` of the request) is, counted from the `ucontext`.
     ///
     /// When the handler returns to the restorer, the stack pointer points at the `ucontext`.
@@ -393,17 +459,21 @@ pub mod task_state {
 /// across the system call boundary.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TaskInfo {
-    /// One of [`task_state`].
+    /// One of [`task_state`]: [`STOPPED`](task_state::STOPPED) if the task is stopped, else
+    /// [`READY`](task_state::READY) if a thread of it runs or may run, else
+    /// [`BLOCKED`](task_state::BLOCKED).
     pub state: u64,
-    /// Whether an upcall waits to be entered: the task has not returned to user mode since the
-    /// upcall was requested.
+    /// Whether an upcall waits to be entered: no thread of the task has returned to user mode
+    /// since the upcall was requested.
     pub upcall: bool,
+    /// How many threads the task has.
+    pub threads: u64,
     /// The program name, NUL-padded.
     pub name: [u8; PROC_NAME_LEN],
 }
 
 /// Serialised size of a [`TaskInfo`].
-pub const TASK_INFO_LEN: usize = 2 * 8 + PROC_NAME_LEN;
+pub const TASK_INFO_LEN: usize = 3 * 8 + PROC_NAME_LEN;
 
 impl TaskInfo {
     /// Serialises the entry.
@@ -411,7 +481,8 @@ impl TaskInfo {
         let mut b = [0u8; TASK_INFO_LEN];
         b[..8].copy_from_slice(&self.state.to_ne_bytes());
         b[8..16].copy_from_slice(&(self.upcall as u64).to_ne_bytes());
-        b[16..].copy_from_slice(&self.name);
+        b[16..24].copy_from_slice(&self.threads.to_ne_bytes());
+        b[24..].copy_from_slice(&self.name);
         b
     }
 
@@ -423,10 +494,11 @@ impl TaskInfo {
             u64::from_ne_bytes(w)
         };
         let mut name = [0u8; PROC_NAME_LEN];
-        name.copy_from_slice(&b[16..]);
+        name.copy_from_slice(&b[24..]);
         TaskInfo {
             state: word(0),
             upcall: word(1) != 0,
+            threads: word(2),
             name,
         }
     }
@@ -603,6 +675,8 @@ pub struct ProcInfo {
     pub sid: u64,
     /// One of [`proc_state`].
     pub state: u64,
+    /// How many threads the process has (0 for a zombie).
+    pub threads: u64,
     /// The program name, NUL-padded.
     pub name: [u8; PROC_NAME_LEN],
 }
@@ -610,19 +684,24 @@ pub struct ProcInfo {
 /// Length of a process name in a [`ProcInfo`].
 pub const PROC_NAME_LEN: usize = 16;
 /// Serialised size of a [`ProcInfo`].
-pub const PROC_INFO_LEN: usize = 5 * 8 + PROC_NAME_LEN;
+pub const PROC_INFO_LEN: usize = 6 * 8 + PROC_NAME_LEN;
 
 impl ProcInfo {
     /// Serialises the entry.
     pub fn to_bytes(&self) -> [u8; PROC_INFO_LEN] {
         let mut b = [0u8; PROC_INFO_LEN];
-        for (i, v) in [self.pid, self.ppid, self.pgid, self.sid, self.state]
-            .iter()
-            .enumerate()
-        {
+        let words = [
+            self.pid,
+            self.ppid,
+            self.pgid,
+            self.sid,
+            self.state,
+            self.threads,
+        ];
+        for (i, v) in words.iter().enumerate() {
             b[i * 8..i * 8 + 8].copy_from_slice(&v.to_ne_bytes());
         }
-        b[40..].copy_from_slice(&self.name);
+        b[48..].copy_from_slice(&self.name);
         b
     }
 
@@ -634,13 +713,14 @@ impl ProcInfo {
             u64::from_ne_bytes(w)
         };
         let mut name = [0u8; PROC_NAME_LEN];
-        name.copy_from_slice(&b[40..]);
+        name.copy_from_slice(&b[48..]);
         ProcInfo {
             pid: word(0),
             ppid: word(1),
             pgid: word(2),
             sid: word(3),
             state: word(4),
+            threads: word(5),
             name,
         }
     }

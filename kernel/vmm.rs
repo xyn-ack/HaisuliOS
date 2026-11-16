@@ -23,6 +23,16 @@
 use crate::arch::x86::PageFlag;
 use crate::arch::{boot, cpu, phys};
 use crate::pmm::{self, PAGE_SIZE};
+use crate::sync::Lock;
+
+/// Serialises the changes to user page tables and the walks that copy them.
+///
+/// The threads of a task share its page tables: two of them mapping memory at once could both
+/// find a table missing and both install one, and a `task_fork` could copy tables that another
+/// thread changes. Reading them (translating user addresses) needs no lock: entries are only
+/// ever added while an address space is in use, each with one atomic write, and an address space
+/// is only destroyed once nothing uses it.
+static MAP_LOCK: Lock<()> = Lock::new(());
 
 /// The bits of a page-table entry that hold the physical address it points to.
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -84,8 +94,11 @@ fn idx(virt: u64, level: usize) -> usize {
     ((virt >> shift(level)) as usize) & (TABLE_ENTRIES - 1)
 }
 
+/// Makes `pml4` this CPU's address space (unless it is already).
 pub(crate) fn switch(pml4: u64) {
-    cpu::set_page_table(pml4);
+    if cpu::page_table() != pml4 {
+        cpu::set_page_table(pml4);
+    }
 }
 
 /// Create an address space that shares the kernel mapping and has no user pages.
@@ -104,7 +117,7 @@ pub(crate) fn new_address_space() -> Option<u64> {
 ///
 /// Panics if `frame` is not an allocator frame: user space must never see
 /// kernel memory.
-pub(crate) fn map_user(pml4: u64, virt: u64, frame: u64, flags: u64) -> Result<(), ()> {
+fn map_user(pml4: u64, virt: u64, frame: u64, flags: u64) -> Result<(), ()> {
     if !(USER_BASE..USER_LIMIT).contains(&virt) || virt & PAGE_OFFSET != 0 {
         return Err(());
     }
@@ -145,6 +158,7 @@ pub(crate) fn map_user(pml4: u64, virt: u64, frame: u64, flags: u64) -> Result<(
 /// zero. Fails if out of memory or if a page is already mapped; pages mapped
 /// before the failure stay mapped (they are freed with the address space).
 pub(crate) fn map_init(pml4: u64, virt: u64, size: u64, data: &[u8], flags: u64) -> Result<(), ()> {
+    let _serialised = MAP_LOCK.lock();
     let end = virt.checked_add(size).ok_or(())?;
     if (data.len() as u64) > size {
         return Err(());
@@ -311,6 +325,7 @@ fn for_each_user_page(pml4: u64, mut f: impl FnMut(u64, u64)) {
 /// Deep-copy all user pages (used by `task_fork`; no copy-on-write yet).
 pub(crate) fn clone_user_space(src: u64) -> Option<u64> {
     let dst = new_address_space()?;
+    let serialised = MAP_LOCK.lock();
     let mut ok = true;
     for_each_user_page(src, |virt, e| {
         if !ok {
@@ -327,6 +342,7 @@ pub(crate) fn clone_user_space(src: u64) -> Option<u64> {
             ok = false;
         }
     });
+    drop(serialised);
     if !ok {
         destroy_user_space(dst);
         return None;

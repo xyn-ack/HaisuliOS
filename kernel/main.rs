@@ -4,8 +4,9 @@
 //!
 //! A bare-bones x86_64 microkernel that provides mechanisms and leaves policy to user space.
 //!
-//! The kernel provides physical and virtual memory, tasks with private address spaces, a
-//! scheduler, message-passing IPC and a small Linux-flavoured system call ABI. Policy and drivers
+//! The kernel provides physical and virtual memory, tasks with private address spaces and any
+//! number of threads, a preemptive scheduler for every CPU of the machine, message-passing IPC
+//! and a small Linux-flavoured system call ABI. Policy and drivers
 //! live in user-space servers that the boot loader hands over as Multiboot modules (see `user/`):
 //! POSIX processes, for one, are implemented by the process server on top of the kernel's tasks.
 //!
@@ -35,9 +36,9 @@ mod task;
 mod upcall;
 mod vmm;
 
-use arch::{cpu, multiboot};
+use arch::{acpi, apic, cpu, multiboot, smp};
 
-/// Called by `arch::boot` once the CPU is in 64-bit mode.
+/// Called by `arch::boot` once the boot CPU is in 64-bit mode.
 pub fn kmain() -> ! {
     serial::init();
     println!(
@@ -51,15 +52,49 @@ pub fn kmain() -> ! {
     idt::init();
     pmm::init();
     irq::init();
+    apic::init(true);
+    apic::calibrate_timer();
     syscall::init();
+    task::cpu_online(apic::id());
     task::spawn_boot_modules();
+    start_cpus();
     println!("[kernel] entering user space");
     task::start()
 }
 
+/// Starts the other CPUs that the firmware lists, and reports how many run.
+fn start_cpus() {
+    let (ids, n) = acpi::cpus();
+    let running = smp::start_cpus(&ids[..n]);
+    // Each one says it is online (`ap_main`) right after it starts.
+    while task::cpus_online() < running {
+        core::hint::spin_loop();
+    }
+    println!(
+        "[kernel] {} CPU{} online",
+        running,
+        if running == 1 { "" } else { "s" }
+    );
+}
+
+/// Called by `arch::smp` on every other CPU, once it is in 64-bit mode: sets the CPU up like the
+/// boot CPU, then idles until there are threads to run.
+pub fn ap_main(_cpu: usize) -> ! {
+    gdt::init();
+    idt::load();
+    apic::init(false);
+    syscall::init();
+    task::cpu_online(apic::id());
+    task::idle()
+}
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
-    println!("\n*** KERNEL PANIC ***\n{}", info);
+    serial::panic_print(format_args!(
+        "\n*** KERNEL PANIC (CPU {}) ***\n{}\n",
+        arch::percpu::index(),
+        info
+    ));
     cpu::qemu_exit(1);
     cpu::halt()
 }

@@ -32,8 +32,15 @@ def test_kernel_starts_init_and_console_server(sh):
     assert "[console] serving COM1 (IRQ 4)\n" in out
 
 
+# Servers log to the same serial line, so their lines can appear anywhere: also between the motd
+# and the prompt, even between two pieces of the motd (on several CPUs, they run at the same time
+# as init).
+LOG_LINE = re.compile(r"\[(?:kernel|proc|console)\] [^\n]*\n")
+
+
 def test_motd_is_shown_before_the_first_prompt(sh):
-    assert sh.boot_output.endswith("\n" + read_rootfs("etc/motd") + PROMPT)
+    out = LOG_LINE.sub("", sh.boot_output)
+    assert out.endswith("\n" + read_rootfs("etc/motd") + PROMPT), out
 
 
 def test_motd_appears_exactly_once(sh):

@@ -4,6 +4,58 @@ What changed in each version of HaisuliOS. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the goals and the
 roadmap are in [TODO.md](TODO.md).
 
+## 0.3.0
+
+Multiple CPUs, threads and preemption. The kernel runs on every CPU of the machine, a task can
+have any number of threads, and the scheduler preempts; the process server makes threads POSIX
+(one pid, one exit, signals), and the runtime gives programs `thread::spawn` and `join`. The tests
+came first (`test_smp.py`).
+
+### Added
+
+- SMP: the boot CPU starts the other CPUs listed in the ACPI MADT (up to 16) through a real-mode
+  trampoline, and logs how many run (`[kernel] 4 CPUs online`). Every CPU has a per-CPU block
+  (GS, `swapgs`), its own TSS and `syscall` stack, a local APIC timer and an idle context; CPUs
+  wake each other with a reschedule IPI.
+- Preemption: the APIC timer ticks every 10 ms; a thread that has run for its quantum (two ticks)
+  while another waits gives way on its way back to user mode. Upcalls are entered on every way
+  back to user mode, after interrupts too.
+- Threads, with the Linux calls (and numbers) `clone` (56, `clone::THREAD_FLAGS` only), `exit`
+  (60, of one thread), `gettid` (186), `sched_getaffinity` (204) and `getcpu` (309). A task ends
+  when its last thread does, and all its threads end with it.
+- `serial_write` (0x101A): the console server's output goes through the kernel's transmitter, so
+  it never mixes with the kernel's log lines on several CPUs.
+- The runtime: `thread::spawn`, `Thread::join`, `sys::gettid`, `getcpu`, `sched_getaffinity`,
+  `nprocs`, `thread_exit`, `mmap` and `serial_write`.
+- The process server handles threads: any thread may make requests; `fork` copies the calling
+  thread only; `execve` ends the other threads; several threads may wait in `pause` or `wait4`;
+  a caught signal goes to a waiting thread (whose wait it ends), and runs before the reply to a
+  request of its process (POSIX's rule for `sigprocmask` and `kill` to oneself).
+- `/bin/nproc`; `ps` shows the threads of every process (`THR`); `make run CPUS=4`.
+- Tests: `test_smp.py`, explicit tests of multiple CPUs and threads (run with
+  `make check TEST_EXPLICIT="smp"`), and the test program `/bin/smp_test` (`user/smp_test`).
+- Test runner: the `@cpus(n)` decorator (`haisuli.cpus`) boots a test's machine with `n` CPUs;
+  `--cpus N` (e.g. `make check TEST_ARGS="--cpus 4"`) sets the number for every other test; a test
+  that asks for `n` CPUs holds `n` of the host's while it runs (`--cpu-budget`).
+
+### Changed
+
+- A task is an address space with one or more threads; thread and task ids share one range (a
+  task's id is its first thread's), and are handed out round robin. `MAX_THREADS` is 64; still
+  at most 16 tasks.
+- `ipc_recv` fills in four words, `[sender, a, b, task]`: for a call, the calling thread (to reply
+  to) and its task. `task_fork` and `task_exec` take the calling thread; `task_upcall` takes a
+  thread with the new `upcall::THREAD` flag. `TaskInfo` and `ProcInfo` report thread counts.
+- `Lock` is a ticket spinlock (it still panics on re-entrant use); the kernel log takes a lock per
+  message. A dying task's memory and descriptors are freed once no CPU uses them any more.
+- The console server sends its output with `serial_write` instead of its own port I/O (it still
+  owns the UART's input).
+
+### Fixed
+
+- The frame allocator could give the same frame to two CPUs at once.
+- The test harness left QEMU running when a machine never reached its first prompt.
+
 ## 0.2.0
 
 POSIX process management moves out of the kernel into a user-space process

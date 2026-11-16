@@ -46,13 +46,26 @@ class Config:
     kernel = "build/haisulios.elf32"
     modules = "build/init,build/proc,build/initrd.tar"
     timeout = 15.0  # Seconds to wait for any expected output.
+    cpus = None  # CPUs of a machine whose test does not ask for a number (None: QEMU's default, 1).
+
+
+def cpus(n):
+    """Decorator: the test runs on a machine with `n` CPUs (QEMU's `-smp n`)."""
+    def mark(test):
+        test.cpus = n
+        return test
+    return mark
 
 
 class Machine:
-    """One QEMU instance running HaisuliOS, booted to the first prompt."""
+    """One QEMU instance running HaisuliOS, booted to the first prompt.
 
-    def __init__(self, config=Config):
+    It has `cpus` CPUs, or `config.cpus` if that is None.
+    """
+
+    def __init__(self, config=Config, cpus=None):
         self.config = config
+        self.cpus = cpus if cpus is not None else config.cpus
         # Everything the console printed so far, decoded, with the terminal's
         # CR LF line ends turned into LF.
         self._text = ""
@@ -74,6 +87,8 @@ class Machine:
             "-no-reboot",
             "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
         ]
+        if self.cpus is not None:
+            cmd += ["-smp", str(self.cpus)]
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
@@ -82,8 +97,13 @@ class Machine:
         self._stderr = b""
         self._err_reader = threading.Thread(target=self._read_stderr, daemon=True)
         self._err_reader.start()
-        # Everything up to and including the first prompt.
-        self.boot_output = self.expect(PROMPT)
+        # Everything up to and including the first prompt. If it never comes, nobody gets this
+        # machine to close: stop QEMU here.
+        try:
+            self.boot_output = self.expect(PROMPT)
+        except BaseException:
+            self.close()
+            raise
 
     # ---- plumbing ---------------------------------------------------------
 

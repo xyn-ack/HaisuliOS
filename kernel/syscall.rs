@@ -15,15 +15,16 @@ use crate::fs::{self, Transfer};
 use crate::task::{self, Access, Why};
 use crate::{irq, serial, vmm};
 use haisuli_abi::console::{OP_READ, OP_WRITE};
-use haisuli_abi::errno::{EBADF, EFAULT, ENAMETOOLONG, ENOSYS};
+use haisuli_abi::errno::{EBADF, EFAULT, ENAMETOOLONG, ENOSYS, EPERM};
 use haisuli_abi::fcntl::PATH_MAX;
 use haisuli_abi::nr;
 
+/// Enables system calls on this CPU.
 pub(crate) fn init() {
     entry::init_syscalls();
 }
 
-/// Kernel stack for the next `syscall` (the running task's).
+/// Kernel stack for the next `syscall` on this CPU (the running thread's).
 pub(crate) fn set_kernel_stack(top: u64) {
     entry::set_syscall_stack(top);
 }
@@ -31,8 +32,8 @@ pub(crate) fn set_kernel_stack(top: u64) {
 /// Called by `syscall_entry` in `arch::entry` with the saved user registers;
 /// the result goes back in rax.
 ///
-/// On the way back to user mode it enters the caller's pending upcall, if
-/// any, which redirects `f` to a handler.
+/// On the way back to user mode it takes the last step of [`task::return_to_user`]: the
+/// thread may end, wait, or enter its pending upcall, which redirects `f` to a handler.
 pub(crate) extern "C" fn syscall_dispatch(f: &mut TrapFrame) {
     let nr = f.rax;
     let (a0, a1, a2, a3) = (f.rdi, f.rsi, f.rdx, f.r10);
@@ -47,6 +48,11 @@ pub(crate) extern "C" fn syscall_dispatch(f: &mut TrapFrame) {
         nr::GETDENTS64 => sys_getdents64(a0, a1, a2),
         nr::MMAP => task::mmap(a1, a2),
         nr::SCHED_YIELD => task::yield_now(),
+        nr::CLONE => task::clone(f, a0, a1),
+        nr::EXIT => task::thread_exit(),
+        nr::GETTID => task::gettid(),
+        nr::GETCPU => task::getcpu(a0, a1),
+        nr::SCHED_GETAFFINITY => task::sched_getaffinity(a0, a1, a2),
         nr::RT_SIGRETURN => task::rt_sigreturn(f),
         nr::IOPERM => task::ioperm(a0, a1, a2),
         nr::IPC_SEND => task::ipc_send(a0, a1, a2),
@@ -61,6 +67,7 @@ pub(crate) extern "C" fn syscall_dispatch(f: &mut TrapFrame) {
         nr::SVC_LOOKUP => task::svc_lookup(a0),
         nr::SVC_WAIT => task::svc_wait(a0),
         nr::DEBUG_LOG => sys_debug_log(a0, a1),
+        nr::SERIAL_WRITE => sys_serial_write(a0, a1),
         nr::TASK_SELF => task::current_tid() as i64,
         nr::TASK_EXIT => task::end_current(Why::Exit),
         nr::TASK_FORK => task::task_fork(a0),
@@ -75,7 +82,7 @@ pub(crate) extern "C" fn syscall_dispatch(f: &mut TrapFrame) {
         _ => -ENOSYS,
     };
     f.rax = ret as u64;
-    task::return_to_user(f, nr);
+    task::return_to_user(f, Some(nr));
 }
 
 /// Reads from a file descriptor (the `read` system call).
@@ -95,7 +102,7 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> i64 {
     if len == 0 {
         return 0;
     }
-    match fs::read(ofd, pml4, buf, len) {
+    match fs::read(ofd.index(), pml4, buf, len) {
         Transfer::Done(n) => n,
         Transfer::Console => task::console_call(OP_READ, buf, len, Access::WriteOnly),
     }
@@ -115,7 +122,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
     if len == 0 {
         return 0;
     }
-    match fs::write(ofd, pml4, buf, len) {
+    match fs::write(ofd.index(), pml4, buf, len) {
         Transfer::Done(n) => n,
         Transfer::Console => task::console_call(OP_WRITE, buf, len, Access::ReadOnly),
     }
@@ -139,7 +146,7 @@ fn sys_getdents64(fd: u64, buf: u64, len: u64) -> i64 {
     if !vmm::user_range_ok(pml4, buf, len, true) {
         return -EFAULT;
     }
-    fs::getdents(ofd, pml4, buf, len)
+    fs::getdents(ofd.index(), pml4, buf, len)
 }
 
 /// Copies the NUL-terminated string at user address `ptr` into `buf` and
@@ -166,21 +173,41 @@ fn user_string(ptr: u64, buf: &mut [u8]) -> Result<usize, i64> {
 ///
 /// It never blocks, so servers and panic handlers can always report problems.
 fn sys_debug_log(buf: u64, len: u64) -> i64 {
+    serial_out(buf, len, false)
+}
+
+/// Sends bytes out of the serial line as they are (the `serial_write` system call);
+/// privileged tasks only (the console server).
+fn sys_serial_write(buf: u64, len: u64) -> i64 {
+    if !task::current_privileged() {
+        return -EPERM;
+    }
+    serial_out(buf, len, true)
+}
+
+/// Writes user memory `buf[..len]` to the serial line as one message: as it is (`raw`), or as
+/// log text (`\n` becomes `\r\n`).
+fn serial_out(buf: u64, len: u64, raw: bool) -> i64 {
     /// Most bytes one call writes; more is cut off (a log line, not a file).
-    const DEBUG_LOG_MAX: u64 = 4096;
-    let len = len.min(DEBUG_LOG_MAX);
+    const SERIAL_OUT_MAX: u64 = 4096;
+    let len = len.min(SERIAL_OUT_MAX);
     let pml4 = task::current_pml4();
     if !vmm::user_range_ok(pml4, buf, len, false) {
         return -EFAULT;
     }
     let mut chunk = [0u8; 256];
     let mut done = 0;
+    let mut log = serial::lock(); // One message, even from several CPUs at once.
     while done < len {
         let n = (len - done).min(chunk.len() as u64) as usize;
         if !vmm::copy_from_user(pml4, buf + done, &mut chunk[..n]) {
             return -EFAULT;
         }
-        serial::write_bytes(&chunk[..n]);
+        if raw {
+            log.write_raw(&chunk[..n]);
+        } else {
+            log.write_bytes(&chunk[..n]);
+        }
         done += n as u64;
     }
     len as i64

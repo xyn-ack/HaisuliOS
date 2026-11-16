@@ -90,6 +90,20 @@ enum Sys<'a> {
         buf: &'a mut [u8],
     },
     Yield,
+    /// Ends the calling thread.
+    ThreadExit,
+    GetTid,
+    /// The kernel writes both.
+    GetCpu {
+        cpu: &'a mut u32,
+        node: &'a mut u32,
+    },
+    /// The kernel writes the mask.
+    SchedGetAffinity(&'a mut [u8; 8]),
+    Mmap {
+        len: u64,
+        prot: u64,
+    },
     Ioperm {
         from: u64,
         num: u64,
@@ -127,6 +141,7 @@ enum Sys<'a> {
     SvcLookup(u64),
     SvcWait(u64),
     DebugLog(&'a [u8]),
+    SerialWrite(&'a [u8]),
     TaskSelf,
     TaskExit,
     TaskFork(u64),
@@ -183,6 +198,17 @@ fn invoke(call: Sys<'_>) -> i64 {
             (nr::GETDENTS64, [fd, p, l, 0])
         }
         Sys::Yield => (nr::SCHED_YIELD, [0; 4]),
+        Sys::ThreadExit => (nr::EXIT, [0; 4]),
+        Sys::GetTid => (nr::GETTID, [0; 4]),
+        Sys::GetCpu { cpu, node } => (
+            nr::GETCPU,
+            [cpu as *mut u32 as u64, node as *mut u32 as u64, 0, 0],
+        ),
+        Sys::SchedGetAffinity(mask) => (
+            nr::SCHED_GETAFFINITY,
+            [0, mask.len() as u64, mask.as_mut_ptr() as u64, 0],
+        ),
+        Sys::Mmap { len, prot } => (nr::MMAP, [0, len, prot, 0]),
         Sys::Ioperm { from, num, on } => (nr::IOPERM, [from, num, on as u64, 0]),
         Sys::IpcSend { dest, a, b } => (nr::IPC_SEND, [dest, a, b, 0]),
         Sys::IpcRecv(m) => (nr::IPC_RECV, [m as *mut Message as u64, 0, 0, 0]),
@@ -215,6 +241,10 @@ fn invoke(call: Sys<'_>) -> i64 {
         Sys::DebugLog(msg) => {
             let (p, l) = ro(msg);
             (nr::DEBUG_LOG, [p, l, 0, 0])
+        }
+        Sys::SerialWrite(bytes) => {
+            let (p, l) = ro(bytes);
+            (nr::SERIAL_WRITE, [p, l, 0, 0])
         }
         Sys::TaskSelf => (nr::TASK_SELF, [0; 4]),
         Sys::TaskExit => (nr::TASK_EXIT, [0; 4]),
@@ -603,11 +633,58 @@ pub fn getppid() -> u64 {
     proc_call(OP_GETPPID, &mut []).unwrap_or(0)
 }
 
-// ---- Tasks ----
+// ---- Tasks, threads and CPUs ----
 
-/// Lets the other ready tasks run.
+/// Lets the other ready threads run.
 pub fn sched_yield() {
     invoke(Sys::Yield);
+}
+
+/// Returns the calling thread's id (the kernel's; see [`crate::thread`]).
+pub fn gettid() -> u64 {
+    invoke(Sys::GetTid) as u64
+}
+
+/// Returns the number of the CPU the calling thread runs on (from 0).
+///
+/// It may run on another one by the time this returns.
+pub fn getcpu() -> Result<u64> {
+    let (mut cpu, mut node) = (0, 0);
+    check(invoke(Sys::GetCpu {
+        cpu: &mut cpu,
+        node: &mut node,
+    }))?;
+    Ok(cpu as u64)
+}
+
+/// Returns the CPUs the caller may run on, one bit each (Linux `sched_getaffinity` for the
+/// caller itself): every online CPU.
+pub fn sched_getaffinity() -> Result<u64> {
+    let mut mask = [0u8; 8];
+    check(invoke(Sys::SchedGetAffinity(&mut mask)))?;
+    Ok(u64::from_ne_bytes(mask))
+}
+
+/// Returns how many CPUs are online, as POSIX `sysconf(_SC_NPROCESSORS_ONLN)` does (at least 1).
+pub fn nprocs() -> usize {
+    sched_getaffinity().map_or(1, |mask| mask.count_ones().max(1) as usize)
+}
+
+/// Ends the calling thread only (Linux `exit`; [`exit`] ends the whole process).
+///
+/// If it is the last thread of the process, the process ends with status 0.
+pub fn thread_exit() -> ! {
+    invoke(Sys::ThreadExit);
+    unreachable!("thread_exit returned")
+}
+
+/// Maps `len` bytes of fresh, zeroed memory (`prot` takes [`crate::abi::mman`] flags) and
+/// returns its address; the kernel picks it.
+///
+/// The memory is not a Rust object: it stays mapped for the life of the process (there is no
+/// `munmap` yet), and what the caller does with it is up to the caller.
+pub fn mmap(len: u64, prot: u64) -> Result<u64> {
+    check(invoke(Sys::Mmap { len, prot }))
 }
 
 /// Grants (or revokes) access to I/O ports `[from, from + num)`.
@@ -622,18 +699,21 @@ pub fn ioperm(from: u64, num: u64, turn_on: bool) -> Result<()> {
 
 // ---- IPC ----
 
-/// A received message: `[sender, a, b]`.
+/// A received message: `[sender, a, b, task]`.
 ///
 /// For a call, `a` is the operation and `b` the length of the client's buffer.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct Message {
-    /// The sending process, or [`PID_KERNEL`](crate::abi::PID_KERNEL) for kernel notifications.
+    /// Who sent it: for a call, the calling thread (reply to it); for a notification, the sending
+    /// task, or [`PID_KERNEL`](crate::abi::PID_KERNEL) for the kernel's.
     pub sender: u64,
     /// The first word (the operation, for a call).
     pub a: u64,
     /// The second word (the buffer length, for a call).
     pub b: u64,
+    /// The sender's task (for a call, the calling thread's; 0 for the kernel).
+    pub task: u64,
 }
 
 /// Sends the asynchronous notification `[a, b]` to `dest`.
@@ -654,7 +734,7 @@ pub fn ipc_call(dest: u64, op: u64, buf: &mut [u8]) -> Result<u64> {
     check(invoke(Sys::IpcCall { dest, op, buf }))
 }
 
-/// Completes `client`'s call, whose `ipc_call` then returns `status`.
+/// Completes the call of thread `client`, whose `ipc_call` then returns `status`.
 ///
 /// Negative values are seen as errors by the client.
 pub fn ipc_reply(client: u64, status: i64) -> Result<()> {
@@ -713,6 +793,12 @@ pub fn debug_log(msg: &[u8]) {
     invoke(Sys::DebugLog(msg));
 }
 
+/// Sends `bytes` as they are out of the kernel's serial line, in one piece (privileged; see
+/// [`crate::abi::nr::SERIAL_WRITE`]).
+pub fn serial_write(bytes: &[u8]) -> Result<()> {
+    check(invoke(Sys::SerialWrite(bytes))).map(drop)
+}
+
 // ---- Task control (the process server's mechanisms) ----
 
 /// Returns the calling task's id (the kernel's, not a POSIX pid).
@@ -726,8 +812,8 @@ pub fn task_exit() -> ! {
     unreachable!("task_exit returned")
 }
 
-/// Creates a copy of task `tid`, which is blocked in a call to the caller,
-/// and returns the copy's id (task manager only).
+/// Creates a copy of the task of thread `tid`, which is blocked in a call to the caller,
+/// and returns the copy's id; the copy has one thread, a copy of `tid` (task manager only).
 pub fn task_fork(tid: u64) -> Result<u64> {
     check(invoke(Sys::TaskFork(tid)))
 }
@@ -747,7 +833,8 @@ pub fn task_cont(tid: u64) -> Result<()> {
     check(invoke(Sys::TaskCont(tid))).map(drop)
 }
 
-/// Makes task `tid` enter a handler (task manager only; see [`crate::abi::upcall`]).
+/// Makes a thread of task `tid` enter a handler (task manager only; see
+/// [`crate::abi::upcall`]).
 pub fn task_upcall(tid: u64, request: &[u64; upcall::WORDS]) -> Result<()> {
     check(invoke(Sys::TaskUpcall { tid, request })).map(drop)
 }
@@ -759,8 +846,9 @@ pub fn task_info(tid: u64) -> Result<TaskInfo> {
     Ok(TaskInfo::from_bytes(&buf))
 }
 
-/// Makes task `tid`, blocked in a call to the caller, run the program that
-/// argument block `block` names (task manager only; see [`crate::abi::exec`]).
+/// Makes the task of thread `tid`, blocked in a call to the caller, run the program that
+/// argument block `block` names; its other threads end (task manager only; see
+/// [`crate::abi::exec`]).
 pub fn task_exec(tid: u64, block: &[u8], flags: u64) -> Result<()> {
     check(invoke(Sys::TaskExec { tid, block, flags })).map(drop)
 }

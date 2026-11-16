@@ -22,16 +22,18 @@ today in the [README](README.md).
 
 ## Roadmap toward POSIX
 
-1. Timer (LAPIC/PIT) + preemption. (Upcalls are entered at the end of
-   system calls, which is enough only while scheduling is cooperative; with
-   preemption, returns from interrupts need the same `return_to_user` step.)
-2. Higher-half kernel, kernel heap, copy-on-write `fork`.
+1. Higher-half kernel, kernel heap, copy-on-write `fork`.
+2. A futex (for `join` and a libc's locks), thread-local storage
+   (`CLONE_SETTLS`), `munmap` (with TLB shootdown between CPUs), and a signal
+   mask per thread.
 3. More programs in `/bin`, moving commands out of the shell; a `PATH`.
 4. Capability-based IPC endpoints; shared memory / page grants.
 5. More user-space servers: a VFS, with the RAM file system moving out of the
    kernel into a file system server; then port musl libc.
 6. Move the fd table out of the kernel (libc/VFS), so that `read`/`write`
    reach servers directly rather than via the kernel.
+7. SMP that scales: per-CPU run queues instead of one lock, the I/O APIC (device
+   IRQs to any CPU), timers for user space (`sleep`).
 
 ## Smaller items
 

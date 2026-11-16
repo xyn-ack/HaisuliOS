@@ -4,18 +4,19 @@ A tiny, bare-bones **microkernel** for **x86_64**, written in **Rust**, with a
 **POSIX-flavoured** syscall ABI. No external crates, no bootloader crate, no
 nightly features: just `core`, inline assembly, and a Multiboot v1 header.
 
-> Status: v0.2. It provides virtual memory, tasks, IPC and user-space drivers;
-> POSIX processes, `execve` and signals with job control are implemented by a
-> user-space process server, which loads programs from the file system, and the
-> system boots into an interactive console served by a user-space console
-> server. It is **not** yet a full POSIX system: there is no libc, and the file
-> system is a RAM disk.
+> Status: v0.3. It provides virtual memory, tasks with any number of threads,
+> a preemptive scheduler on every CPU of the machine (SMP), IPC and user-space
+> drivers; POSIX processes, `execve` and signals with job control are
+> implemented by a user-space process server, which loads programs from the file
+> system, and the system boots into an interactive console served by a
+> user-space console server. It is **not** yet a full POSIX system: there is no
+> libc, and the file system is a RAM disk.
 
 More documents:
 
 * [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how it works inside: the source
-  layout, boot, the system calls, processes, programs, files, the console and
-  signals.
+  layout, boot, CPUs and threads, the system calls, processes, programs, files,
+  the console and signals.
 * [docs/TESTING.md](docs/TESTING.md): how it is tested.
 * [CHANGELOG.md](CHANGELOG.md): what changed in each version.
 * [TODO.md](TODO.md): the goals and the roadmap.
@@ -24,12 +25,13 @@ More documents:
 
 | In the kernel (mechanism)                             | In user space (policy)                      |
 |-------------------------------------------------------|---------------------------------------------|
-| Physical memory manager (bitmap frame allocator)      | **Process server**: POSIX processes (`user/proc`): pids, `fork`, `execve`, `exit`, `wait4`, zombies, `getpid`, process groups and sessions, signals; starts the system servers listed in `/etc/servers` |
+| Physical memory manager (bitmap frame allocator)      | **Process server**: POSIX processes (`user/proc`): pids, `fork`, `execve`, `exit`, `wait4`, zombies, `getpid`, process groups and sessions, signals, and what threads mean for all of them; starts the system servers listed in `/etc/servers` |
 | Virtual memory: 4-level paging, per-task spaces       | **Console server**: COM1 driver, line discipline and the job control terminal (`user/console`, run from `/sbin/console`) |
-| Tasks, kernel stacks, context switch, scheduler       | **init**: motd, then a job control shell (`user/init`) |
+| Tasks and their threads (`clone`, `exit`, `gettid`), kernel stacks, context switch | **Runtime** (`user/rt`): threads (`thread::spawn`, `join`), `nprocs` |
+| Every CPU (SMP): started at boot, per-CPU state, APIC timer, IPIs; one preemptive scheduler for all | **init**: motd, then a job control shell (`user/init`) |
 | Task control for the task manager: copy, end, stop, continue, upcalls | Job control policy: who is in the foreground, what Ctrl-C means |
 | `mmap` (anonymous)                                    | Shell redirections (`>`, `>>`, `<`, `2>&1`) |
-| RAM file system (the unpacked ramdisk), file descriptors | Programs in `/bin` (`user/coreutils`, and the test program `user/probe_test`) |
+| RAM file system (the unpacked ramdisk), file descriptors | Programs in `/bin` (`user/coreutils`, and the test programs `user/probe_test` and `user/smp_test`) |
 | IPC: async notifications + synchronous calls with data transfer |                                   |
 | IRQ forwarding, per-task I/O-port permissions         |                                             |
 | ELF loader: boot modules, and programs from the file system (argv/envp on the stack) |             |
@@ -37,10 +39,12 @@ More documents:
 | Exceptions -> end the task, report it to the task manager |                                         |
 
 The kernel contains no device drivers apart from a write-only debug log on
-COM1, and it knows nothing about POSIX processes: it runs *tasks* (an address
-space with one thread), and the process server builds processes, with their
-pids, parents, exit statuses and signals, on top of them (see
-[Processes](docs/ARCHITECTURE.md#processes)). A task's file descriptors refer
+COM1 (which the console server also sends its output through), and it knows
+nothing about POSIX processes: it runs *tasks* (an address space with one or
+more threads), on all the CPUs, and the process server builds processes, with
+their pids, parents, exit statuses and signals, on top of them (see
+[Processes](docs/ARCHITECTURE.md#processes) and
+[CPUs and threads](docs/ARCHITECTURE.md#cpus-and-threads)). A task's file descriptors refer
 to files in the kernel's RAM file system or to the terminal; `read` and
 `write` on the terminal are forwarded, as IPC calls, to whichever task
 registered as the console service.
@@ -52,14 +56,15 @@ behind a VFS; a libc (a musl port) and more drivers are planned too (see
 ## Layout
 
 ```
-kernel/           the kernel: boot, memory, tasks, IPC, the RAM file system
+kernel/           the kernel: boot, CPUs, memory, tasks and threads, IPC, the RAM file system
 abi/              system call numbers, errno values and IPC protocols (kernel + user)
-user/rt/          user runtime: entry point, system calls, POSIX process calls, print!
+user/rt/          user runtime: entry point, system calls, POSIX process calls, threads, print!
 user/proc/        process server: POSIX processes, signals and execve
 user/console/     console server (/sbin/console)
 user/init/        init (pid 1): /etc/motd, then a job control shell
-user/coreutils/   programs for /bin: echo, true, false
+user/coreutils/   programs for /bin: echo, true, false, nproc
 user/probe_test/  /bin/probe_test, a test program
+user/smp_test/    /bin/smp_test, a test program for multiple CPUs and threads
 rootfs/           contents of the boot ramdisk, besides the programs the build adds
 test/             tests (see docs/TESTING.md)
 docs/             architecture and testing documentation
@@ -80,6 +85,7 @@ automatically from `rust-toolchain.toml`.
 make          # build kernel + user programs, pack rootfs/ and the programs
               # for /sbin and /bin into build/initrd.tar
 make run      # boot in QEMU with an interactive console on your terminal
+make run CPUS=4   # the same, on four CPUs
 ```
 
 In `make run`, keys (including Ctrl-C) go to HaisuliOS. Type `exit` or press
@@ -116,11 +122,12 @@ module    /boot/initrd.tar initrd
 ### Expected output
 
 ```
-HaisuliOS 0.2.0 - x86_64 microkernel
+HaisuliOS 0.3.0 - x86_64 microkernel
 [pmm] 32364 frames free (126 MiB)
 [kernel] started task 1 (init): 71 KiB image
 [kernel] started task 2 (proc): 44 KiB image
 [kernel] ramdisk "initrd.tar": 120 KiB
+[kernel] 1 CPU online
 [kernel] entering user space
 [proc] started pid 3 (console) from /sbin/console
 [proc] serving POSIX processes
@@ -147,11 +154,11 @@ redirect with > file, >> file, < file, 2> file and 2>&1
 haisuli# pause &
 [1] 4
 haisuli# ps
-  PID  PPID  PGID   SID STAT NAME
-    1     0     1     1 R    init
-    2     0     2     2 R    proc
-    3     0     3     3 S    console
-    4     1     4     1 S    init
+  PID  PPID  PGID   SID STAT THR NAME
+    1     0     1     1 R      1 init
+    2     0     2     2 R      1 proc
+    3     0     3     3 S      1 console
+    4     1     4     1 S      1 init
 haisuli# kill 4
 [proc] pid 4 (init) exited (wait status 0xf)
 haisuli# wait 4
@@ -165,12 +172,17 @@ haisuli# exit
 
 QEMU then exits via `isa-debug-exit` (host exit status 1 is expected).
 
+`make run` gives the machine one CPU; `make run CPUS=4` gives it four (up to
+16). The kernel then says `[kernel] 4 CPUs online`, and `nproc` prints 4.
+
 ## Tests
 
 ```sh
 make check                          # build, then run every test
 make check TEST_ARGS="echo"         # only tests whose id contains "echo"
 make check TEST_EXPLICIT="process-server"  # only the explicit tests named process-server
+make check TEST_EXPLICIT="smp"      # the SMP and thread tests, on machines with 1 to 4 CPUs
+make check TEST_ARGS="--cpus 4"     # every other test, on machines with 4 CPUs
 ```
 
 Each test boots its own QEMU machine and drives the shell over the serial
@@ -221,25 +233,36 @@ HaisuliOS is licensed under the GNU General Public License, version 2 only
 
 ## Known limitations
 
-By design for v0.2; [TODO.md](TODO.md) has the plans for them.
+By design for v0.3; [TODO.md](TODO.md) has the plans for them.
 
-* Cooperative scheduling only: IRQs wake drivers but do not preempt, and the
-  timer is not used yet. The CPU halts when nothing is runnable.
 * Identity-mapped kernel in the low 1 GiB (not higher-half); RAM above 1 GiB unused.
-* Single CPU, no locking. Kernel stacks are static (max 16 tasks). A zombie
+* Up to 16 CPUs, found in the ACPI tables (without them, only the boot CPU
+  runs). One scheduler lock for all of them, and one global run queue; device
+  IRQs go to the boot CPU only (through the 8259 PICs, no I/O APIC). The timer
+  only preempts: there is no `sleep`, and no other timer for user space.
+* Kernel stacks are static: at most 64 threads and 16 tasks at once. A zombie
   takes no task, only a record in the process server, which keeps up to 64
   processes, zombies included.
+* Threads: no futex yet, so `join` waits by yielding; no thread-local storage
+  (`CLONE_SETTLS`); no `munmap`, so a thread stack is reused by later threads
+  of the process rather than freed. Signal masks and dispositions belong to the
+  process, not to each thread, and a signal goes to a thread in `pause` or
+  `wait4` if there is one, otherwise to one the kernel picks. A thread that
+  calls `ioperm` changes the permissions of the other threads of its task only
+  the next time they are switched to.
 * Programs are static ELF executables of up to 128 KiB (the file system's
   limit), with at most 4 KiB of arguments and environment. There is no
   `PATH`, no close-on-exec and no `#!` scripts. Boot-module memory is not
   reclaimed after the programs are loaded.
-* The kernel debug log and the console server share COM1 (output only on
-  the kernel's side), so kernel messages can interleave with console output.
-* Signal handlers run only when a process returns from a system call. With
-  cooperative scheduling that is always before it runs again, except for a
-  forked child that has not run yet: its signals wait for its first system
-  call. CPU exceptions are not signals to a handler: the kernel ends the task
-  and the process dies of `SIGSEGV`. There is no `sigaltstack`, and
+* The kernel debug log and the console server share COM1. Each message, and
+  each piece of terminal output, goes out in one piece (the console server
+  sends its output through the kernel's transmitter), but log lines can still
+  appear between two pieces of a program's output.
+* Signal handlers run when a thread returns to user mode: at the end of a
+  system call, or of an interrupt (so a busy thread on another CPU enters its
+  handler at once: the kernel interrupts its CPU). CPU exceptions are not
+  signals to a handler: the kernel ends the task and the process dies of
+  `SIGSEGV`. There is no `sigaltstack`, and
   `SA_SIGINFO` changes nothing (every handler gets all three arguments). No
   `SIGCHLD` is sent.
 * The process server is trusted and nothing restarts it: if it died, every
