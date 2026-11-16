@@ -39,9 +39,43 @@ class Timeout(AssertionError):
     pass
 
 
+class Arch:
+    """What differs between the architectures: how QEMU runs the machine, and what the tests may
+    expect of it."""
+
+    def __init__(self, name, qemu, machine, power_off_status, console, console_info):
+        self.name = name  # As the kernel's banner says it.
+        self.qemu = qemu  # The default QEMU binary.
+        self.machine = machine  # QEMU's arguments for the machine.
+        # QEMU's exit status when the kernel powers the machine off.
+        self.power_off_status = power_off_status
+        # The console device's name and IRQ line, as the console server logs them.
+        self.console = console
+        # What `probe_test devices` prints about it.
+        self.console_info = console_info
+
+
+ARCHES = {
+    "x86_64": Arch(
+        "x86_64", "qemu-system-x86_64",
+        # The kernel powers off through isa-debug-exit, which makes QEMU exit with
+        # (code << 1) | 1: status 1 for code 0.
+        ["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"], 1,
+        ("COM1", 4), "console: COM1 kind 1 space 1 base 0x3f8 len 8 irq 4",
+    ),
+    "aarch64": Arch(
+        "aarch64", "qemu-system-aarch64",
+        # PSCI SYSTEM_OFF makes QEMU exit with status 0.
+        ["-M", "virt,gic-version=3", "-cpu", "cortex-a72"], 0,
+        ("UART0", 1), "console: UART0 kind 2 space 2 base 0x9000000 len 4096 irq 1",
+    ),
+}
+
+
 class Config:
     """How to start QEMU. Filled in by the runner from its command line."""
 
+    arch = ARCHES["x86_64"]
     qemu = "qemu-system-x86_64"
     kernel = "build/haisulios.elf32"
     modules = "build/init,build/proc,build/initrd.tar"
@@ -85,7 +119,7 @@ class Machine:
             "-display", "none",
             "-nic", "none",
             "-no-reboot",
-            "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+            *config.arch.machine,
         ]
         if self.cpus is not None:
             cmd += ["-smp", str(self.cpus)]

@@ -74,7 +74,7 @@ boot entry speaks the boot loader's protocol (x86_64's takes the Multiboot hands
 `platform::pc`). So booting reads, in `main.rs`: the platform's early console, the architecture's
 `init_cpu` (with the platform's delays), the frame allocator from the platform's memory map, the
 platform's interrupt controller, the boot modules, then the architecture's `start_cpus` for the
-platform's `cpus()`. [TODO.md](../TODO.md) has what remains: arm64 itself.
+platform's `cpus()`. [TODO.md](../TODO.md) has what the arm64 port leaves for later.
 
 ```
 kernel/            the kernel
@@ -98,6 +98,20 @@ kernel/            the kernel
       paging.rs    the 4-level page-table format (PageTables), the kernel's half (PML4[0])
       phys.rs      physical memory access, limited to allocator-owned frames
       x86.rs       names for the CPU's numbers: register bits, vectors, descriptors
+    aarch64/
+      mod.rs       Cpu: the Processor and CpuInterrupts traits, on the modules below
+      boot.rs      Linux Image header and entry (EL1, device tree), boot tables, MMU (asm)
+      cpu.rs       privileged instructions and system registers
+      percpu.rs    each CPU's own block, through TPIDR_EL1
+      entry.rs     exception vectors, the trap frame (with FP/SIMD), UserRegs (asm)
+      context.rs   kernel stacks, per-CPU idle contexts, context switch
+      paging.rs    the stage 1 tables (PageTables), user space in TTBR0_EL1
+      phys.rs      physical memory access through the linear map
+      gic.rs       the GICv3 CPU interface: taking and ending interrupts, SGIs
+      timer.rs     the generic timer: the tick, short waits
+      psci.rs      PSCI: CPU_ON, SYSTEM_OFF
+      smp.rs       starting the other CPUs
+      upcall.rs    the frame that enters a handler (Linux arm64 signal frame layout)
   platform/        hardware layer, the machine around the CPU: one directory per platform,
                    behind one contract (see mod.rs: the Machine, BootInfo and
                    InterruptController traits)
@@ -109,6 +123,11 @@ kernel/            the kernel
       pit.rs       the 8254 timer, as a boot-time stopwatch
       uart.rs      the COM1 16550, the serial line's transmitter
       power.rs     powering off (QEMU's isa-debug-exit)
+    qemu_virt/
+      mod.rs       Board (QEMU's virt): the platform's traits; the boot modules in the initrd
+      fdt.rs       the device tree
+      gic.rs       the GICv3 distributor and redistributors
+      pl011.rs     the PL011 UART, the serial line's transmitter
   sync.rs          Lock: a ticket spinlock that panics on re-entrant use
   irq.rs           forwarding interrupt lines to drivers; every interrupt's dispatch, by
                    source (the tick, a reschedule, a line)
@@ -157,19 +176,23 @@ boot loader or the hardware defines. It lives in a few small modules that
 wrap it in safe interfaces. The restrictions of those interfaces are what
 make them safe:
 
-* `kernel/arch/` and `kernel/platform/`: port I/O only on a fixed list of
+* `kernel/arch/` and `kernel/platform/`: device registers (x86 port I/O, or
+  memory-mapped registers in arm64's linear map) only of a fixed list of
   devices that cannot do DMA, with bounds-checked register offsets. Physical
   memory access only to frames the allocator owns; `phys` itself refuses
   anything in the kernel image, in boot-loader data (recorded with its
-  `keep_out`) or below 1 MiB. A context switch only to contexts that the
+  `keep_out`) or, on x86_64, below 1 MiB. A context switch only to contexts that the
   context module itself saved, and never to one that another CPU has not
   finished leaving. (On top of that, `vmm::map_user` maps only allocator
   frames, so user space never sees kernel memory.) The local APIC's
   registers only at their fixed offsets, in the page the boot page tables
   map. Firmware tables (ACPI) only where no allocator frame or kernel data
-  lies, read-only. The CPU trampoline only in its one page of conventional
-  memory, which nothing else uses. The GS base only as a pointer to the
-  CPU's own block.
+  lies, read-only; likewise the device tree and the initrd on arm64, which
+  are kept out of the allocator. The CPU trampoline only in its one page of
+  conventional memory, which nothing else uses. The GS base (TPIDR_EL1 on
+  arm64) only as a pointer to the CPU's own block. Device registers are mapped
+  into a driver only for a device the machine lists (`device_grant`), and those
+  pages are neither copied by `task_fork` nor read by the kernel for the task.
 * `kernel/sync.rs`: `Lock`, a ticket spinlock, which guards the task table,
   the TSSs, the file system, the serial line and the page-table changes (all
   other shared kernel state is atomics). Kernel code runs with interrupts
@@ -208,6 +231,15 @@ ustar archive: the kernel unpacks it into its RAM file system (see *Files*
 below), so `/etc/motd` is an ordinary file that init opens, and the programs
 in `/sbin` and `/bin` are ordinary files too.
 
+On x86_64 the boot loader speaks Multiboot v1, which passes any number of
+modules. On arm64 the kernel is a Linux Image, booted as Linux is: the loader
+(QEMU's `-kernel`) enters it at EL1 with the MMU off and the device tree's
+address in `x0`, and passes one initrd, so the modules travel in it as a ustar
+archive, in order (`build/aarch64/boot.tar`: init, proc, initrd.tar). The boot
+code turns on the MMU with the kernel in `TTBR1_EL1` and jumps there; the
+device tree says where the memory, the CPUs, the GIC, the UART and the initrd
+are.
+
 The other servers are not critical to booting, so they come from the file
 system: the process server starts the **system servers** listed in
 `/etc/servers`, one path per line. Today that is the console server,
@@ -242,7 +274,17 @@ comes late), and no more are started.
 Each CPU's local APIC runs a periodic timer, the scheduler's *tick* (10 ms,
 calibrated against the PIT), and carries the *reschedule IPI*, with which one
 CPU makes another look at the scheduler. Device IRQs still come from the 8259
-PICs, to the boot CPU only. The serial line has one transmitter, the kernel's:
+PICs, to the boot CPU only.
+
+On arm64, the boot CPU starts the CPUs of the device tree's `/cpus` with PSCI
+`CPU_ON`, one at a time as on x86_64; each turns on its MMU with the boot
+tables and enters Rust on a stack of its own. Its per-CPU block is in
+TPIDR_EL1, which user mode cannot touch, so nothing needs swapping on the way
+in and out. The tick is each CPU's generic timer (its virtual timer), the
+reschedule IPI is SGI 0 of the GICv3, and device IRQs (SPIs) are routed to the
+boot CPU. An exception from user mode saves the registers, the FP/SIMD ones
+included (the kernel's own code uses them), at the top of the thread's kernel
+stack, where the stack pointer was left by the return to user mode. The serial line has one transmitter, the kernel's:
 its log and the console server's output (`serial_write`) each go out in one
 piece, however many CPUs write at once.
 
@@ -302,11 +344,15 @@ User space is the same on every architecture:
 
 How the kernel's half gets there is the architecture's business. On x86_64, PML4 entry 0, the
 identity map of the first 1 GiB (supervisor only), is shared by every address space, and user
-space is entries 1 to 255.
+space is entries 1 to 255. On arm64, user space has `TTBR0_EL1` to itself, one root table per
+address space that starts empty, and the kernel lives in `TTBR1_EL1`: its image and a linear map
+of physical memory (devices uncached) from `0xFFFF_0000_0000_0000` on. There are no address
+space ids yet, so every switch of address space flushes the CPU's TLB.
 
 User pages are mapped 4 KiB at a time, so `task_fork` is a deep copy (no COW yet).
-W^X is enforced for the image/stack/mmap (on x86_64 with the NX bit; EFER.NXE is on); the
-ELF loader refuses segments that are both writable and executable.
+W^X is enforced for the image/stack/mmap (on x86_64 with the NX bit, EFER.NXE on; on arm64
+with UXN, and PXN keeps the kernel from running user pages); the ELF loader refuses segments
+that are both writable and executable.
 
 ## Syscall ABI
 
@@ -520,9 +566,10 @@ ones a driver may have, by well-known ids (`abi::device`; so far `CONSOLE`, the 
 what each one is (a 16550 or a PL011), where its registers are (I/O ports, or memory-mapped) and
 which IRQ line it raises. `device_info` tells anyone; `device_grant` gives a privileged task the
 registers, for as long as its program runs: I/O ports become usable (x86's per-task I/O bitmap,
-loaded into the TSS whenever a thread of the task runs), and memory-mapped registers are to be
-mapped into the task's address space (the kernel side of that comes with arm64, the first
-machine that has such devices). Only the devices the machine lists can be granted, and only their
+loaded into the TSS whenever a thread of the task runs), and memory-mapped registers are mapped
+into the task's address space, uncached (QEMU `virt`'s PL011). Such pages are not memory: the
+kernel never reads or writes them for the task, `task_fork` does not copy them, and they are not
+freed with the address space. Only the devices the machine lists can be granted, and only their
 registers. The runtime's `device` module turns a grant into register access that does not depend
 on where the registers are, so a driver does not depend on the architecture.
 

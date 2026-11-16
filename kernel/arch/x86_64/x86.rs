@@ -289,6 +289,9 @@ flags! {
         CacheDisable = 1 << 4,
         /// PS, in a page-directory entry: it maps a 2 MiB page.
         Huge = 1 << 7,
+        /// An available bit (ignored by the CPU), which HaisuliOS sets in the entries that map
+        /// device registers rather than memory.
+        Device = 1 << 9,
         /// XD: instruction fetches fault (needs [`Efer::NoExecute`]).
         NoExecute = 1 << 63,
     }

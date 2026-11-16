@@ -2,7 +2,7 @@
 
 //! The HaisuliOS kernel.
 //!
-//! A bare-bones microkernel (for x86_64, so far) that provides mechanisms and leaves policy to
+//! A bare-bones microkernel (for x86_64 and arm64) that provides mechanisms and leaves policy to
 //! user space.
 //!
 //! The kernel provides physical and virtual memory, tasks with private address spaces and any
@@ -56,6 +56,7 @@ pub fn kmain() -> ! {
     Cpu::init_cpu(true, Board::wait_us);
     pmm::init();
     irq::init();
+    irq::init_cpu();
     task::cpu_online();
     task::spawn_boot_modules();
     start_cpus();
@@ -81,6 +82,7 @@ fn start_cpus() {
 /// sets the CPU up like the boot CPU, then idles until there are threads to run.
 pub fn ap_main(_cpu: usize) -> ! {
     Cpu::init_cpu(false, Board::wait_us);
+    irq::init_cpu();
     task::cpu_online();
     task::idle()
 }

@@ -50,7 +50,7 @@ LOG_LINE = re.compile(r"\[(?:kernel|proc)\] [^\n]*\n")
 
 # The kernel's report of a process's CPU exception: a line after an empty one, and indented
 # details. A process that faults on another CPU can report in the middle of another command.
-FAULT_REPORT = re.compile(r"\n?\[user\] #\d+ [^\n]*\n(?: {4}[^\n]*\n)*")
+FAULT_REPORT = re.compile(r"\n?\[user\] #\S+ [^\n]*\n(?: {4}[^\n]*\n)*")
 
 # Job status notices ("[1]+ Done  exit 7") that the shell may print before a prompt, maybe after
 # an empty line. Unlike the "[1] 3" of `cmd &`, the job number is not followed by a pid.
@@ -308,7 +308,7 @@ def test_a_fault_in_one_thread_kills_the_whole_process(sh):
     sh.allow("[user] #")  # The kernel reports the fault, which is the point.
     since = len(sh.transcript)
     smp_test(sh, "fault", "2", hang=THREADS_LEFT_BEHIND)
-    faults = re.findall(r"\[user\] #14 \(page fault\)", sh.transcript[since:])
+    faults = re.findall(r"\[user\] #\S+ \(page fault\)", sh.transcript[since:])
     assert len(faults) == 1, f"expected the thread's page fault only: {sh.transcript[since:]!r}"
 
 

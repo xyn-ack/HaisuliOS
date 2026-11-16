@@ -1932,6 +1932,26 @@ pub(crate) fn mmap(len: u64, prot: u64) -> i64 {
     base as i64
 }
 
+/// Maps the memory-mapped registers at physical `regs..regs + len` (page aligned), of a device
+/// granted to it (see [`crate::device`]), into the running, privileged task's mmap region, and
+/// returns their address there.
+pub(crate) fn map_device(regs: u64, len: u64) -> Result<u64, i64> {
+    let pages = len.div_ceil(4096);
+    // Take the range first, as `mmap` does.
+    let (space, base) = {
+        let mut t = table();
+        let p = t.cur_mut();
+        if !p.privileged {
+            return Err(-EPERM);
+        }
+        let base = p.mmap_next;
+        p.mmap_next = base + (pages + 1) * 4096; // Leave a guard page.
+        (p.space, base)
+    };
+    vmm::map_device(space, base, regs, pages).map_err(|()| -ENOMEM)?;
+    Ok(base)
+}
+
 /// Lets the running, privileged task use the I/O ports `ports`, of a device granted to it (see
 /// [`crate::device`]).
 ///

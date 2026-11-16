@@ -13,7 +13,7 @@
 
 use crate::platform::{Board, Machine, Registers};
 use crate::{task, vmm};
-use haisuli_abi::device::{DeviceInfo, DEVICE_INFO_LEN, NO_IRQ, SPACE_PORTS};
+use haisuli_abi::device::{DeviceInfo, DEVICE_INFO_LEN, NO_IRQ, SPACE_MMIO, SPACE_PORTS};
 use haisuli_abi::errno::{EFAULT, EINVAL, ENODEV, EPERM};
 use haisuli_abi::PROC_NAME_LEN;
 
@@ -27,6 +27,7 @@ pub(crate) fn info(id: u64, buf: u64, len: u64) -> i64 {
     }
     let (space, base, count) = match device.registers {
         Registers::Ports { base, count } => (SPACE_PORTS, base, count),
+        Registers::Mmio { base, len } => (SPACE_MMIO, base, len),
     };
     let mut name = [0u8; PROC_NAME_LEN];
     let n = device.name.len().min(PROC_NAME_LEN - 1);
@@ -47,7 +48,8 @@ pub(crate) fn info(id: u64, buf: u64, len: u64) -> i64 {
 }
 
 /// Gives the calling, privileged task the registers of device `id` (the `device_grant` system
-/// call): I/O ports become usable, and the first one is returned.
+/// call): I/O ports become usable, and the first one is returned; memory-mapped registers are
+/// mapped into the task's address space, and their address is returned.
 pub(crate) fn grant(id: u64) -> i64 {
     if !task::current_privileged() {
         return -EPERM;
@@ -58,6 +60,10 @@ pub(crate) fn grant(id: u64) -> i64 {
     match device.registers {
         Registers::Ports { base, count } => match task::allow_ports(base..base + count) {
             Ok(()) => base as i64,
+            Err(e) => e,
+        },
+        Registers::Mmio { base, len } => match task::map_device(base, len) {
+            Ok(address) => address as i64,
             Err(e) => e,
         },
     }

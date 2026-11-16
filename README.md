@@ -1,8 +1,9 @@
 # HaisuliOS
 
-A tiny, bare-bones **microkernel** for **x86_64**, written in **Rust**, with a
-**POSIX-flavoured** syscall ABI. No external crates, no bootloader crate, no
-nightly features: just `core`, inline assembly, and a Multiboot v1 header.
+A tiny, bare-bones **microkernel** for **x86_64** (a PC) and **arm64** (QEMU's
+`virt` machine), written in **Rust**, with a **POSIX-flavoured** syscall ABI.
+No external crates, no bootloader crate, no nightly features: just `core`,
+inline assembly, and a Multiboot v1 header or a Linux arm64 Image header.
 
 > Status: v0.3.1. It provides virtual memory, tasks with any number of threads,
 > a preemptive scheduler on every CPU of the machine (SMP), IPC and user-space
@@ -79,27 +80,33 @@ map.
 
 Requirements: Rust (stable, **via `rustup`**), `make`, `tar`, `objcopy`
 (binutils; on macOS use `OBJCOPY=x86_64-elf-objcopy` or `llvm-objcopy`), and
-`qemu-system-x86_64`. A distribution-packaged Rust (e.g. `apt install cargo`)
-usually lacks the `x86_64-unknown-none` target; rustup installs it
-automatically from `rust-toolchain.toml`.
+`qemu-system-x86_64`; for arm64, `qemu-system-aarch64` (Debian and Ubuntu:
+`qemu-system-arm`) and rustup's `llvm-tools` component (for `llvm-objcopy`:
+GNU objcopy does not read arm64 ELF files). A distribution-packaged Rust (e.g.
+`apt install cargo`) usually lacks the `x86_64-unknown-none` target; rustup
+installs it automatically from `rust-toolchain.toml`.
 
 ```sh
 make          # build kernel + user programs, pack rootfs/ and the programs
               # for /sbin and /bin into build/initrd.tar
 make run      # boot in QEMU with an interactive console on your terminal
 make run CPUS=4   # the same, on four CPUs
-make portcheck    # check that the system stays portable to arm64: the user programs
-                  # build for aarch64-unknown-none (see below), and more
+make ARCH=aarch64 run   # the same for arm64, on QEMU's virt machine; build, check and
+                        # every other target take ARCH too (outputs in build/aarch64/)
+make portcheck    # check that the system stays portable: the user programs build for
+                  # aarch64-unknown-none (see below), and more
 ```
 
 In `make run`, keys (including Ctrl-C) go to HaisuliOS. Type `exit` or press
 Ctrl-D at the prompt to power off, or press **Ctrl-A X** to quit QEMU.
 
-`rust-toolchain.toml` pulls the `x86_64-unknown-none` target automatically and
-the Makefile builds for it (`--target x86_64-unknown-none`). It also asks for
-`aarch64-unknown-none`, for `make portcheck`; if the stable release that rustup
-picks does not ship that target (rustup then warns that it skips it), give
-`portcheck` a toolchain that does: `make portcheck AARCH64_TOOLCHAIN=+1.98.0`. Each image's
+`rust-toolchain.toml` pulls the `x86_64-unknown-none` and
+`aarch64-unknown-none` targets and `llvm-tools` automatically, and the Makefile
+builds for `$(ARCH)-unknown-none`. If the stable release that rustup picks does
+not ship the arm64 target (some do not; rustup then warns that it skips it),
+the Makefile falls back to the 1.98.0 toolchain for arm64 (`rustup toolchain
+install 1.98.0 --target aarch64-unknown-none --component llvm-tools`), or to
+whichever you name: `AARCH64_TOOLCHAIN=+<toolchain>`. Each image's
 `build.rs` applies its linker script and links it as a static executable.
 `.cargo/config.toml` only makes plain `cargo build` / `cargo clippy` default to
 the bare-metal target too; outputs land in `target/x86_64-unknown-none/`.

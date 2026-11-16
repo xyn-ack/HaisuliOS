@@ -16,6 +16,7 @@ use super::gdt::{DOUBLE_FAULT_IST, KERNEL_CS};
 use super::x86::{gate_descriptor, Exception, GateType, PrivilegeLevel};
 use crate::arch::Interrupt;
 use crate::task::{self, Why};
+use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The first vector after the CPU's own: where the platform's interrupt lines start.
@@ -94,7 +95,10 @@ pub(crate) extern "C" fn interrupt_handler(vector: u64, f: &mut TrapFrame) {
 pub(crate) extern "C" fn exception_handler(f: &ExceptionFrame) -> ! {
     let exception = Exception::from_vector(f.vector);
     let from_user = PrivilegeLevel::of_selector(f.cs) == PrivilegeLevel::User;
-    crate::println!(
+    // One message, so that nothing cuts into it.
+    let mut log = crate::serial::lock();
+    let _ = writeln!(
+        log,
         "\n[{}] #{} ({}) err={:#x} rip={:#x} rsp={:#x}",
         if from_user { "user" } else { "KERNEL" },
         f.vector,
@@ -104,8 +108,13 @@ pub(crate) extern "C" fn exception_handler(f: &ExceptionFrame) -> ! {
         f.rsp
     );
     if exception == Some(Exception::PageFault) {
-        crate::println!("    faulting address (CR2) = {:#x}", cpu::fault_address());
+        let _ = writeln!(
+            log,
+            "    faulting address (CR2) = {:#x}",
+            cpu::fault_address()
+        );
     }
+    drop(log);
     if from_user {
         // The task cannot go on. What that means for its process (SIGSEGV) is
         // the task manager's business, which `end_current` tells.

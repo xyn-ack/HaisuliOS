@@ -7,7 +7,7 @@ console server from the file system, and that init shows /etc/motd.
 import os
 import re
 
-from haisuli import PROMPT, read_rootfs
+from haisuli import PROMPT, Config, read_rootfs
 
 
 def version():
@@ -19,7 +19,7 @@ def version():
 
 def test_kernel_starts_init_and_console_server(sh):
     out = sh.boot_output
-    assert out.startswith(f"HaisuliOS {version()} - x86_64 microkernel\n")
+    assert out.startswith(f"HaisuliOS {version()} - {Config.arch.name} microkernel\n")
     # The kernel starts tasks; the process server makes processes of them.
     # The kernel unpacks the ramdisk into its file system; init is not handed a copy.
     assert re.search(r"^\[kernel\] started task 1 \(init\): \d+ KiB image$", out, re.M)
@@ -29,7 +29,8 @@ def test_kernel_starts_init_and_console_server(sh):
     assert "(console): " not in out
     assert "[proc] started pid 3 (console) from /sbin/console\n" in out
     assert re.search(r'^\[kernel\] ramdisk "initrd.tar": \d+ KiB$', out, re.M)
-    assert "[console] serving COM1 (IRQ 4)\n" in out
+    name, irq = Config.arch.console
+    assert f"[console] serving {name} (IRQ {irq})\n" in out
 
 
 # Servers log to the same serial line, so their lines can appear anywhere: also between the motd

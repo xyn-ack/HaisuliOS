@@ -4,7 +4,7 @@
 name = "haisulios"
 version = "0.3.1"
 edition = "2021"
-description = "HaisuliOS - a tiny x86_64 microkernel written in Rust"
+description = "HaisuliOS - a tiny microkernel for x86_64 and arm64, written in Rust"
 license = "GPL-2.0"
 
 # The kernel sources live in kernel/ (not the default src/).

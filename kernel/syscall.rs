@@ -16,7 +16,9 @@ use crate::task::{self, Access, Why};
 use crate::{device, irq, serial, vmm};
 use haisuli_abi::console::{OP_READ, OP_WRITE};
 use haisuli_abi::errno::{EBADF, EFAULT, ENAMETOOLONG, ENOSYS, EPERM};
-use haisuli_abi::fcntl::{AT_FDCWD, PATH_MAX};
+#[cfg(target_arch = "x86_64")]
+use haisuli_abi::fcntl::AT_FDCWD;
+use haisuli_abi::fcntl::PATH_MAX;
 use haisuli_abi::nr;
 
 /// Called by the architecture's system call entry with the saved user registers; the result
@@ -125,8 +127,8 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
 
 /// Opens a file (the `openat` system call, and x86_64's `open`); `path` is NUL-terminated.
 ///
-/// A relative `path` starts at directory `dirfd`, or at the root for [`AT_FDCWD`]: there is no
-/// current directory.
+/// A relative `path` starts at directory `dirfd`, or at the root for
+/// `AT_FDCWD`: there is no current directory.
 fn sys_openat(dirfd: u64, path: u64, flags: u64) -> i64 {
     let mut buf = [0u8; 2 * PATH_MAX];
     match user_string(path, &mut buf) {

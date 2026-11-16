@@ -58,6 +58,19 @@ impl PageTables for Paging {
         entry
     }
 
+    fn device_entry(frame: u64, prot: Prot) -> u64 {
+        Self::page_entry(frame, prot)
+            | PageFlag::bits(&[
+                PageFlag::WriteThrough,
+                PageFlag::CacheDisable,
+                PageFlag::Device,
+            ])
+    }
+
+    fn is_device(entry: u64) -> bool {
+        entry & PageFlag::Device as u64 != 0
+    }
+
     fn page_prot(entry: u64) -> Prot {
         Prot {
             user: entry & PageFlag::User as u64 != 0,

@@ -153,8 +153,11 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("selectors", nargs="*", help="run only tests whose id contains one of these")
-    ap.add_argument("--qemu", default=haisuli.Config.qemu)
-    ap.add_argument("--kernel", default=haisuli.Config.kernel, help="32-bit kernel image")
+    ap.add_argument("--arch", choices=sorted(haisuli.ARCHES), default="x86_64",
+                    help="the architecture of the kernel (default %(default)s)")
+    ap.add_argument("--qemu", help="the QEMU binary (default: the architecture's)")
+    ap.add_argument("--kernel", default=haisuli.Config.kernel,
+                    help="kernel image (x86_64: the 32-bit ELF; aarch64: the Image)")
     ap.add_argument("--modules", default=haisuli.Config.modules,
                     help="comma-separated boot modules")
     ap.add_argument("--timeout", type=float, default=haisuli.Config.timeout,
@@ -196,10 +199,13 @@ def main():
     if missing:
         print(f"missing build output: {', '.join(missing)} (run `make` first)")
         return 1
-    if shutil.which(args.qemu) is None:
-        print(f"QEMU not found: {args.qemu}")
+    arch = haisuli.ARCHES[args.arch]
+    qemu = args.qemu or arch.qemu
+    if shutil.which(qemu) is None:
+        print(f"QEMU not found: {qemu}")
         return 1
-    haisuli.Config.qemu = args.qemu
+    haisuli.Config.arch = arch
+    haisuli.Config.qemu = qemu
     haisuli.Config.kernel = args.kernel
     haisuli.Config.modules = args.modules
     haisuli.Config.timeout = args.timeout

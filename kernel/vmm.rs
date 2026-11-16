@@ -20,6 +20,10 @@
 //! User memory is only ever reached through the page tables of its address space (never by
 //! dereferencing a user pointer), which also checks that it is mapped, user-accessible and, for
 //! writes, writable.
+//!
+//! A driver's address space may also map a device's registers ([`map_device`]). Such pages are
+//! not memory: the kernel never reads or writes them for the task (they are not user memory to
+//! [`translate`]), a `task_fork` copy does not get them, and they are not freed with the space.
 
 use crate::arch::{phys, PageTables, Paging, Prot};
 use crate::pmm::{self, PAGE_SIZE};
@@ -117,15 +121,21 @@ pub(crate) fn new_address_space() -> Option<AddressSpace> {
 /// Panics if `frame` is not an allocator frame: user space must never see
 /// kernel memory.
 fn map_user(space: AddressSpace, virt: u64, frame: u64, prot: Prot) -> Result<(), ()> {
-    if !(USER_BASE..USER_LIMIT).contains(&virt) || virt & PAGE_OFFSET != 0 {
-        return Err(());
-    }
     // User space must never see kernel memory: only allocator frames.
     assert!(
         phys::is_managed(frame),
         "mapping a non-allocator frame {:#x} into user space",
         frame
     );
+    set_user_entry(space, virt, Paging::page_entry(frame, prot))
+}
+
+/// Installs the page entry `page` for user address `virt` (page aligned), making the tables on
+/// the way as needed; fails if out of memory, or if a page is mapped there already.
+fn set_user_entry(space: AddressSpace, virt: u64, page: u64) -> Result<(), ()> {
+    if !(USER_BASE..USER_LIMIT).contains(&virt) || virt & PAGE_OFFSET != 0 {
+        return Err(());
+    }
     let mut t = space.0;
     for lvl in 0..PAGE_LEVEL {
         let e = entry(t, idx(virt, lvl));
@@ -140,7 +150,7 @@ fn map_user(space: AddressSpace, virt: u64, frame: u64, prot: Prot) -> Result<()
     if Paging::is_present(entry(t, idx(virt, PAGE_LEVEL))) {
         return Err(());
     }
-    set_entry(t, idx(virt, PAGE_LEVEL), Paging::page_entry(frame, prot));
+    set_entry(t, idx(virt, PAGE_LEVEL), page);
     Ok(())
 }
 
@@ -183,7 +193,30 @@ pub(crate) fn map_init(
     Ok(())
 }
 
+/// Maps the device registers at physical `regs` (page aligned), `pages` pages of them, at
+/// `virt` in `space`, for the task's own use.
+///
+/// Only for a device that the machine describes (see [`crate::device`]): its registers are not
+/// memory, so they are neither copied by [`clone_user_space`] nor freed by
+/// [`destroy_user_space`]. Fails if out of memory for page tables or if a page is already
+/// mapped; pages mapped before the failure stay mapped.
+pub(crate) fn map_device(space: AddressSpace, virt: u64, regs: u64, pages: u64) -> Result<(), ()> {
+    let _serialised = MAP_LOCK.lock();
+    let prot = Prot {
+        user: true,
+        write: true,
+        exec: false,
+    };
+    for i in 0..pages {
+        let entry = Paging::device_entry(regs + i * PAGE_SIZE, prot);
+        set_user_entry(space, virt + i * PAGE_SIZE, entry)?;
+    }
+    Ok(())
+}
+
 /// Walks the page tables for a user address and returns its physical address and protection.
+///
+/// Device registers ([`map_device`]) are not user memory: they are not found.
 pub(crate) fn translate(space: AddressSpace, virt: u64) -> Option<(u64, Prot)> {
     if !(USER_BASE..USER_LIMIT).contains(&virt) {
         return None; // The kernel's half is not walked here.
@@ -197,7 +230,7 @@ pub(crate) fn translate(space: AddressSpace, virt: u64) -> Option<(u64, Prot)> {
         t = Paging::target(e);
     }
     let e = entry(t, idx(virt, PAGE_LEVEL));
-    if !Paging::is_present(e) {
+    if !Paging::is_present(e) || Paging::is_device(e) {
         return None;
     }
     Some((
@@ -338,7 +371,8 @@ pub(crate) fn clone_user_space(src: AddressSpace) -> Option<AddressSpace> {
         let Visit::Page(virt, e) = visit else {
             return;
         };
-        if !ok {
+        // Device registers stay the driver's own: the copy (never privileged) gets none.
+        if !ok || Paging::is_device(e) {
             return;
         }
         let Some(f) = pmm::alloc_frame() else {
@@ -365,6 +399,8 @@ pub(crate) fn clone_user_space(src: AddressSpace) -> Option<AddressSpace> {
 /// Never call this on an address space that a CPU uses.
 pub(crate) fn destroy_user_space(space: AddressSpace) {
     walk(space, |visit| match visit {
+        // Device registers are not the allocator's.
+        Visit::Page(_, e) if Paging::is_device(e) => {}
         Visit::Page(_, e) => pmm::free_frame(Paging::target(e)),
         Visit::Table(table) => pmm::free_frame(table),
     });

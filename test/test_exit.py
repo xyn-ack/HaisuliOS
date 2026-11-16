@@ -3,17 +3,15 @@
 
 Checks that leaving the shell makes init exit and the process server power the machine off.
 """
-
-# QEMU's isa-debug-exit device makes QEMU exit with (code << 1) | 1; the
-# kernel writes code 0 when it shuts down normally.
-QEMU_STATUS_POWER_OFF = 1
+from haisuli import Config
 
 
 def assert_powered_off(sh, wait_status):
-    # The process server reports the end of init, and powers the machine off.
+    # The process server reports the end of init, and powers the machine off (QEMU's exit status
+    # depends on how: see haisuli.ARCHES).
     sh.expect(f"[proc] pid 1 (init) exited (wait status {wait_status})\n")
     sh.expect("[proc] init exited - shutting down\n")
-    assert sh.wait_exit() == QEMU_STATUS_POWER_OFF
+    assert sh.wait_exit() == Config.arch.power_off_status
 
 
 def test_exit_powers_off(sh):

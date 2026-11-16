@@ -91,6 +91,7 @@ impl<T> Lock<T> {
     /// This is for hardware that is told where a structure lives (e.g. the
     /// TSS). Obtaining it is harmless; the CPU's own accesses are outside
     /// Rust's aliasing model.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn addr(&self) -> u64 {
         self.value.get() as u64
     }

@@ -37,6 +37,11 @@ pub(crate) fn init() {
     Board::init();
 }
 
+/// Sets up the interrupt controller's part for the CPU this runs on (every CPU).
+pub(crate) fn init_cpu() {
+    Board::init_cpu();
+}
+
 /// Handles an interrupt from `source`, with interrupts disabled; `f` holds the interrupted
 /// registers. Called by the architecture's interrupt entry.
 pub(crate) fn dispatch(source: Interrupt, f: &mut UserContext) {

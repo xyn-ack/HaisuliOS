@@ -33,7 +33,7 @@ The shell cannot see where a call is served, so the tests check what a user can 
 import re
 import time
 
-from haisuli import PROMPT, Timeout
+from haisuli import PROMPT, Config, Timeout
 
 # Run by `make check TEST_EXPLICIT="process-server"` only (see run_tests.py).
 EXPLICIT = "process-server"
@@ -47,9 +47,6 @@ SIGKILL = 9
 # hold one of them until it was reaped, back when the kernel implemented processes.
 KERNEL_PROCESS_SLOTS = 16
 
-# QEMU's isa-debug-exit device makes QEMU exit with (code << 1) | 1. The kernel writes code 0
-# when it shuts down normally.
-QEMU_STATUS_POWER_OFF = 1
 
 # The kernel and the process server log to the same serial line as the console server, so their
 # lines can appear anywhere in the output, even in the middle of an echoed command line.
@@ -192,7 +189,7 @@ def test_the_process_server_reports_the_exit_of_init(sh):
     sh.send("exit 3\r")
     sh.expect(f"[{SERVER}] pid 1 (init) exited (wait status {3 << 8:#x})\n")
     # Init exiting still shuts the system down.
-    assert sh.wait_exit() == QEMU_STATUS_POWER_OFF
+    assert sh.wait_exit() == Config.arch.power_off_status
 
 
 def test_the_kernel_log_never_mentions_a_wait_status(sh):
@@ -203,7 +200,7 @@ def test_the_kernel_log_never_mentions_a_wait_status(sh):
     run(sh, f"kill -KILL {job.pid}")
     assert wait_status(sh, job.pid) == 128 + SIGKILL
     sh.send("exit\r")
-    assert sh.wait_exit() == QEMU_STATUS_POWER_OFF
+    assert sh.wait_exit() == Config.arch.power_off_status
     leaks = kernel_wait_statuses(sh)
     assert not leaks, f"the kernel knows about wait statuses: {leaks}"
 

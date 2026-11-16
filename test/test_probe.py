@@ -9,7 +9,7 @@ only if every check passed. See `user/probe_test/src/main.rs` for what each case
 """
 import re
 
-from haisuli import PROMPT, Timeout, cpus
+from haisuli import PROMPT, Config, Timeout, cpus
 
 # The kernel and the process server share the console, so their lines can appear anywhere.
 LOG_LINE = re.compile(r"\[(?:kernel|proc)\] [^\n]*\n")
@@ -48,7 +48,7 @@ def test_a_cpu_fault_kills_the_process_with_sigsegv(sh):
     sh.allow("[user] #")  # The kernel reports the fault of the child, which is the point.
     since = len(sh.transcript)
     probe(sh, "fault")
-    faults = re.findall(r"\[user\] #14 \(page fault\)", sh.transcript[since:])
+    faults = re.findall(r"\[user\] #\S+ \(page fault\)", sh.transcript[since:])
     assert len(faults) == 1, f"expected the child's page fault only: {sh.transcript[since:]!r}"
 
 
@@ -88,8 +88,9 @@ def test_files_openat_dup3_and_the_x86_only_calls(sh):
 
 def test_devices_are_described_and_granted_to_privileged_programs_only(sh):
     out = probe(sh, "devices")
-    # The PC's console: COM1, a 16550 (kind 1) in the I/O port space (space 1).
-    assert "console: COM1 kind 1 space 1 base 0x3f8 len 8 irq 4\n" in out, out
+    # The PC's console: COM1, a 16550 (kind 1) in the I/O port space (space 1); QEMU virt's:
+    # UART0, a PL011 (kind 2), memory-mapped (space 2).
+    assert Config.arch.console_info + "\n" in out, out
 
 
 def test_execve_keeps_and_resets_what_posix_says(sh):

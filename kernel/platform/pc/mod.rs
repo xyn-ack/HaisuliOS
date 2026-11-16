@@ -107,6 +107,9 @@ impl InterruptController for Pc {
         pic::init();
     }
 
+    /// The 8259s deliver to the boot CPU only: nothing to set up per CPU.
+    fn init_cpu() {}
+
     fn is_reserved(line: usize) -> bool {
         line == pic::RESERVED_LINE
     }

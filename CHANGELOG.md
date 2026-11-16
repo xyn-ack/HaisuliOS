@@ -6,8 +6,10 @@ roadmap are in [TODO.md](TODO.md).
 
 ## Unreleased
 
-The fourth and fifth steps toward a second CPU architecture. The machine and the CPU's own devices
-are behind contracts too: generic kernel code no longer names the local APIC, the IDT, the GDT,
+HaisuliOS runs on arm64: `make ARCH=aarch64` builds it for QEMU's `virt` machine, and `make check
+ARCH=aarch64` passes the same tests as on x86_64, on one CPU or several. That took three steps,
+the last of which is the bring-up itself. The machine and the CPU's own devices are behind
+contracts too: generic kernel code no longer names the local APIC, the IDT, the GDT,
 the SMP start-up or the entry stubs, nor any module of the PC platform; it boots, schedules and
 takes interrupts through traits that the compiler checks, like `UserRegs` and `PageTables`. And
 the ABI and user space are ready for arm64: system call numbers per architecture, devices granted
@@ -16,6 +18,26 @@ user program builds for `aarch64-unknown-none` (`make portcheck`).
 
 ### Added
 
+- arm64 (`kernel/arch/aarch64`): a Linux arm64 Image, entered at EL1 with the device tree; the
+  kernel in `TTBR1_EL1` (its image and a linear map of physical memory) and user space in
+  `TTBR0_EL1`, one root per address space, so a new one has nothing of the kernel to copy;
+  exception vectors that save the general-purpose and FP/SIMD registers in the trap frame (the
+  kernel's own code uses the SIMD registers); `UserRegs` for `x0` to `x30`, `SP_EL0` and
+  `ELR_EL1` (a restart backs up 4 bytes and puts `x0` back); the Linux arm64 signal frame, with
+  the FP/SIMD state in its `fpsimd_context`; per-CPU data in `TPIDR_EL1`; the GICv3 CPU interface
+  (system registers) and the generic timer for the tick and the reschedule IPI (SGI 0); PSCI
+  `CPU_ON` for the other CPUs and `SYSTEM_OFF` to power off.
+- QEMU's `virt` machine (`kernel/platform/qemu_virt`): the memory, the CPUs, the PSCI method, the
+  PL011 and the GIC from the device tree; the PL011 for the log; the GICv3 distributor for the
+  device lines and each CPU's redistributor; the boot modules as a ustar archive in the one
+  initrd that the Linux boot protocol has.
+- The kernel side of memory-mapped device grants: `device_grant` maps a device's registers
+  uncached into the driver, which `task_fork` does not copy and which are not freed as memory.
+  The console server drives the PL011 through it.
+- `InterruptController::init_cpu`, the controller's per-CPU part (the GIC's redistributor; the
+  PC has none); `PageTables::device_entry` and `is_device`.
+- `make ARCH=x86_64|aarch64` for every target, and the test runner's `--arch`; what the tests
+  may expect of each architecture is in `haisuli.ARCHES`.
 - `openat` (257 on x86_64, 56 on arm64), `dup3` (292, 24) and `fcntl(F_GETFD)`: the calls that
   arm64 has instead of `open` and `dup2`, which the runtime now uses everywhere. A relative path
   of `openat` starts at a directory descriptor (or at the root for `AT_FDCWD`).
@@ -46,6 +68,10 @@ user program builds for `aarch64-unknown-none` (`make portcheck`).
 
 ### Changed
 
+- The tests that checked x86 specifics check the architecture's (the banner, the console's device
+  and IRQ, QEMU's exit status on power-off); a CPU exception's report is one log message now.
+- User programs are linked with 4 KiB segment alignment (lld's default for arm64 is 64 KiB).
+- `/etc/motd` no longer says x86_64.
 - `abi::nr` has the architecture's Linux numbers, declared side by side for x86_64 and arm64;
   `open` and `dup2` are x86_64's only. `UC_SIGMASK` (now counted from the restorer's stack
   pointer) and `O_DIRECTORY` are per architecture too; the native calls are shared.

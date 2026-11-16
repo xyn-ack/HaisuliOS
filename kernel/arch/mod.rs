@@ -33,6 +33,10 @@
 //! Everything here may use unsafe Rust (see `main.rs`); the module documentation of each part
 //! says what makes its interface safe.
 
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod aarch64;
+#[cfg(target_arch = "aarch64")]
+use aarch64 as imp;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86_64;
 #[cfg(target_arch = "x86_64")]
@@ -115,6 +119,11 @@ pub(crate) trait PageTables {
     fn table_entry(table: u64) -> u64;
     /// An entry that maps the page at `frame` with `prot`.
     fn page_entry(frame: u64, prot: Prot) -> u64;
+    /// An entry that maps the device registers at `frame` with `prot`: uncached, and marked so
+    /// that [`is_device`](Self::is_device) tells it from a page of memory.
+    fn device_entry(frame: u64, prot: Prot) -> u64;
+    /// Whether a page entry maps device registers ([`device_entry`](Self::device_entry)).
+    fn is_device(entry: u64) -> bool;
     /// What a page entry allows.
     fn page_prot(entry: u64) -> Prot;
     /// The root of the address space with no user pages, for a CPU that runs no thread.

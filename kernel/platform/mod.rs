@@ -30,6 +30,10 @@
 pub(crate) mod pc;
 #[cfg(target_arch = "x86_64")]
 use pc as imp;
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod qemu_virt;
+#[cfg(target_arch = "aarch64")]
+use qemu_virt as imp;
 
 use crate::arch::percpu::MAX_CPUS;
 use core::ops::Range;
@@ -88,8 +92,16 @@ pub(crate) trait InterruptController {
     /// The number of interrupt lines.
     const LINES: usize;
 
-    /// Sets the controller up, with every device line masked.
+    /// Sets the controller up, with every device line masked; on the boot CPU, before any other
+    /// CPU is started.
     fn init();
+
+    /// Sets up the controller's part for the CPU this runs on (every CPU, after [`init`]
+    /// and the architecture's [`init_cpu`]), so that the CPU's own interrupts reach it.
+    ///
+    /// [`init`]: Self::init
+    /// [`init_cpu`]: crate::arch::Processor::init_cpu
+    fn init_cpu();
 
     /// Whether `line` (below [`LINES`](Self::LINES)) can never be a device's.
     fn is_reserved(line: usize) -> bool;
@@ -126,16 +138,29 @@ pub(crate) struct Device {
 }
 
 /// Where a device's registers are.
-///
-/// (Memory-mapped registers come with the first machine that has such devices: arm64's.)
 #[derive(Clone, Copy)]
 pub(crate) enum Registers {
     /// I/O ports `base..base + count`, on an architecture that has an I/O port space.
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        expect(dead_code, reason = "only x86 machines have I/O ports")
+    )]
     Ports {
         /// The first port.
         base: u64,
         /// How many.
         count: u64,
+    },
+    /// Memory-mapped registers at physical `base..base + len` (page aligned).
+    #[cfg_attr(
+        target_arch = "x86_64",
+        expect(dead_code, reason = "the PC's devices are in the I/O port space")
+    )]
+    Mmio {
+        /// The physical address of the first register.
+        base: u64,
+        /// How many bytes.
+        len: u64,
     },
 }
 

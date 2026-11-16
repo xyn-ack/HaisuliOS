@@ -37,9 +37,9 @@ today in the [README](README.md).
 
 ## A second CPU architecture (ARM)
 
-The kernel is being made portable to a second CPU architecture, arm64 (aarch64) on QEMU's `virt`
-machine first, in small steps that each keep `make check` (and `TEST_EXPLICIT="smp"`,
-`TEST_ARGS="--cpus 4"`) passing. The design: `kernel/arch/<cpu>/` for the CPU architecture and
+HaisuliOS runs on a second CPU architecture, arm64 (aarch64), on QEMU's `virt` machine
+(`make ARCH=aarch64`). It got there in small steps that each kept `make check` (and
+`TEST_EXPLICIT="smp"`, `TEST_ARGS="--cpus 4"`) passing. The design: `kernel/arch/<cpu>/` for the CPU architecture and
 `kernel/platform/<machine>/` for the machine around it, selected at compile time, each used by the
 rest of the kernel only through what its `mod.rs` re-exports (see
 [ARCHITECTURE.md](docs/ARCHITECTURE.md#source-layout)). The platform may use the architecture;
@@ -72,32 +72,25 @@ Done:
    assembly, and `rt::device` for register access from a grant, so the console server has no
    unsafe code and chooses its UART driver (16550 or PL011). `make portcheck` keeps it so.
 
-To do:
+6. **The build, the tests, and the arm64 bring-up.** `make ARCH=x86_64|aarch64` (`make check
+   ARCH=aarch64` passes the same tests, and `TEST_EXPLICIT="smp"`). `arch/aarch64`: a Linux
+   Image entered at EL1, the kernel in `TTBR1_EL1` (a linear map of physical memory) and user
+   space in `TTBR0_EL1`, exception vectors with the FP/SIMD state in the trap frame, `UserRegs`,
+   the Linux signal frame, the context switch, `TPIDR_EL1`, the GICv3 CPU interface and the
+   generic timer, PSCI `CPU_ON` and `SYSTEM_OFF`. `platform/qemu_virt`: the device tree, the
+   PL011, the GICv3 distributor and redistributors, the boot modules in one initrd. The kernel
+   side of memory-mapped device grants, which the console server's PL011 driver uses.
 
-6. **The build, the tests, and the arm64 bring-up.**
-   - `make ARCH=x86_64|aarch64`: the target triple, the linker scripts, the 32-bit `objcopy` step
-     (Multiboot only), the QEMU binary and machine (`qemu-system-aarch64 -M virt`); the test
-     harness configured the same way, powering off through PSCI `SYSTEM_OFF` rather than
-     `isa-debug-exit`.
-   - `arch/aarch64` and `platform/qemu_virt`: the boot entry (EL1, device tree), the PL011 for the
-     log, exception vectors and the `UserRegs` implementation (`x0`-`x30`, `SP_EL0`, `ELR_EL1`;
-     a restart backs up 4 bytes), the context switch, per-CPU data in `TPIDR_EL1`, the page
-     tables (`TTBR0_EL1` for user space, `TTBR1_EL1` for the kernel, so `init_root` has nothing to
-     copy), the GIC and the generic timer; one CPU first, then the others through PSCI `CPU_ON`.
-   - The kernel side of memory-mapped device grants (the PC has none, so it waited for arm64):
-     `platform::Registers::Mmio`, mapping a device's registers uncached into the driver's address
-     space, and keeping those pages out of `task_fork`'s copy and out of the frame allocator when
-     the task ends. The ABI, the runtime's `device` and the console's PL011 driver are ready.
-   - The user programs' link for arm64 (`user.ld` at the same address; lld's default 64 KiB
-     segment alignment, or `-z max-page-size=4096`).
-   - Step 4's contracts there: `BootInfo` and `Machine::cpus()` from the device tree (`/memory`,
-     `/chosen`'s initrd, MPIDR values from `/cpus`), `InterruptController` on the GIC's
-     distributor, `CpuInterrupts` on the generic timer and the GIC's CPU interface (an SGI for
-     the reschedule IPI; the entry decodes the interrupt id into an `arch::Interrupt`). The GIC's
-     per-CPU part may need a per-CPU hook in `InterruptController`, which the PC has no use for.
+Left for later, on arm64 (none of it matters on QEMU's `virt` as the tests run it):
 
-   Done when `make check ARCH=aarch64` passes the same tests as on x86_64, then
-   `TEST_EXPLICIT="smp"`.
+- Entry at EL2 (QEMU's `virtualization=on`, most real boards): the kernel expects EL1.
+- Caches while the MMU is off: the boot code writes the boot tables, and the other CPUs read
+  them, without cache maintenance, which QEMU does not need but real hardware does.
+- Up to 1 GiB of RAM (the boot tables map 2 GiB of physical memory); one GIC redistributor
+  region; the device tree's `/memreserve/` and memory nodes, but no `reserved-memory` node.
+- No address space ids: every switch of address space flushes the CPU's TLB.
+- QEMU's exit status on power-off is always 0 (PSCI `SYSTEM_OFF` has no code): a kernel panic
+  shows in the log only.
 
 ## Smaller items
 

@@ -12,8 +12,14 @@ make check TEST_ARGS="-v -j 1"      # one at a time, print every transcript
 make check TEST_EXPLICIT="process-server"  # only the explicit tests named process-server
 make check TEST_EXPLICIT="smp"      # only the SMP and thread tests (see below)
 make check TEST_ARGS="--cpus 4"     # every machine gets 4 CPUs, unless its test asks otherwise
+make check ARCH=aarch64             # the same tests on arm64 (QEMU's virt machine)
 python3 test/run_tests.py --list    # list the test ids
 ```
+
+The tests are the same on every architecture. What legitimately differs (QEMU's binary and
+machine, QEMU's exit status on power-off, the console device's name, IRQ line and description)
+is in one table, `haisuli.ARCHES`, which the runner picks with `--arch` (`make check` passes
+`ARCH`); a test compares with that rather than accept anything.
 
 *Explicit* tests, such as the tests of a feature that is still being written, never run by
 default. A test file makes its tests explicit with `EXPLICIT = "name"` at module level. They
