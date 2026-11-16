@@ -21,13 +21,16 @@ RAMDISK  := build/initrd.tar
 MODULES  := build/init,build/proc,$(RAMDISK)
 # Programs in the ramdisk, by directory.
 SBIN     := console
-BIN      := echo true false probe_test
+BIN      := echo true false nproc probe_test smp_test
 
 # COM1 on the terminal, multiplexed with the QEMU monitor: Ctrl-C and other
 # keys go to HaisuliOS, Ctrl-A X quits QEMU, Ctrl-A C toggles the monitor.
 SERIAL := -chardev stdio,id=con,mux=on,signal=off -serial chardev:con -mon chardev=con
 
-QEMU_FLAGS := -kernel $(IMG) -initrd "$(MODULES)" -m 128M $(SERIAL) \
+# CPUs of the machine that `make run` boots (up to 16).
+CPUS ?= 1
+
+QEMU_FLAGS := -kernel $(IMG) -initrd "$(MODULES)" -m 128M -smp $(CPUS) $(SERIAL) \
               -display none -no-reboot
 
 PYTHON ?= python3
@@ -73,7 +76,8 @@ debug: all
 # Pass runner options with TEST_ARGS, e.g. make check TEST_ARGS="-v echo".
 # Explicit tests (a test file with EXPLICIT = "name", e.g. for a feature still
 # being written) only run when named exactly, e.g.
-# make check TEST_EXPLICIT="process-server"; then only they run.
+# make check TEST_EXPLICIT="process-server" or TEST_EXPLICIT="smp"; then only they run.
+# TEST_ARGS="--cpus N" boots every machine with N CPUs, unless its test asks otherwise.
 check: all
 	$(PYTHON) test/run_tests.py --qemu $(QEMU) --kernel $(IMG) --modules "$(MODULES)" \
 		$(foreach name,$(TEST_EXPLICIT),--explicit "$(name)") $(TEST_ARGS)

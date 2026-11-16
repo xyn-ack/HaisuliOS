@@ -82,14 +82,19 @@ pub(crate) fn free_frames() -> usize {
     FREE.load(Ordering::Relaxed)
 }
 
+/// Takes a free frame. Several CPUs may allocate at once: a frame is only theirs if their
+/// `fetch_or` is the one that set its bit.
 pub(crate) fn alloc_frame() -> Option<u64> {
     for (w, word) in BITMAP.iter().enumerate() {
-        let bits = word.load(Ordering::Relaxed);
-        if bits != u64::MAX {
+        let mut bits = word.load(Ordering::Relaxed);
+        while bits != u64::MAX {
             let bit = (!bits).trailing_zeros() as usize;
-            word.fetch_or(1 << bit, Ordering::Relaxed);
-            FREE.fetch_sub(1, Ordering::Relaxed);
-            return Some(((w * 64 + bit) as u64) * PAGE_SIZE);
+            let old = word.fetch_or(1 << bit, Ordering::AcqRel);
+            if old & (1 << bit) == 0 {
+                FREE.fetch_sub(1, Ordering::Relaxed);
+                return Some(((w * 64 + bit) as u64) * PAGE_SIZE);
+            }
+            bits = old | (1 << bit); // Another CPU took it first: try the next one.
         }
     }
     None

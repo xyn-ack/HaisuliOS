@@ -7,7 +7,9 @@
 //! The server owns the UART (I/O ports granted with `ioperm`, receive interrupts delivered as IPC
 //! notifications) and implements a small canonical-mode line discipline on top of it: input is
 //! echoed and edited (Backspace, Ctrl-U, Ctrl-C) until Enter, then becomes readable as one line;
-//! Ctrl-D on an empty line is end-of-file.
+//! Ctrl-D on an empty line is end-of-file. The kernel's debug log goes out of the same line, so
+//! the server sends its output through the kernel's transmitter (`serial_write`): then neither
+//! can cut into the other's output, even when they run on different CPUs at once.
 //!
 //! Protocol ([`haisuli_rt::abi::console`], usually reached through `read(0)` and `write(1|2)`,
 //! which the kernel forwards here):
@@ -40,7 +42,7 @@ const LINE_MAX: usize = 256;
 
 #[expect(unsafe_code)]
 mod uart {
-    //! 16550 UART on COM1, polled output, interrupt-driven input.
+    //! 16550 UART on COM1: interrupt-driven input; output through the kernel's transmitter.
     use core::arch::asm;
     use haisuli_rt::abi::uart::{
         FifoControl, InterruptEnable, LineControl, LineStatus, ModemControl, Register, COM1,
@@ -107,17 +109,29 @@ mod uart {
     }
 
     pub(crate) fn write_byte(b: u8) {
-        while !line_status(LineStatus::TransmitterEmpty) {}
-        outb(Register::Data, b);
+        let _ = haisuli_rt::sys::serial_write(&[b]);
     }
 
-    /// Terminal output: newline becomes CR LF.
+    /// Terminal output: newline becomes CR LF. Sent in one piece (see the module documentation),
+    /// in chunks of this many bytes of output.
     pub(crate) fn write(bytes: &[u8]) {
+        const CHUNK: usize = 512;
+        let mut out = [0u8; CHUNK];
+        let mut len = 0;
         for &b in bytes {
-            if b == b'\n' {
-                write_byte(b'\r');
+            if len + 2 > CHUNK {
+                let _ = haisuli_rt::sys::serial_write(&out[..len]);
+                len = 0;
             }
-            write_byte(b);
+            if b == b'\n' {
+                out[len] = b'\r';
+                len += 1;
+            }
+            out[len] = b;
+            len += 1;
+        }
+        if len > 0 {
+            let _ = haisuli_rt::sys::serial_write(&out[..len]);
         }
     }
 }

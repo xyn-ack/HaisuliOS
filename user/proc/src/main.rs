@@ -4,9 +4,9 @@
 //!
 //! Implements POSIX processes and signals in user space, on top of the kernel's tasks.
 //!
-//! The kernel only knows tasks: address spaces with a thread, identified by task ids. Everything
-//! POSIX about them lives here, in the task registered as [`svc::PROC`], which the kernel makes
-//! its *task manager*:
+//! The kernel only knows tasks: address spaces with one or more threads, identified by task ids.
+//! Everything POSIX about them lives here, in the task registered as [`svc::PROC`], which the
+//! kernel makes its *task manager*:
 //!
 //! - Process ids, which are not task ids. Each process record names the task running it; a boot
 //!   module becomes a process under its task id, a forked child gets the lowest free pid.
@@ -28,6 +28,14 @@
 //!   (`task_exec`). At boot, the server also starts the system servers listed in [`SERVERS`]
 //!   (`task_spawn`), such as the console server: the ones that are not needed to get this far.
 //!   They run privileged, with no parent, like boot modules.
+//! - Threads: a process is its task, with all of its threads (which the kernel starts with
+//!   `clone`). Any thread may make a request: the kernel tells the server the calling thread,
+//!   which gets the reply, and its task, which names the process. So `getpid` is the same in
+//!   every thread, `exit` and the default action of a signal end every thread (`task_kill`),
+//!   `fork` copies only the calling thread (`task_fork` of that thread) and `execve` ends the
+//!   others. Several threads may wait in `pause` or `wait4` at once; a caught signal goes to one
+//!   of them if there is one, and ends its wait. Signal masks and dispositions are the
+//!   process's (POSIX gives every thread a mask of its own; HaisuliOS does not yet).
 //!
 //! Requests come as IPC calls ([`haisuli_rt::abi::proc`]); `pause` and a blocking `wait4` are
 //! answered later, so the server never blocks on a client. It never calls another server either:
@@ -66,6 +74,8 @@ const PID_MAX: u64 = 32767;
 const INIT_PID: u64 = 1;
 /// The most words of a request (`OP_SIGACTION`).
 const REQUEST_WORDS_MAX: usize = 10;
+/// The most threads of one process that can wait in `pause` or `wait4` at once.
+const MAX_WAITERS: usize = 8;
 /// The file listing the system servers to start at boot, one path per line.
 ///
 /// They run privileged: they are the ones that drive hardware and provide the
@@ -85,13 +95,25 @@ enum Life {
 /// A request that the server answers later.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Waiting {
-    None,
     /// `pause`: until a handler is about to run.
     Pause,
     /// `wait4`: until a child it waits for ends.
-    Wait {
-        want: i64,
-    },
+    Wait { want: i64 },
+}
+
+/// A thread that waits for the answer to a request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Waiter {
+    /// The waiting thread (the kernel's id); 0 if the entry is free.
+    thread: u64,
+    what: Waiting,
+}
+
+impl Waiter {
+    const NONE: Waiter = Waiter {
+        thread: 0,
+        what: Waiting::Pause,
+    };
 }
 
 /// A process.
@@ -114,8 +136,8 @@ struct Proc {
     /// Whether a signal stopped the process.
     stopped: bool,
     signals: Signals,
-    /// What the process waits for in a request to the server.
-    waiting: Waiting,
+    /// Its threads that wait for a request to the server.
+    waiters: [Waiter; MAX_WAITERS],
 }
 
 impl Proc {
@@ -130,7 +152,7 @@ impl Proc {
         wstatus: 0,
         stopped: false,
         signals: Signals::DEFAULT,
-        waiting: Waiting::None,
+        waiters: [Waiter::NONE; MAX_WAITERS],
     };
 
     fn alive(&self) -> bool {
@@ -139,6 +161,36 @@ impl Proc {
 
     fn exists(&self) -> bool {
         self.life != Life::Unused
+    }
+
+    /// Makes `thread` wait for the answer to request `what`; `false` if too many threads wait.
+    fn add_waiter(&mut self, thread: u64, what: Waiting) -> bool {
+        match self.waiters.iter_mut().find(|w| w.thread == 0) {
+            Some(w) => {
+                *w = Waiter { thread, what };
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Takes the waiting request of `thread`, if it has one.
+    fn take_waiter(&mut self, thread: u64) -> Option<Waiting> {
+        let w = self
+            .waiters
+            .iter_mut()
+            .find(|w| w.thread != 0 && w.thread == thread)?;
+        let what = w.what;
+        *w = Waiter::NONE;
+        Some(what)
+    }
+
+    /// The first thread that waits for an answer, if any.
+    fn first_waiter(&self) -> Option<u64> {
+        self.waiters
+            .iter()
+            .find(|w| w.thread != 0)
+            .map(|w| w.thread)
     }
 
     /// The program name as text.
@@ -207,7 +259,7 @@ fn log(args: fmt::Arguments<'_>) {
     w.flush();
 }
 
-/// Completes `client`'s request with `status`.
+/// Completes the request of thread `client` with `status`.
 ///
 /// If the client is gone (its task was killed), there is nobody to tell.
 fn reply(client: u64, status: i64) {
@@ -230,6 +282,14 @@ fn read_words<const N: usize>(client: u64, len: u64) -> Result<[u64; N], i64> {
         *w = u64::from_ne_bytes(*b);
     }
     Ok(words)
+}
+
+/// Stores the wait status in the `wait4` request of thread `client`; returns its result.
+fn report_reaped(client: u64, pid: u64, status: i32) -> i64 {
+    match write_words(client, 2, &[status as u32 as u64]) {
+        Ok(()) => pid as i64,
+        Err(e) => e,
+    }
 }
 
 /// Writes `words` into `client`'s request, from word `index` on.
@@ -304,7 +364,7 @@ impl Server {
             (PID_KERNEL, KMSG_TASK_EXIT) => self.task_ended(m.b, Termination::exit(0)),
             (PID_KERNEL, KMSG_TASK_FAULT) => self.task_ended(m.b, Termination::Signalled(SIGSEGV)),
             (PID_KERNEL, _) => {}
-            (client, op) => self.request(client, op, m.b),
+            (client, op) => self.request(client, m.task, op, m.b),
         }
     }
 
@@ -316,16 +376,17 @@ impl Server {
         }
     }
 
-    /// Handles request `op` from task `client`, whose call buffer is `len` bytes.
-    fn request(&mut self, client: u64, op: u64, len: u64) {
-        let Some(i) = self.by_tid(client) else {
+    /// Handles request `op` from thread `client` of task `task`, whose call buffer is `len`
+    /// bytes.
+    fn request(&mut self, client: u64, task: u64, op: u64, len: u64) {
+        let Some(i) = self.by_tid(task) else {
             reply(client, -ESRCH);
             return;
         };
         let result = match op {
             OP_GETPID => Some(self.procs[i].pid as i64),
             OP_GETPPID => Some(self.procs[i].ppid as i64),
-            OP_FORK => Some(self.fork(i)),
+            OP_FORK => Some(self.fork(i, client)),
             OP_EXIT => match read_words::<1>(client, len) {
                 Ok([code]) => {
                     self.terminate(i, Termination::exit(code as i32));
@@ -334,7 +395,7 @@ impl Server {
                 Err(e) => Some(e),
             },
             OP_WAIT => match read_words::<2>(client, len) {
-                Ok([want, options]) => self.wait(i, want as i64, options),
+                Ok([want, options]) => self.wait(i, client, want as i64, options),
                 Err(e) => Some(e),
             },
             OP_KILL => Some(match read_words::<2>(client, len) {
@@ -355,13 +416,16 @@ impl Server {
                 Err(e) => e,
             }),
             OP_PAUSE => {
-                self.procs[i].waiting = Waiting::Pause;
-                self.act(i); // Ends the pause at once for a deliverable signal.
-                self.end_wait_for_upcall(i);
-                None
+                if self.procs[i].add_waiter(client, Waiting::Pause) {
+                    self.act(i); // Ends the pause at once for a deliverable signal.
+                    self.end_wait_for_upcall(i, client);
+                    None
+                } else {
+                    Some(-EAGAIN)
+                }
             }
-            OP_SIGACTION => Some(self.sigaction(i, len)),
-            OP_SIGPROCMASK => Some(self.sigprocmask(i, len)),
+            OP_SIGACTION => Some(self.sigaction(client, i, len)),
+            OP_SIGPROCMASK => Some(self.sigprocmask(client, i, len)),
             OP_SIGRETURN => Some(match read_words::<1>(client, len) {
                 Ok([mask]) => {
                     self.procs[i].signals.blocked = SigSet::from_bits(mask).blockable();
@@ -382,30 +446,34 @@ impl Server {
                 Ok([pid]) => self.attribute(i, pid, |p| p.sid),
                 Err(e) => e,
             }),
-            OP_LIST => Some(self.list(i, len)),
-            OP_EXEC => self.exec(i, len),
+            OP_LIST => Some(self.list(client, task, len)),
+            OP_EXEC => self.exec(i, client, len),
             _ => Some(-ENOSYS),
         };
         if let Some(status) = result {
-            reply(client, status);
             // Signals that became deliverable (a mask that changed, a handler
-            // that returned, a signal the process sent itself) act now: the
-            // kernel enters a handler when the reply reaches the process.
-            if self.procs[i].alive() && self.procs[i].tid == client {
-                self.act(i);
+            // that returned, a signal the process sent itself) act now, before
+            // the reply: a handler goes to the thread that gets it, which then
+            // enters it on its way back (on another CPU, the reply may reach it
+            // at once). So the handler has run by the time the call returns, as
+            // POSIX requires of `sigprocmask` and of `kill` to oneself.
+            if self.procs[i].alive() && self.procs[i].tid == task {
+                self.act_returning(i, Some(client));
             }
+            reply(client, status);
         }
     }
 
-    /// `fork`: copies the caller `i` into a new child process.
-    fn fork(&mut self, i: usize) -> i64 {
+    /// `fork`: copies process `i` into a new child process, whose only thread is a copy of the
+    /// calling thread `client`.
+    fn fork(&mut self, i: usize, client: u64) -> i64 {
         let (Some(slot), Some(pid)) =
             (self.procs.iter().position(|p| !p.exists()), self.free_pid())
         else {
             return -EAGAIN;
         };
         let parent = self.procs[i];
-        let tid = match sys::task_fork(parent.tid) {
+        let tid = match sys::task_fork(client) {
             Ok(tid) => tid,
             Err(e) => return -e.0,
         };
@@ -423,11 +491,11 @@ impl Server {
         pid as i64
     }
 
-    /// `execve`: makes process `i` run the program that its request names.
+    /// `execve`: makes process `i` run the program that the request of its thread `client`
+    /// names (its other threads end).
     ///
     /// On success the process runs the new program, so there is no reply.
-    fn exec(&mut self, i: usize, len: u64) -> Option<i64> {
-        let client = self.procs[i].tid;
+    fn exec(&mut self, i: usize, client: u64, len: u64) -> Option<i64> {
         if len > ARG_MAX as u64 {
             return Some(-E2BIG);
         }
@@ -451,7 +519,9 @@ impl Server {
                 *action = SigAction::DEFAULT;
             }
         }
-        if let Ok(info) = sys::task_info(client) {
+        // The other threads are gone, and so are their requests.
+        p.waiters = [Waiter::NONE; MAX_WAITERS];
+        if let Ok(info) = sys::task_info(p.tid) {
             p.name = info.name;
         }
         self.act(i);
@@ -544,7 +614,7 @@ impl Server {
         p.tid = 0;
         p.wstatus = how.wait_status();
         p.stopped = false;
-        p.waiting = Waiting::None;
+        p.waiters = [Waiter::NONE; MAX_WAITERS];
         p.signals.pending = SigSet::EMPTY;
         let (pid, ppid) = (p.pid, p.ppid);
         log(format_args!(
@@ -579,19 +649,22 @@ impl Server {
 
     // ---- wait4 ------------------------------------------------------------------
 
-    /// `wait4`: reaps a child of process `i` that `want` selects, or waits for one.
+    /// `wait4` by thread `client`: reaps a child of process `i` that `want` selects, or waits
+    /// for one.
     ///
     /// `want` selects the children the POSIX way: a pid waits for that child, -1 for any child,
     /// 0 for the caller's process group and anything below -1 for process group `-want`.
-    fn wait(&mut self, i: usize, want: i64, options: u64) -> Option<i64> {
+    fn wait(&mut self, i: usize, client: u64, want: i64, options: u64) -> Option<i64> {
         match self.reap(i, want) {
-            Reap::Reaped(pid, status) => Some(self.report_reaped(i, pid, status)),
+            Reap::Reaped(pid, status) => Some(report_reaped(client, pid, status)),
             Reap::NoChild => Some(-ECHILD),
             Reap::NotYet if options & WNOHANG != 0 => Some(0),
+            Reap::NotYet if !self.procs[i].add_waiter(client, Waiting::Wait { want }) => {
+                Some(-EAGAIN)
+            }
             Reap::NotYet => {
-                self.procs[i].waiting = Waiting::Wait { want };
                 self.act(i); // A deliverable signal interrupts the wait at once.
-                self.end_wait_for_upcall(i);
+                self.end_wait_for_upcall(i, client);
                 None
             }
         }
@@ -628,30 +701,31 @@ impl Server {
         }
     }
 
-    /// Stores the wait status in process `i`'s `wait4` request; returns its result.
-    fn report_reaped(&self, i: usize, pid: u64, status: i32) -> i64 {
-        match write_words(self.procs[i].tid, 2, &[status as u32 as u64]) {
-            Ok(()) => pid as i64,
-            Err(e) => e,
-        }
-    }
-
-    /// Completes the `wait4` that process `pid` is blocked in, if a child it waits for ended
-    /// (or none is left).
+    /// Completes the `wait4`s that threads of process `pid` are blocked in, if a child they
+    /// wait for ended (or none is left).
     fn wake_waiter(&mut self, pid: u64) {
         let Some(i) = self.live(pid) else {
             return;
         };
-        let Waiting::Wait { want } = self.procs[i].waiting else {
-            return;
-        };
-        let status = match self.reap(i, want) {
-            Reap::Reaped(child, status) => self.report_reaped(i, child, status),
-            Reap::NoChild => -ECHILD,
-            Reap::NotYet => return,
-        };
-        self.procs[i].waiting = Waiting::None;
-        reply(self.procs[i].tid, status);
+        for w in 0..MAX_WAITERS {
+            let Waiter {
+                thread,
+                what: Waiting::Wait { want },
+            } = self.procs[i].waiters[w]
+            else {
+                continue;
+            };
+            if thread == 0 {
+                continue;
+            }
+            let status = match self.reap(i, want) {
+                Reap::Reaped(child, status) => report_reaped(thread, child, status),
+                Reap::NoChild => -ECHILD,
+                Reap::NotYet => continue,
+            };
+            self.procs[i].waiters[w] = Waiter::NONE;
+            reply(thread, status);
+        }
     }
 
     // ---- Signals ----------------------------------------------------------------
@@ -750,6 +824,12 @@ impl Server {
     /// Only one handler is entered at a time: once the kernel holds an upcall for the process,
     /// further caught signals stay pending, but default actions still happen.
     fn act(&mut self, i: usize) {
+        self.act_returning(i, None);
+    }
+
+    /// [`act`](Self::act), while thread `returning` of process `i` is about to get a reply: a
+    /// handler runs in it, unless a thread waits in `pause` or `wait4`.
+    fn act_returning(&mut self, i: usize, returning: Option<u64>) {
         let mut upcall_held = false;
         let mut later = SigSet::EMPTY;
         loop {
@@ -764,7 +844,7 @@ impl Server {
             let act = p.signals.actions[sig as usize];
             match act.disposition(sig) {
                 Disposition::Catch => {
-                    if upcall_held || !self.enter_handler(i, sig, act) {
+                    if upcall_held || !self.enter_handler(i, sig, act, returning) {
                         later.add(sig);
                     }
                     upcall_held = true;
@@ -791,22 +871,34 @@ impl Server {
 
     /// Makes process `i` enter the handler `act` for `sig`, with an upcall.
     ///
-    /// Returns `false` if the kernel still holds an earlier upcall for the process.
-    fn enter_handler(&mut self, i: usize, sig: u64, act: SigAction) -> bool {
+    /// The handler runs in a thread that waits in `pause` or `wait4` here, if there is one
+    /// (whose wait it ends); else in thread `returning`, which is about to get a reply; else the
+    /// kernel picks a thread. Returns `false` if the kernel still holds an earlier upcall for
+    /// the process.
+    fn enter_handler(
+        &mut self,
+        i: usize,
+        sig: u64,
+        act: SigAction,
+        returning: Option<u64>,
+    ) -> bool {
         let p = &mut self.procs[i];
+        let waiter = p.first_waiter();
+        let thread = waiter.or(returning);
+        let restart = if act.flags & SA_RESTART != 0 {
+            upcall::RESTART
+        } else {
+            0
+        };
         let request = [
             act.handler,
             act.restorer,
             sig,
             p.signals.senders[sig as usize],
             p.signals.blocked.bits(),
-            if act.flags & SA_RESTART != 0 {
-                upcall::RESTART
-            } else {
-                0
-            },
+            restart | thread.map_or(0, |_| upcall::THREAD),
         ];
-        if sys::task_upcall(p.tid, &request).is_err() {
+        if sys::task_upcall(thread.unwrap_or(p.tid), &request).is_err() {
             return false;
         }
         p.signals.pending.remove(sig);
@@ -814,43 +906,41 @@ impl Server {
         if act.flags & SA_RESETHAND != 0 {
             p.signals.actions[sig as usize] = SigAction::DEFAULT;
         }
-        self.interrupt_wait(i);
+        if let Some(thread) = waiter {
+            self.interrupt_wait(i, thread);
+        }
         true
     }
 
-    /// Ends the `pause` or `wait4` that process `i` sleeps in here, because a handler is about
-    /// to run.
+    /// Ends the `pause` or `wait4` that thread `thread` of process `i` sleeps in here, because
+    /// a handler is about to run in it.
     ///
     /// `wait4` fails with `EINTR` (which the kernel restarts after a `SA_RESTART` handler);
     /// `pause` replies 0, which the runtime reports as `EINTR`, so that it is never restarted.
-    fn interrupt_wait(&mut self, i: usize) {
-        let p = &mut self.procs[i];
-        let status = match core::mem::replace(&mut p.waiting, Waiting::None) {
-            Waiting::None => return,
-            Waiting::Pause => 0,
-            Waiting::Wait { .. } => -EINTR,
+    fn interrupt_wait(&mut self, i: usize, thread: u64) {
+        let status = match self.procs[i].take_waiter(thread) {
+            None => return,
+            Some(Waiting::Pause) => 0,
+            Some(Waiting::Wait { .. }) => -EINTR,
         };
-        reply(p.tid, status);
+        reply(thread, status);
     }
 
-    /// Ends the `pause` or `wait4` that process `i` is about to sleep in if the kernel still
-    /// holds an upcall for it.
+    /// Ends the `pause` or `wait4` that thread `thread` of process `i` is about to sleep in if
+    /// the kernel still holds an upcall for the process.
     ///
     /// That happens when a signal was turned into an upcall while the request was queued, not
     /// yet received: the handler runs when the request returns, so it must not sleep.
-    fn end_wait_for_upcall(&mut self, i: usize) {
+    fn end_wait_for_upcall(&mut self, i: usize, thread: u64) {
         let p = &self.procs[i];
-        if p.alive()
-            && p.waiting != Waiting::None
-            && sys::task_info(p.tid).is_ok_and(|info| info.upcall)
-        {
-            self.interrupt_wait(i);
+        if p.alive() && sys::task_info(p.tid).is_ok_and(|info| info.upcall) {
+            self.interrupt_wait(i, thread);
         }
     }
 
-    /// `rt_sigaction`: sets (and reports) the disposition of a signal of process `i`.
-    fn sigaction(&mut self, i: usize, len: u64) -> i64 {
-        let client = self.procs[i].tid;
+    /// `rt_sigaction` by thread `client`: sets (and reports) the disposition of a signal of
+    /// process `i`.
+    fn sigaction(&mut self, client: u64, i: usize, len: u64) -> i64 {
         let [sig, set, handler, flags, restorer, mask] = match read_words::<6>(client, len) {
             Ok(w) => w,
             Err(e) => return e,
@@ -875,12 +965,12 @@ impl Server {
         0
     }
 
-    /// `rt_sigprocmask`: changes (and reports) the blocked signals of process `i`.
+    /// `rt_sigprocmask` by thread `client`: changes (and reports) the blocked signals of
+    /// process `i`.
     ///
     /// SIGKILL and SIGSTOP are silently left unblocked. Signals that become
     /// unblocked are delivered when the call returns.
-    fn sigprocmask(&mut self, i: usize, len: u64) -> i64 {
-        let client = self.procs[i].tid;
+    fn sigprocmask(&mut self, client: u64, i: usize, len: u64) -> i64 {
         let [how, set_given, set] = match read_words::<3>(client, len) {
             Ok(w) => w,
             Err(e) => return e,
@@ -962,9 +1052,9 @@ impl Server {
 
     // ---- ps ----------------------------------------------------------------------
 
-    /// Lists the processes, by pid, into the request of process `i` (`len` bytes).
-    fn list(&self, i: usize, len: u64) -> i64 {
-        let client = self.procs[i].tid;
+    /// Lists the processes, by pid, into the request (`len` bytes) of thread `client` of task
+    /// `asking`.
+    fn list(&self, client: u64, asking: u64, len: u64) -> i64 {
         let capacity = len as usize / PROC_INFO_LEN;
         let mut written = 0;
         let mut last = 0;
@@ -979,12 +1069,17 @@ impl Server {
                 break;
             };
             last = p.pid;
+            let threads = match p.life {
+                Life::Alive => sys::task_info(p.tid).map_or(0, |info| info.threads),
+                _ => 0,
+            };
             let info = ProcInfo {
                 pid: p.pid,
                 ppid: p.ppid,
                 pgid: p.pgid,
                 sid: p.sid,
-                state: self.state_of(p, client),
+                state: self.state_of(p, asking),
+                threads,
                 name: p.name,
             };
             if let Err(e) = sys::ipc_write(client, written * PROC_INFO_LEN, &info.to_bytes()) {

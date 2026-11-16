@@ -25,6 +25,11 @@ pub(crate) enum Device {
     Pic2,
     /// POST diagnostic port, written only to wait a little.
     PostCode,
+    /// 8254 programmable interval timer: three counters and the mode register. Only counter 2
+    /// is used, to measure time while the kernel starts the other CPUs.
+    Pit,
+    /// System control port B: the gate of PIT counter 2 (bit 0) and its output (bit 5).
+    SystemControl,
     /// QEMU's isa-debug-exit device (no-op on real hardware).
     DebugExit,
 }
@@ -37,6 +42,8 @@ impl Device {
             Device::Pic1 => (0x20, 2),
             Device::Pic2 => (0xA0, 2),
             Device::PostCode => (0x80, 1),
+            Device::Pit => (0x40, 4),
+            Device::SystemControl => (0x61, 1),
             // QEMU: `-device isa-debug-exit,iobase=0xf4,iosize=0x04`.
             Device::DebugExit => (0xF4, 4),
         }
@@ -137,6 +144,14 @@ pub(crate) fn set_page_table(pml4: u64) {
     unsafe { asm!("mov cr3, {}", in(reg) pml4, options(nostack, preserves_flags)) };
 }
 
+/// The page tables this CPU uses (CR3).
+pub(crate) fn page_table() -> u64 {
+    let v: u64;
+    // SAFETY: Reading CR3 has no side effects.
+    unsafe { asm!("mov {}, cr3", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
 // ---- Descriptor tables -------------------------------------------------------
 
 #[repr(C, packed)]
@@ -147,7 +162,9 @@ struct DescriptorPointer {
 
 /// Loads the GDT, the kernel's segment selectors and the task register.
 ///
-/// Every segment register is reloaded. The table lives forever (`'static`).
+/// CS, DS, ES and SS are reloaded; FS and GS are left alone: loading a selector into GS would
+/// reset the GS base, which points at this CPU's [`super::percpu`] block (and neither is used
+/// as a segment in 64-bit mode). The table lives forever (`'static`).
 pub(crate) fn load_gdt(gdt: &'static [AtomicU64], code: u16, data: u16, tss: u16) {
     let ptr = DescriptorPointer {
         limit: (size_of_val(gdt) - 1) as u16,
@@ -167,9 +184,6 @@ pub(crate) fn load_gdt(gdt: &'static [AtomicU64], code: u16, data: u16, tss: u16
             "mov ds, {data:x}",
             "mov es, {data:x}",
             "mov ss, {data:x}",
-            "xor {tmp:e}, {tmp:e}",
-            "mov fs, {tmp:x}",
-            "mov gs, {tmp:x}",
             "ltr {tss:x}",
             ptr = in(reg) &ptr,
             code = in(reg) code as u64,
@@ -209,13 +223,14 @@ pub(crate) fn rdmsr(msr: Msr) -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
-/// Writes one of the system call MSRs (every [`Msr`] is one).
+/// Writes a model-specific register.
 ///
-/// Only [`super::entry`] may write them, and it points them at its own entry
-/// stub.
+/// Only the hardware layer may: [`super::entry`] points the system call MSRs at its own entry
+/// stub, [`super::percpu`] points the GS base at a CPU's own block and [`super::apic`] enables
+/// the local APIC at the address where the boot page tables map it.
 pub(super) fn wrmsr(msr: Msr, v: u64) {
     // SAFETY: See above; callers write values that describe the kernel's
-    // GDT layout and syscall entry point.
+    // own layout (GDT, entry points, per-CPU blocks, APIC mapping).
     unsafe {
         asm!("wrmsr", in("ecx") msr as u32, in("eax") v as u32, in("edx") (v >> 32) as u32,
              options(nomem, nostack, preserves_flags))

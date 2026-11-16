@@ -10,6 +10,8 @@ make check                          # build, then run every test
 make check TEST_ARGS="echo"         # only tests whose id contains "echo"
 make check TEST_ARGS="-v -j 1"      # one at a time, print every transcript
 make check TEST_EXPLICIT="process-server"  # only the explicit tests named process-server
+make check TEST_EXPLICIT="smp"      # only the SMP and thread tests (see below)
+make check TEST_ARGS="--cpus 4"     # every machine gets 4 CPUs, unless its test asks otherwise
 python3 test/run_tests.py --list    # list the test ids
 ```
 
@@ -17,6 +19,15 @@ python3 test/run_tests.py --list    # list the test ids
 default. A test file makes its tests explicit with `EXPLICIT = "name"` at module level. They
 run only when `TEST_EXPLICIT` gives that exact name (a substring does not match, unlike
 `TEST_ARGS`), and then only they run. `TEST_ARGS` can still narrow them down.
+
+A machine has one CPU unless its test asks for more with the `@cpus(n)` decorator from
+`haisuli` (QEMU's `-smp n`). `--cpus N` gives every other machine `N` CPUs, e.g. to run the
+whole suite on several CPUs: `make check TEST_ARGS="--cpus 4"` passes too.
+
+A test that asks for `n` CPUs may keep them all busy, so it also holds `n` of the host's CPUs
+while it runs (`--cpu-budget`, by default the host's number): the runner never starts more
+emulated CPUs that spin than the host has, which would make every test slow and its timeouts
+wrong. Machines that get their CPUs from `--cpus` mostly idle, and count as one.
 
 ## How the tests work
 
@@ -36,6 +47,11 @@ What the shell cannot reach, the test program `/bin/probe_test` does:
 each check, and exits with status 0 only if all passed. `test_probe.py` runs
 every case.
 
+`/bin/smp_test` does the same for multiple CPUs and threads (`test_smp.py`): `smp_test CASE [N]`,
+where `N` is the machine's number of CPUs, runs one case (`spin`, `threads`, `parallel N`,
+`thread-loop N`, `syscalls N`, `exit N`, `kill N`, `fault N`, `exec N`, `fork`, `signals`). It
+starts threads with the runtime's `thread::spawn`, on the kernel's `clone`.
+
 ## The test files
 
 ```
@@ -52,6 +68,11 @@ test/test_process.py      signals, process groups/sessions, waitpid semantics
 test/test_process_server.py  explicit ("process-server"): process management lives in the
                           process server (pids, exit statuses, zombies), not the kernel
 test/test_shell_redirection.py  >, >>, <, 2> and 2>&1, backed by the kernel's files
+test/test_smp.py          explicit ("smp"): written before SMP and threads existed. The CPUs are
+                          started and counted (boot log, nproc); jobs that keep CPUs busy leave
+                          the shell one; threads run at once on different CPUs and end with
+                          their process (exit, kill, fault, execve); fork copies one thread;
+                          a signal ends the pause of the thread that waits
 ```
 
 ## Writing a test
@@ -59,4 +80,5 @@ test/test_shell_redirection.py  >, >>, <, 2> and 2>&1, backed by the kernel's fi
 A test is a function `test_*(sh)` in a `test/test_*.py` file. It receives a
 machine waiting at its first prompt: `sh.run("echo hi")` types a command and
 returns its output (`"hi\n"`), `sh.run_raw(keys)` also returns the echoed
-line, and `sh.send()` / `sh.expect()` give full control.
+line, and `sh.send()` / `sh.expect()` give full control. A test that needs several CPUs says so
+with `@cpus(n)` (`from haisuli import cpus`).

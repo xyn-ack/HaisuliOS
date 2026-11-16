@@ -7,6 +7,7 @@ servers built on them. The [README](../README.md) has the overview and how to bu
 * [Source layout](#source-layout)
 * [Unsafe code](#unsafe-code)
 * [Boot](#boot)
+* [CPUs and threads](#cpus-and-threads)
 * [Virtual address space (per task)](#virtual-address-space-per-task)
 * [Syscall ABI](#syscall-abi)
 * [Processes](#processes)
@@ -23,33 +24,40 @@ kernel/            the kernel
   arch/            hardware layer: the only place with unsafe Rust (besides sync.rs)
     boot.rs        Multiboot entry, 32->64-bit switch, boot page tables (asm)
     cpu.rs         privileged instructions; port I/O on a fixed list of devices
+    percpu.rs      each CPU's own block, through GS (swapgs on every user/kernel switch)
+    apic.rs        local APICs: the tick, IPIs, starting CPUs; the PIT as a stopwatch
+    acpi.rs        the CPUs the firmware's MADT lists
+    smp.rs         starting the other CPUs: the real-mode trampoline (asm)
     entry.rs       exception/IRQ/syscall entry stubs, return to user mode (asm)
-    context.rs     kernel stacks, context switch
+    context.rs     kernel stacks, per-CPU idle contexts, context switch
     phys.rs        physical memory access, limited to allocator-owned frames
     multiboot.rs   boot-loader information: memory map, boot modules
     x86.rs         names for the CPU's numbers: register bits, vectors, descriptors
-  sync.rs          Lock: a cell that panics on re-entrant use instead of aliasing
-  gdt.rs           GDT + TSS (layout chosen for SYSCALL/SYSRET), I/O bitmap
+  sync.rs          Lock: a ticket spinlock that panics on re-entrant use
+  gdt.rs           GDT + a TSS per CPU (layout chosen for SYSCALL/SYSRET), I/O bitmap
   idt.rs           IDT, CPU exception handling
-  irq.rs           8259 PIC, forwarding IRQs to drivers
+  irq.rs           8259 PIC, forwarding IRQs to drivers; every interrupt's dispatch
   pmm.rs           Physical frame allocator (Multiboot memory map)
   vmm.rs           Paging: map, translate, clone (task_fork), destroy, user-memory copies
   elf.rs           ELF64 loader for user programs
   program.rs       a program's address space: its image, stack and arguments
   fs.rs            RAM file system (the unpacked ramdisk), open file descriptions
-  task.rs          Task table, scheduler, task control, upcalls, mmap, IPC, services
+  task.rs          Tasks and threads, the scheduler of every CPU, task control, upcalls,
+                   mmap, IPC, services
   upcall.rs        The frame that enters a handler (Linux signal frame layout)
   syscall.rs       Syscall dispatcher (Linux-compatible numbers)
-  serial.rs        COM1 kernel debug log, print!/println!
+  serial.rs        COM1 kernel debug log (and the console's transmitter), print!/println!
 abi/               syscall numbers, errno values, IPC protocols, the 16550 UART's
                    registers (kernel + user)
 user/rt/           user runtime: entry point, syscall wrappers, POSIX process calls
                    (requests to the process server), print!, panics
+  src/thread.rs    threads: spawn and join, on the kernel's clone and exit
 user/proc/         process server: POSIX processes and signals
   src/signals.rs   dispositions, default actions, signal sets
 user/console/      console server (/sbin/console)
-user/coreutils/    programs for /bin: echo, true, false
+user/coreutils/    programs for /bin: echo, true, false, nproc
 user/probe_test/   /bin/probe_test: a test program for what the shell cannot reach
+user/smp_test/     /bin/smp_test: a test program for multiple CPUs and threads
 user/init/         init (pid 1): /etc/motd, then a job control shell
   src/words.rs     command line words: quotes, `$?`, `&`, redirection operators
   src/redirect.rs  applying (and undoing) redirections
@@ -73,19 +81,28 @@ make them safe:
   DMA, with bounds-checked register offsets. Physical memory access only to
   frames the allocator owns; `phys` itself refuses anything in the kernel
   image, in boot-loader data or below 1 MiB. A context switch only to
-  contexts that the context module itself saved. (On top of that,
-  `vmm::map_user` maps only allocator frames, so user space never sees
-  kernel memory.)
-* `kernel/sync.rs`: `Lock`, which guards the task table and the TSS (all
-  other shared kernel state is atomics). On this single CPU it can only be
-  found held through re-entrant use, which panics instead of creating
-  aliased `&mut`.
+  contexts that the context module itself saved, and never to one that
+  another CPU has not finished leaving. (On top of that, `vmm::map_user`
+  maps only allocator frames, so user space never sees kernel memory.) The
+  local APIC's registers only at their fixed offsets, in the page the boot
+  page tables map. Firmware tables (ACPI) only where no allocator frame or
+  kernel data lies, read-only. The CPU trampoline only in its one page of
+  conventional memory, which nothing else uses. The GS base only as a
+  pointer to the CPU's own block.
+* `kernel/sync.rs`: `Lock`, a ticket spinlock, which guards the task table,
+  the TSSs, the file system, the serial line and the page-table changes (all
+  other shared kernel state is atomics). Kernel code runs with interrupts
+  disabled, so only another CPU can hold it while this one waits; if the
+  same CPU finds it held, that is re-entrant use, which panics instead of
+  deadlocking (or creating aliased `&mut`).
 * `user/rt`: the `syscall` instruction and the start-up code, which reads
   the arguments only within the initial stack area. The wrappers
   pass the kernel only pointers taken from borrows of the right length and
   mutability (`&mut` whenever the kernel or an IPC server may write). A
   `write()` buffer can be a shared borrow because the kernel enforces that
-  the console server only reads it (see below).
+  the console server only reads it (see below). `thread` starts a thread
+  with `clone` on a stack that no Rust object lives in, and ends it without
+  touching that stack once it has said so.
 * `user/console`: its UART's port I/O (its own 8 registers).
 * `user/proc`: handing out its process table, which is too big for the stack,
   as a `&'static mut` from a `static`: once, which an atomic flag enforces.
@@ -115,11 +132,79 @@ no parent and leads its own session and process group. init waits for the
 console while it starts: a terminal `read` or `write` waits for the console
 service to register.
 
+Before it starts any task, the boot CPU starts the others (see *CPUs and
+threads*) and logs how many run: `[kernel] 4 CPUs online`.
+
 Boot modules and system servers are *privileged*: they may use `ioperm`,
-`irq_bind`, `svc_register` and `power_off`. Nothing else is: neither copies
-made with `task_fork` (forked children) nor programs started with `execve`.
+`irq_bind`, `svc_register`, `serial_write` and `power_off`. Nothing else is:
+neither copies made with `task_fork` (forked children) nor programs started
+with `execve`.
 
 When init exits, the process server powers the machine off.
+
+## CPUs and threads
+
+**CPUs.** The boot CPU finds the others in the firmware's ACPI tables (the
+MADT's enabled local APICs, up to 16 CPUs) and starts them one at a time with
+the INIT / start-up IPI sequence: each wakes in 16-bit real mode in a
+*trampoline* that the boot CPU copied below 1 MiB, switches to long mode with
+the boot page tables, and enters Rust on a stack of its own. Every CPU has its
+own GDT entry and TSS (its kernel stack for interrupts, its I/O bitmap), its
+own `syscall` stack, and a small *per-CPU block* that its GS base points to in
+the kernel: every entry from user mode does `swapgs`, every return does it
+again. A CPU that takes too long to start is given up for good (it halts if it
+comes late), and no more are started.
+
+Each CPU's local APIC runs a periodic timer, the scheduler's *tick* (10 ms,
+calibrated against the PIT), and carries the *reschedule IPI*, with which one
+CPU makes another look at the scheduler. Device IRQs still come from the 8259
+PICs, to the boot CPU only. The serial line has one transmitter, the kernel's:
+its log and the console server's output (`serial_write`) each go out in one
+piece, however many CPUs write at once.
+
+**Threads.** A task is an address space (with its file descriptors, mailbox,
+services and privileges) and one or more threads. `clone` (with exactly
+`CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD`: a thread,
+not a process) starts another thread in the caller's task, which returns 0 on
+the new stack; `exit` ends the calling thread, and when the last one ends,
+the task ends as with `task_exit`. Thread and task ids share one range: a
+task's id is the id of its first thread, and stays taken until the task is
+gone. Ids are handed out round robin, so an id that was just freed is the last
+to be reused. The runtime's `thread::spawn` and `join` are built on these
+calls (see *Processes* for what they mean to POSIX).
+
+**Scheduling.** Every thread is in one table; each CPU takes the next runnable
+thread after the one it ran last (round robin). A thread runs until it blocks
+or yields; after its quantum (two ticks) the tick preempts it on its way back
+to user mode, if another thread waits. A thread that becomes runnable wakes
+an idle CPU with an IPI, except when the thread that made it runnable is about
+to give up its own CPU, which then runs it: a client's call goes straight to
+the server (a direct hand-off), and a server's reply, the program after
+`execve`, a new task or thread wake an idle CPU only if their maker is still
+running at the next tick. A CPU with nothing to run halts in its own *idle
+context* (its boot stack), until a reschedule IPI, or every tenth tick, makes
+it look again. The last step on every way back to
+user mode, at the end of a system call or of an interrupt that arrived in user
+mode, is where a thread ends if its task has ended, waits while its task is
+stopped, gives way when preempted, and enters an upcall.
+
+The scheduler's state is behind one lock, which every CPU takes: so the
+frequent paths (the tick, an interrupt's return to user mode, an idle CPU
+waking up) first look at per-CPU hints (atomics) and skip the lock when
+there is nothing to do, and IPIs go out only once the lock is released (an
+IPI is a device access, which can be slow). The lock is a ticket lock, handed
+out in order: a CPU that retakes it in a loop cannot starve the others.
+
+**Ending tasks.** A task never vanishes from under a CPU. Ending one (a kill,
+a fault, `task_exit`, or the exit of its last thread) makes it *dying*: its
+threads that are on no CPU end at once; the others are marked, their CPUs
+interrupted, and they end themselves at their next return to user mode or
+when they block. Its calls fail and its services go at once, but its address
+space and file descriptors are freed only once none of its threads is on a
+CPU any more (a CPU switches to another address space before it lets go of a
+thread's context) and no other task is copying to or from its memory (an IPC
+copy *pins* the task). `execve` ends the other threads of the task the same
+way, and frees the old address space once they are gone.
 
 ## Virtual address space (per task)
 
@@ -151,14 +236,19 @@ There are no process calls: `fork`, `exit`, `wait4`, `getpid`, `kill`,
 | 3      | `close(fd)`                       |                                                         |
 | 9      | `mmap(_,len,prot,...)`            | anonymous only; kernel chooses the address              |
 | 15     | `rt_sigreturn()`                  | from an upcall's restorer; restores the saved registers |
-| 24     | `sched_yield()`                   |                                                         |
+| 24     | `sched_yield()`                   | lets the other ready threads run                        |
 | 32     | `dup(fd)`                         | lowest free descriptor; shares the open file description |
 | 33     | `dup2(fd,newfd)`                  |                                                         |
 | 72     | `fcntl(fd,cmd,arg)`               | `F_DUPFD` only                                          |
 | 173    | `ioperm(from,num,on)`             | privileged; ports `0..0x400` only                       |
+| 56     | `clone(flags,stack,...)`          | a thread in the caller's task (`clone::THREAD_FLAGS` only) |
+| 60     | `exit(status)`                    | ends the calling thread (the last one ends the task)    |
+| 186    | `gettid()`                        | the calling thread's id                                 |
+| 204    | `sched_getaffinity(0,len,mask)`   | the online CPUs, one bit each                           |
 | 217    | `getdents64(fd,buf,len)`          | Linux `struct linux_dirent64` records                   |
+| 309    | `getcpu(&cpu,&node,_)`            | the CPU the caller runs on                              |
 | 0x1000 | `ipc_send(tid,a,b)`               | async; non-blocking; `-EAGAIN` if mailbox (8) is full   |
-| 0x1001 | `ipc_recv(&[u64;3])`              | blocking; `[sender, a, b]` (see below)                  |
+| 0x1001 | `ipc_recv(&[u64;4])`              | blocking; `[sender, a, b, task]` (see below)            |
 | 0x1002 | `ipc_call(tid,op,buf,len)`        | synchronous; blocks until the server replies            |
 | 0x1003 | `ipc_reply(client,status)`        | completes a received call; client gets `status`         |
 | 0x1004 | `ipc_read(client,off,dst,len)`    | copy from the client's call buffer (if the call allows) |
@@ -171,27 +261,30 @@ There are no process calls: `fork`, `exit`, `wait4`, `getpid`, `kill`,
 | 0x100D | `svc_wait(id)`                    | `svc_lookup`, but waits until the service registers     |
 | 0x100E | `task_self()`                     | the caller's task id                                    |
 | 0x1010 | `task_exit()`                     | ends the calling task; reported to the task manager     |
-| 0x1011 | `task_fork(tid)`                  | task manager; copies a task blocked in a call to it     |
+| 0x1011 | `task_fork(thread)`               | task manager; copies the task of a thread blocked in a call to it, with only that thread |
 | 0x1012 | `task_kill(tid)`                  | task manager; ends a task                               |
 | 0x1013 | `task_stop(tid)`                  | task manager; stops scheduling a task                   |
 | 0x1014 | `task_cont(tid)`                  | task manager; schedules a stopped task again            |
 | 0x1015 | `task_upcall(tid,&[u64;6])`       | task manager; enter a handler on the way to user mode   |
 | 0x1016 | `task_info(tid,buf,len)`          | a `TaskInfo`: running, blocked or stopped; its name     |
 | 0x1017 | `power_off()`                     | privileged                                              |
-| 0x1018 | `task_exec(tid,blk,len,flags)`    | task manager; a task blocked in a call to it runs a program from the file system |
+| 0x1018 | `task_exec(thread,blk,len,flags)` | task manager; the task of a thread blocked in a call to it runs a program from the file system (its other threads end) |
 | 0x1019 | `task_spawn(blk,len,flags)`       | task manager; a program from the file system in a new task |
+| 0x101A | `serial_write(buf,len)`           | privileged; raw bytes out of the serial line, in one piece (the console's output) |
 
 Task ids are the kernel's; pids are the process server's. IPC addresses
-tasks. The *task manager* is whichever task registered as service 2, the
+tasks, and any thread of a server may receive its calls; a call is made by a
+thread, and the reply goes to that thread. The *task manager* is whichever task registered as service 2, the
 process server: only it may use the task control calls (`task_fork` to
 `task_upcall`), and the kernel reports to it the tasks that end by
 themselves.
 
-`ipc_recv` delivers, in order: IRQ notifications `[0, KMSG_IRQ, line]`
+`ipc_recv` delivers, in order: IRQ notifications `[0, KMSG_IRQ, line, 0]`
 (sender 0 is the kernel and cannot be forged), for the task manager the
-reports of ended tasks (`[0, KMSG_TASK_EXIT, tid]` after `task_exit`,
-`[0, KMSG_TASK_FAULT, tid]` after a CPU exception), mailbox messages, then the
-oldest pending call `[client, op, len]`. A server may keep a call pending,
+reports of ended tasks (`[0, KMSG_TASK_EXIT, tid, 0]` after `task_exit` or the
+end of its last thread, `[0, KMSG_TASK_FAULT, tid, 0]` after a CPU exception),
+mailbox messages `[task, a, b, task]`, then the oldest pending call
+`[client thread, op, len, client task]`. A server may keep a call pending,
 without replying, for as long as it likes. The console server does this for
 `read` until a full line has been typed, and the process server for `pause`
 and `wait4`. If a server exits, its clients' calls fail with `-EPIPE`.
@@ -216,23 +309,40 @@ sessions, exit statuses and signal state. The user runtime (`user/rt`) turns
 the POSIX calls into `ipc_call`s to it; the protocol, `abi::proc`, passes a
 few `u64` words per request:
 
-* `fork`: the server has the kernel copy the caller's task (`task_fork`,
-  whose copy returns 0 from the pending call) and records the child, with
-  its parent's process group, session and signal dispositions.
-* `exit`, a signal's default action, a fault: the server ends the task
-  (`task_kill`; a fault has ended it already) and the process becomes a
-  **zombie**, which is only a record in the server with its POSIX wait
-  status. The task's memory and kernel slot are freed at once. The server
+* `fork`: the server has the kernel copy the caller's task with only the
+  calling thread (`task_fork`, whose copy returns 0 from the pending call)
+  and records the child, with its parent's process group, session and signal
+  dispositions.
+* `exit`, a signal's default action, a fault: the server ends the task, with
+  all its threads (`task_kill`; a fault has ended it already) and the process
+  becomes a **zombie**, which is only a record in the server with its POSIX
+  wait status. The task's memory and kernel slot are freed as soon as no CPU
+  uses them any more. The server
   logs the end, e.g. `[proc] pid 4 (init) exited (wait status 0xf)`,
   reparents the orphans to init and completes the parent's `wait4`.
 * `wait4` and `pause` are answered later: the server keeps the call pending,
-  so it never blocks on a client.
+  so it never blocks on a client. Several threads of a process may wait at
+  once; each gets its own answer.
 * `execve`: the server has the kernel replace the caller's program with one
-  from the file system (`task_exec`; see *Programs*), and resets the caught
-  signals to their default action.
+  from the file system (`task_exec`; see *Programs*), which also ends the
+  process's other threads, and resets the caught signals to their default
+  action.
 * `getpid`, `getppid`, `setpgid`, `getpgid`, `setsid`, `getsid`, `kill`, the
   terminal's `kill_pgrp` and the listing that `ps` shows are answered from
   the table.
+
+A process is a task with all its threads. The kernel starts threads itself
+(`clone`: a mechanism), and the server learns about them as they make
+requests: with every call, `ipc_recv` tells it the calling thread, which
+gets the reply, and its task, which names the process. So every thread gets
+the same `getpid`, `exit` in any thread ends the whole process, and a
+`wait4` or `pause` in one thread leaves the others running. Signal
+dispositions, masks and pending signals belong to the process (POSIX gives
+each thread its own mask; HaisuliOS does not yet). A caught signal goes to a
+thread that waits in `pause` or `wait4` in the server, whose wait it ends, or
+else to the thread that is about to get a reply from the server, or else to
+one the kernel picks (`task_upcall`, see *Signals*). `ps` shows how many
+threads each process has (`THR`).
 
 When init exits, the process server powers the machine off. The process
 server itself cannot be signalled (`kill` fails with `EPERM`).
@@ -312,8 +422,10 @@ registers as the console service. It is a canonical-mode terminal: input is
 echoed and can be edited (Backspace, Ctrl-U kills the line, Ctrl-C abandons
 it, cursor-key escape sequences are ignored) until Enter. A `read` then
 returns that line. Ctrl-D on an empty line is end-of-file. Output turns `\n`
-into `\r\n`. The protocol (`OP_WRITE`, `OP_READ`, `OP_SET_FG_PGRP`) is in
-`abi/src/lib.rs`.
+into `\r\n`, and goes out through the kernel's transmitter (`serial_write`):
+the kernel's log shares the line, and on several CPUs the two would otherwise
+cut into each other's lines. The protocol (`OP_WRITE`, `OP_READ`,
+`OP_SET_FG_PGRP`) is in `abi/src/lib.rs`.
 
 It is also the *job control terminal*: it remembers a foreground process
 group (`OP_SET_FG_PGRP`, the `tcsetpgrp()` of HaisuliOS), and on Ctrl-C it
@@ -342,14 +454,18 @@ wakes its parent out of `wait4`, fails the calls it was serving with `-EPIPE`,
 and reparents its children to init. A blocked signal waits until it is
 unblocked.
 
-A *caught* signal runs a handler when its process next returns to user mode.
-The process server asks the kernel for an **upcall** (`task_upcall`), giving
-the handler, the restorer, the signal, the sender and the signal mask to
-restore afterwards, and blocks the signal (unless `SA_NODEFER`) and
-`sa_mask` meanwhile. The scheduler is cooperative, so a task only stops
-running inside a system call, and the end of every system call is the one
-place where the kernel enters an upcall: it pushes a frame on the user stack
-and enters the handler with the signal number, a `siginfo_t` and a
+A *caught* signal runs a handler when a thread of its process next returns to
+user mode. The process server asks the kernel for an **upcall**
+(`task_upcall`), giving the handler, the restorer, the signal, the sender and
+the signal mask to restore afterwards (and, with `upcall::THREAD`, the thread
+to run it in), and blocks the signal (unless `SA_NODEFER`) and `sa_mask`
+meanwhile. It asks before it replies to a request of the process, so that the
+handler has run by the time the call returns, even when the reply reaches the
+thread on another CPU at once (as POSIX requires of `sigprocmask` and of a
+`kill` to oneself). The kernel enters an upcall on the thread's way back to
+user mode, at the end of a system call or of an interrupt: a thread busy on
+another CPU is interrupted for it. It pushes a frame on the user stack and
+enters the handler with the signal number, a `siginfo_t` and a
 `ucontext_t`. The frame has the Linux x86_64 layout, so a libc ported later
 finds things where it expects them. The handler returns to its
 `SA_RESTORER`, which hands the saved mask back to the process server and

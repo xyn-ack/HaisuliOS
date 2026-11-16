@@ -4,7 +4,8 @@
 //!
 //! Installs the IDT and handles CPU exceptions (vectors 0 to 31).
 //!
-//! Hardware interrupts (vectors 32 to 47) are installed by [`crate::irq::init`].
+//! Hardware interrupts (vectors 32 to 47, and the local APIC's) are installed by
+//! [`crate::irq::init`].
 
 use crate::arch::cpu;
 use crate::arch::entry::{stub_address, ExceptionFrame, EXCEPTION_STUBS};
@@ -35,6 +36,7 @@ fn set_gate(vector: usize, handler: u64, ist: u8) {
     IDT[2 * vector + 1].store(high, Ordering::Relaxed);
 }
 
+/// Fills in the exception gates and loads the IDT on the boot CPU.
 pub(crate) fn init() {
     for (vector, &stub) in EXCEPTION_STUBS.iter().enumerate() {
         let ist = if vector == Exception::DoubleFault as usize {
@@ -44,6 +46,11 @@ pub(crate) fn init() {
         };
         set_gate(vector, stub_address(stub), ist);
     }
+    load();
+}
+
+/// Loads the IDT (shared by every CPU) on this CPU.
+pub(crate) fn load() {
     cpu::load_idt(&IDT);
 }
 
