@@ -80,6 +80,8 @@ impl Processor for Cpu {
 
 /// The local APIC's timer and inter-processor interrupts.
 impl CpuInterrupts for Cpu {
+    const TICK_MS: u64 = apic::TICK_MS as u64;
+
     fn start_tick() {
         apic::start_timer();
     }

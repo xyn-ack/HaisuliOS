@@ -99,7 +99,8 @@ Known limitations (see the README) that are worth fixing on the way:
 - An init that is not the shell, and that reaps every orphan, including the
   zombies it did not start.
 - `SIGCHLD`.
-- Restarting a system server that dies (like MINIX's reincarnation server).
+- A system server's state across a restart: the console server loses its line and, while a
+  foreground job runs, the terminal's foreground group (until the shell prompts again).
 - `execve`: close-on-exec, `#!` scripts.
 - The file system: `unlink`, `mkdir`, `lseek`, file permissions.
 - The shell: double quotes, `;` and pipes.

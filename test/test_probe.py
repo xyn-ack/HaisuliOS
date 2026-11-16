@@ -93,6 +93,10 @@ def test_devices_are_described_and_granted_to_privileged_programs_only(sh):
     assert Config.arch.console_info + "\n" in out, out
 
 
+def test_the_monotonic_clock_advances(sh):
+    probe(sh, "clock")
+
+
 def test_execve_keeps_and_resets_what_posix_says(sh):
     probe(sh, "exec")
 

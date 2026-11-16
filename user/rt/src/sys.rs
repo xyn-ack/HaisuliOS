@@ -20,6 +20,7 @@ use crate::abi::errno::{EINTR, EINVAL};
 use crate::abi::fcntl::{AT_FDCWD, F_DUPFD, F_GETFD, PATH_MAX};
 use crate::abi::proc::*;
 use crate::abi::signal::{SA_RESTORER, SIG_DFL, SIG_IGN};
+use crate::abi::time::{CLOCK_MONOTONIC, NSEC_PER_SEC, TIMESPEC_LEN};
 use crate::abi::{exec, nr, svc, upcall, ProcInfo, TaskInfo, PROC_INFO_LEN, TASK_INFO_LEN};
 use crate::arch;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -94,6 +95,11 @@ enum Sys<'a> {
     },
     /// The kernel writes the mask.
     SchedGetAffinity(&'a mut [u8; 8]),
+    /// The kernel writes the time.
+    ClockGettime {
+        clock: u64,
+        out: &'a mut [u8; TIMESPEC_LEN],
+    },
     Mmap {
         len: u64,
         prot: u64,
@@ -206,6 +212,9 @@ fn invoke(call: Sys<'_>) -> i64 {
             nr::SCHED_GETAFFINITY,
             [0, mask.len() as u64, mask.as_mut_ptr() as u64, 0],
         ),
+        Sys::ClockGettime { clock, out } => {
+            (nr::CLOCK_GETTIME, [clock, out.as_mut_ptr() as u64, 0, 0])
+        }
         Sys::Mmap { len, prot } => (nr::MMAP, [0, len, prot, 0]),
         Sys::IpcSend { dest, a, b } => (nr::IPC_SEND, [dest, a, b, 0]),
         Sys::IpcRecv(m) => (nr::IPC_RECV, [m as *mut Message as u64, 0, 0, 0]),
@@ -653,6 +662,19 @@ pub fn sched_getaffinity() -> Result<u64> {
     let mut mask = [0u8; 8];
     check(invoke(Sys::SchedGetAffinity(&mut mask)))?;
     Ok(u64::from_ne_bytes(mask))
+}
+
+/// Returns the time since boot, in nanoseconds (`clock_gettime(CLOCK_MONOTONIC)`; it advances
+/// in steps of the scheduler's tick).
+pub fn monotonic_ns() -> Result<u64> {
+    let mut out = [0u8; TIMESPEC_LEN];
+    check(invoke(Sys::ClockGettime {
+        clock: CLOCK_MONOTONIC,
+        out: &mut out,
+    }))?;
+    let (sec, nsec) = out.split_at(8);
+    let word = |b: &[u8]| u64::from_ne_bytes(b.try_into().unwrap_or([0; 8]));
+    Ok(word(sec) * NSEC_PER_SEC + word(nsec))
 }
 
 /// Returns how many CPUs are online, as POSIX `sysconf(_SC_NPROCESSORS_ONLN)` does (at least 1).

@@ -75,6 +75,8 @@ impl Processor for Cpu {
 
 /// The GIC CPU interface and the generic timer's virtual timer.
 impl CpuInterrupts for Cpu {
+    const TICK_MS: u64 = timer::TICK_MS;
+
     fn start_tick() {
         timer::start();
     }

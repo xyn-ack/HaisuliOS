@@ -29,9 +29,11 @@ pub enum Sink {
 /// Makes `pgid` the terminal's foreground process group (POSIX `tcsetpgrp`).
 ///
 /// The console server sends the terminal's signals, such as the SIGINT of
-/// Ctrl-C, to that group, and interrupts reads from it with `EINTR`.
+/// Ctrl-C, to that group, and interrupts reads from it with `EINTR`. Like
+/// reading or writing the terminal, this waits for the console server if it is
+/// not there (yet, or again: the process server restarts it if it dies).
 pub fn tcsetpgrp(pgid: u64) -> sys::Result<()> {
-    let console = sys::svc_lookup(crate::abi::svc::CONSOLE)?;
+    let console = sys::svc_wait(crate::abi::svc::CONSOLE)?;
     let mut pgid = pgid.to_ne_bytes();
     sys::ipc_call(console, crate::abi::console::OP_SET_FG_PGRP, &mut pgid).map(drop)
 }

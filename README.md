@@ -26,7 +26,7 @@ More documents:
 
 | In the kernel (mechanism)                             | In user space (policy)                      |
 |-------------------------------------------------------|---------------------------------------------|
-| Physical memory manager (bitmap frame allocator)      | **Process server**: POSIX processes (`user/proc`): pids, `fork`, `execve`, `exit`, `wait4`, zombies, `getpid`, process groups and sessions, signals, and what threads mean for all of them; starts the system servers listed in `/etc/servers` |
+| Physical memory manager (bitmap frame allocator)      | **Process server**: POSIX processes (`user/proc`): pids, `fork`, `execve`, `exit`, `wait4`, zombies, `getpid`, process groups and sessions, signals, and what threads mean for all of them; starts the system servers listed in `/etc/servers`, and restarts one that dies |
 | Virtual memory: 4-level paging, per-task spaces       | **Console server**: COM1 driver, line discipline and the job control terminal (`user/console`, run from `/sbin/console`) |
 | Tasks and their threads (`clone`, `exit`, `gettid`), kernel stacks, context switch | **Runtime** (`user/rt`): threads (`thread::spawn`, `join`), `nprocs` |
 | Every CPU (SMP): started at boot, per-CPU state, APIC timer, IPIs; one preemptive scheduler for all | **init**: motd, then a job control shell (`user/init`) |
@@ -289,7 +289,10 @@ By design for v0.3; [TODO.md](TODO.md) has the plans for them.
   server (though no kernel resources).
 * Stopping a server that the rest of the system depends on (for instance
   `kill -STOP 3`, the console) leaves nothing runnable; the kernel reports
-  the deadlock and powers off. Nothing restarts a system server that dies.
+  the deadlock and powers off. A system server that *dies* is restarted (see
+  [Boot](docs/ARCHITECTURE.md#boot)), but what it knew is lost: a
+  restarted console server has lost the line being typed, and a foreground job
+  loses Ctrl-C until the shell prompts again.
 * Syscalls validate every user pointer against the page tables, but
   "privileged" (boot modules and the servers in `/etc/servers`, or not) is
   the only permission model; there are no capabilities yet, and no file

@@ -119,6 +119,11 @@ pub mod nr {
     /// `(cpu, node, cache)`: stores the number of the CPU the caller runs on (from 0) in `*cpu`,
     /// and 0 in `*node`; either pointer may be null, `cache` is ignored.
     pub const GETCPU: u64 = per_arch!("x86_64" => 309, "aarch64" => 168);
+    /// `(clock, *mut timespec)`: stores the time of `clock` in a Linux `struct timespec`.
+    ///
+    /// Only [`CLOCK_MONOTONIC`](super::time::CLOCK_MONOTONIC): the time since boot, in steps of
+    /// the scheduler's tick. Other clocks fail with `-EINVAL`.
+    pub const CLOCK_GETTIME: u64 = per_arch!("x86_64" => 228, "aarch64" => 113);
 
     // HaisuliOS-native microkernel calls.
 
@@ -338,6 +343,16 @@ pub mod errno {
             _ => "Unknown error",
         }
     }
+}
+
+/// Time: the clocks of [`nr::CLOCK_GETTIME`] and `struct timespec` (Linux values and layout).
+pub mod time {
+    /// The time since boot, which never goes back.
+    pub const CLOCK_MONOTONIC: u64 = 1;
+    /// Bytes of a `struct timespec`: `tv_sec` (i64), then `tv_nsec` (i64).
+    pub const TIMESPEC_LEN: usize = 16;
+    /// Nanoseconds per second.
+    pub const NSEC_PER_SEC: u64 = 1_000_000_000;
 }
 
 /// Memory mapping: `MMAP` protection bits (Linux values).

@@ -248,6 +248,21 @@ no parent and leads its own session and process group. init waits for the
 console while it starts: a terminal `read` or `write` waits for the console
 service to register.
 
+The process server keeps the system servers running, like MINIX's
+reincarnation server: when one dies (of a signal, a fault or a non-zero exit
+status), it starts the program again, as a new process, and logs
+`[proc] restarting /sbin/console`. One that exits with status 0 has finished.
+A server that keeps dying soon after it starts (6 times in a row, each within
+10 seconds of its start, on the kernel's monotonic clock) is given up rather
+than restarted forever. What the kernel does for the clients of a server that
+dies makes this work: their pending calls fail with `-EPIPE`, its service
+registration goes, and their next terminal `read` or `write` waits for the new
+one to register. A restarted server starts with nothing of the old one's
+state: the console server has lost the line being typed and the terminal's
+foreground process group, which the shell gives it again before every prompt
+(as POSIX shells take the terminal back), and a shell whose `read` failed
+with `-EPIPE` just prompts again.
+
 Before it starts any task, the boot CPU starts the others (see *CPUs and
 threads*) and logs how many run: `[kernel] 4 CPUs online`.
 
@@ -386,6 +401,7 @@ live in `abi/src/lib.rs`. There are no process calls: `fork`, `exit`, `wait4`, `
 | 204    | 123    | `sched_getaffinity(0,len,mask)`   | the online CPUs, one bit each                           |
 | 217    | 61     | `getdents64(fd,buf,len)`          | Linux `struct linux_dirent64` records                   |
 | 309    | 168    | `getcpu(&cpu,&node,_)`            | the CPU the caller runs on                              |
+| 228    | 113    | `clock_gettime(clock,&timespec)`  | `CLOCK_MONOTONIC` only: the time since boot, in ticks (10 ms) |
 
 | Nr     | Call                              | Notes                                                   |
 |--------|-----------------------------------|---------------------------------------------------------|

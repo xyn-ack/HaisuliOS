@@ -25,6 +25,7 @@
 //!   the calls that arm64 does not have (`open`, `dup2`).
 //! - `devices`: what `device_info` says about the console, and that an ordinary program is not
 //!   granted devices.
+//! - `clock`: the monotonic clock never goes back, and advances.
 //! - `exec`: what `execve` keeps and what it resets, and that a failed `execve` returns.
 //! - `exec-loop N`: `N` `execve`s in a row: a leak would run out of memory.
 
@@ -139,6 +140,7 @@ fn main(info: haisuli_rt::StartInfo) -> i32 {
         "blocked-ignored" => blocked_ignored(&mut c),
         "files" => files(&mut c),
         "devices" => devices(&mut c),
+        "clock" => clock(&mut c),
         "exec" => exec(&mut c),
         "exec-stage2" => exec_stage2(&mut c, info),
         "exec-loop" => {
@@ -436,6 +438,30 @@ fn legacy_calls(c: &mut Checks) {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn legacy_calls(_: &mut Checks) {}
+
+/// `clock`: `clock_gettime(CLOCK_MONOTONIC)` never goes back, and advances while the program
+/// waits (it counts the scheduler's ticks, so it moves in their steps).
+fn clock(c: &mut Checks) {
+    let start = sys::monotonic_ns();
+    c.check(start.is_ok(), format_args!("read the clock: {:?}", start));
+    let start = start.unwrap_or(0);
+    let mut last = start;
+    let mut went_back = false;
+    for _ in 0..PATIENCE {
+        let now = sys::monotonic_ns().unwrap_or(0);
+        went_back |= now < last;
+        last = now;
+        if now > start {
+            break;
+        }
+        sys::sched_yield();
+    }
+    c.check(!went_back, format_args!("it never went back"));
+    c.check(
+        last > start,
+        format_args!("it advanced: {} ns to {} ns", start, last),
+    );
+}
 
 /// `devices`: the console's description, and what an unprivileged program may not do.
 fn devices(c: &mut Checks) {

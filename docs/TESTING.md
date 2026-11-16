@@ -49,8 +49,8 @@ traceback and the full console transcript.
 
 What the shell cannot reach, the test program `/bin/probe_test` does:
 `probe_test CASE` runs one case (`restart`, `eintr`, `fault`, `task-exit`,
-`two-signals`, `pause-race`, `blocked-ignored`, `files`, `devices`, `exec`,
-`exec-loop N`), prints `ok` or `FAIL` for each check, and exits with status 0
+`two-signals`, `pause-race`, `blocked-ignored`, `files`, `devices`, `clock`,
+`exec`, `exec-loop N`), prints `ok` or `FAIL` for each check, and exits with status 0
 only if all passed. `test_probe.py` runs every case.
 
 `/bin/smp_test` does the same for multiple CPUs and threads (`test_smp.py`): `smp_test CASE [N]`,
@@ -71,11 +71,14 @@ test/test_exec.py         programs from the file system: execve, /bin, /sbin/con
 test/test_probe.py        /bin/probe_test: SA_RESTART, faults, task_exit, back-to-back signals,
                           the queued-pause race, blocked signals that are ignored when sent,
                           openat/dup3 (and x86_64's open/dup2), device descriptions and
-                          grants, what execve keeps, 1000 execs in a row
+                          grants, the monotonic clock, what execve keeps, 1000 execs in a row
 test/test_process.py      signals, process groups/sessions, waitpid semantics; jobs signalled
                           the moment they start
 test/test_process_server.py  explicit ("process-server"): process management lives in the
                           process server (pids, exit statuses, zombies), not the kernel
+test/test_servers.py      the process server restarts a system server that dies (the console
+                          server: killed, killed under the shell's read), and gives up one that
+                          keeps dying
 test/test_shell_redirection.py  >, >>, <, 2> and 2>&1, backed by the kernel's files
 test/test_smp.py          explicit ("smp"): written before SMP and threads existed. The CPUs are
                           started and counted (boot log, nproc); jobs that keep CPUs busy leave

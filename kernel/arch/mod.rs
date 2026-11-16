@@ -191,8 +191,11 @@ pub(crate) trait Processor {
 ///
 /// The platform's interrupt lines are [`crate::platform::InterruptController`]'s business.
 pub(crate) trait CpuInterrupts {
-    /// Starts this CPU's periodic tick ([`Interrupt::Tick`]), which arrives once interrupts are
-    /// enabled.
+    /// Milliseconds between two ticks.
+    const TICK_MS: u64;
+
+    /// Starts this CPU's periodic tick ([`Interrupt::Tick`]), every [`TICK_MS`](Self::TICK_MS),
+    /// which arrives once interrupts are enabled.
     fn start_tick();
 
     /// Interrupts CPU `cpu` (an index) with [`Interrupt::Reschedule`].

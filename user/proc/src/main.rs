@@ -28,6 +28,11 @@
 //!   (`task_exec`). At boot, the server also starts the system servers listed in [`SERVERS`]
 //!   (`task_spawn`), such as the console server: the ones that are not needed to get this far.
 //!   They run privileged, with no parent, like boot modules.
+//! - Keeping the system servers running (like MINIX's reincarnation server): when one dies (of a
+//!   signal, a fault or a non-zero exit status), the server starts its program again, as a new
+//!   process. One that exits with status 0 has finished, and stays ended. A server that keeps
+//!   dying soon after it starts ([`MAX_QUICK_FAILURES`] times in a row, each within
+//!   [`STABLE_NS`] of its start) is given up, rather than restarted forever.
 //! - Threads: a process is its task, with all of its threads (which the kernel starts with
 //!   `clone`). Any thread may make a request: the kernel tells the server the calling thread,
 //!   which gets the reply, and its task, which names the process. So `getpid` is the same in
@@ -81,6 +86,16 @@ const MAX_WAITERS: usize = 8;
 /// They run privileged: they are the ones that drive hardware and provide the
 /// well-known services. Programs started any other way never are.
 const SERVERS: &str = "/etc/servers";
+/// The most system servers the server keeps running.
+const MAX_SERVERS: usize = 8;
+/// The longest path of a system server's program.
+const SERVER_PATH_MAX: usize = 64;
+/// How long a system server must have run for its death not to count as a failure to start: the
+/// quick failures in a row start counting again from there.
+const STABLE_NS: u64 = 10_000_000_000;
+/// How many times in a row a system server may die soon after it started (within [`STABLE_NS`])
+/// and be restarted; after that it is given up.
+const MAX_QUICK_FAILURES: u32 = 5;
 
 /// Whether a process record is in use.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -244,11 +259,41 @@ mod table {
     }
 }
 
+/// A system server, from [`SERVERS`], which the server keeps running.
+#[derive(Clone, Copy)]
+struct SystemServer {
+    /// Its program's path (`len` bytes of it); 0 long if the entry is free.
+    path: [u8; SERVER_PATH_MAX],
+    len: usize,
+    /// The pid of the process that runs it; 0 while none does.
+    pid: u64,
+    /// When that process was started (nanoseconds since boot).
+    started: u64,
+    /// How many times in a row it died soon after it started.
+    quick_failures: u32,
+}
+
+impl SystemServer {
+    const NONE: SystemServer = SystemServer {
+        path: [0; SERVER_PATH_MAX],
+        len: 0,
+        pid: 0,
+        started: 0,
+        quick_failures: 0,
+    };
+
+    fn path(&self) -> &str {
+        core::str::from_utf8(&self.path[..self.len]).unwrap_or("?")
+    }
+}
+
 /// The state of the process server.
 pub(crate) struct Server {
     procs: [Proc; MAX_PROCS],
     /// The server's own task; its process cannot be signalled.
     me: u64,
+    /// The system servers that it keeps running.
+    servers: [SystemServer; MAX_SERVERS],
 }
 
 /// Writes a line to the kernel debug log.
@@ -304,6 +349,7 @@ impl Server {
     const NEW: Server = Server {
         procs: [Proc::UNUSED; MAX_PROCS],
         me: 0,
+        servers: [SystemServer::NONE; MAX_SERVERS],
     };
 
     // ---- The table ------------------------------------------------------------
@@ -550,15 +596,75 @@ impl Server {
             return;
         };
         for path in text.lines().map(str::trim) {
-            if !path.is_empty() && !path.starts_with('#') {
-                self.start_server(path);
+            if path.is_empty() || path.starts_with('#') {
+                continue;
             }
+            let Some(k) = self.servers.iter().position(|s| s.len == 0) else {
+                log(format_args!(
+                    "[proc] cannot keep {} running: too many servers",
+                    path
+                ));
+                self.start_server(path);
+                continue;
+            };
+            if path.len() > SERVER_PATH_MAX {
+                log(format_args!(
+                    "[proc] cannot keep {} running: path too long",
+                    path
+                ));
+                self.start_server(path);
+                continue;
+            }
+            let s = &mut self.servers[k];
+            s.path[..path.len()].copy_from_slice(path.as_bytes());
+            s.len = path.len();
+            self.run_server(k);
         }
     }
 
+    /// Starts system server `k` (see [`SystemServer`]).
+    fn run_server(&mut self, k: usize) {
+        let mut path = [0u8; SERVER_PATH_MAX];
+        let len = self.servers[k].len;
+        path[..len].copy_from_slice(&self.servers[k].path[..len]);
+        let pid = self.start_server(core::str::from_utf8(&path[..len]).unwrap_or("?"));
+        let s = &mut self.servers[k];
+        s.pid = pid.unwrap_or(0);
+        s.started = sys::monotonic_ns().unwrap_or(0);
+    }
+
+    /// Process `pid`, without a parent, has ended with `how`: if it ran a system server, starts
+    /// that again (see the module documentation).
+    fn server_ended(&mut self, pid: u64, how: Termination) {
+        let Some(k) = self.servers.iter().position(|s| s.pid != 0 && s.pid == pid) else {
+            return;
+        };
+        let now = sys::monotonic_ns().unwrap_or(0);
+        let s = &mut self.servers[k];
+        s.pid = 0;
+        if how == Termination::Exited(0) {
+            log(format_args!("[proc] {} has finished", s.path()));
+            return;
+        }
+        if now.saturating_sub(s.started) >= STABLE_NS {
+            s.quick_failures = 0;
+        }
+        s.quick_failures += 1;
+        if s.quick_failures > MAX_QUICK_FAILURES {
+            log(format_args!(
+                "[proc] {} failed {} times in a row: not restarting it",
+                s.path(),
+                MAX_QUICK_FAILURES + 1
+            ));
+            return;
+        }
+        log(format_args!("[proc] restarting {}", s.path()));
+        self.run_server(k);
+    }
+
     /// Starts the program at `path` as a privileged system server: a process of its own, with no
-    /// parent, leading its own session and process group, like a boot module.
-    fn start_server(&mut self, path: &str) {
+    /// parent, leading its own session and process group, like a boot module. Returns its pid.
+    fn start_server(&mut self, path: &str) -> Option<u64> {
         let (Some(slot), Some(pid)) =
             (self.procs.iter().position(|p| !p.exists()), self.free_pid())
         else {
@@ -566,7 +672,7 @@ impl Server {
                 "[proc] cannot start {}: no free process",
                 path
             ));
-            return;
+            return None;
         };
         let mut block = [0u8; ARG_MAX];
         let started = exec::build(path, &[path], &[], &mut block)
@@ -580,7 +686,7 @@ impl Server {
                     path,
                     errno::describe(e)
                 ));
-                return;
+                return None;
             }
         };
         let name = sys::task_info(tid).map_or([0; PROC_NAME_LEN], |info| info.name);
@@ -599,6 +705,7 @@ impl Server {
             self.procs[slot].name(),
             path
         ));
+        Some(pid)
     }
 
     /// Ends process `i`, which becomes a zombie with wait status `how`.
@@ -638,7 +745,9 @@ impl Server {
             orphans = true;
         }
         if ppid == 0 {
-            self.procs[i] = Proc::UNUSED; // A boot module: nobody will wait for it.
+            // A boot module or a system server: nobody will wait for it.
+            self.procs[i] = Proc::UNUSED;
+            self.server_ended(pid, how);
         } else {
             self.wake_waiter(ppid);
         }

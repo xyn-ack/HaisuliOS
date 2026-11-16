@@ -22,7 +22,7 @@
 
 use crate::arch::{Cpu, CpuInterrupts, Interrupt, UserContext, UserRegs};
 use crate::platform::{Board, InterruptController};
-use crate::task;
+use crate::{clock, task};
 use core::sync::atomic::{AtomicU64, Ordering};
 use haisuli_abi::errno::{EBUSY, EINVAL, EPERM};
 
@@ -49,6 +49,7 @@ pub(crate) fn dispatch(source: Interrupt, f: &mut UserContext) {
         Interrupt::Line(line) => line_interrupt(line),
         Interrupt::Tick => {
             Cpu::end_of_interrupt();
+            clock::tick();
             task::tick();
         }
         Interrupt::Reschedule => Cpu::end_of_interrupt(),

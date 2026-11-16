@@ -27,7 +27,7 @@
 #![forbid(unsafe_code)]
 
 use core::fmt::Write;
-use haisuli_rt::abi::errno::{self, ECHILD, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, ESRCH};
+use haisuli_rt::abi::errno::{self, ECHILD, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, EPIPE, ESRCH};
 use haisuli_rt::abi::fcntl::{O_DIRECTORY, O_RDONLY, PATH_MAX};
 use haisuli_rt::abi::proc_state;
 use haisuli_rt::abi::signal::{self, NSIG, SIGINT, SIGTERM, SIG_BLOCK, SIG_SETMASK};
@@ -156,9 +156,14 @@ impl Shell {
             if let Some(status) = self.run_traps() {
                 return status;
             }
+            // The shell holds the terminal while it reads a command, as POSIX shells take it back
+            // before every prompt. That also tells a console server that was restarted since the
+            // last prompt (and knows nothing of the old one's foreground group).
+            let _ = tcsetpgrp(self.pgid);
             print!("{}", PROMPT);
-            // Signals are only delivered when a system call returns, so one
-            // that arrived while prompting is seen here, before `read` blocks.
+            // Signals are only delivered when a system call returns, so one that arrived while
+            // prompting (or taking the terminal) is seen here, before `read` blocks; one that
+            // arrives later interrupts the `read`.
             if traps::any_caught() {
                 leave_prompt();
                 continue;
@@ -171,6 +176,12 @@ impl Shell {
                 Ok(n) => n,
                 Err(e) if e.0 == EINTR => {
                     leave_prompt();
+                    continue;
+                }
+                // The console server died while we read: the process server starts it again,
+                // and the line being typed is lost. Prompt again (which waits for the new one).
+                Err(e) if e.0 == EPIPE => {
+                    println!();
                     continue;
                 }
                 Err(e) => {

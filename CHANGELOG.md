@@ -18,6 +18,15 @@ user program builds for `aarch64-unknown-none` (`make portcheck`).
 
 ### Added
 
+- System servers are kept running, like MINIX's reincarnation server: when one dies (of a signal,
+  a fault or a non-zero exit status), the process server starts its program again, as a new
+  process; one that keeps dying soon after it starts (6 times in a row, each within 10 s) is
+  given up. Killing the console server used to take the whole system down (the shell gave up,
+  or the kernel found every task blocked and powered off); now the terminal comes back.
+- `clock_gettime` (228 on x86_64, 113 on arm64), `CLOCK_MONOTONIC` only: the time since boot, in
+  the scheduler's ticks (the tick's length is part of `CpuInterrupts` now). The runtime's
+  `sys::monotonic_ns`.
+- Tests: `test_servers.py`, and `probe_test clock`.
 - arm64 (`kernel/arch/aarch64`): a Linux arm64 Image, entered at EL1 with the device tree; the
   kernel in `TTBR1_EL1` (its image and a linear map of physical memory) and user space in
   `TTBR0_EL1`, one root per address space, so a new one has nothing of the kernel to copy;
@@ -68,6 +77,10 @@ user program builds for `aarch64-unknown-none` (`make portcheck`).
 
 ### Changed
 
+- The shell survives its console server dying: a `read` that fails with `EPIPE` prompts again,
+  and the shell takes the terminal (`tcsetpgrp`) before every prompt, so that a restarted
+  console server learns the foreground process group. `tcsetpgrp` waits for the console server,
+  as terminal reads and writes do.
 - The tests that checked x86 specifics check the architecture's (the banner, the console's device
   and IRQ, QEMU's exit status on power-off); a CPU exception's report is one log message now.
 - User programs are linked with 4 KiB segment alignment (lld's default for arm64 is 64 KiB).

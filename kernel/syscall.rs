@@ -13,7 +13,7 @@
 use crate::arch::{UserContext, UserRegs};
 use crate::fs::{self, Transfer};
 use crate::task::{self, Access, Why};
-use crate::{device, irq, serial, vmm};
+use crate::{clock, device, irq, serial, vmm};
 use haisuli_abi::console::{OP_READ, OP_WRITE};
 use haisuli_abi::errno::{EBADF, EFAULT, ENAMETOOLONG, ENOSYS, EPERM};
 #[cfg(target_arch = "x86_64")]
@@ -48,6 +48,7 @@ pub(crate) extern "C" fn syscall_dispatch(f: &mut UserContext) {
         nr::EXIT => task::thread_exit(),
         nr::GETTID => task::gettid(),
         nr::GETCPU => task::getcpu(a0, a1),
+        nr::CLOCK_GETTIME => clock::clock_gettime(a0, a1),
         nr::SCHED_GETAFFINITY => task::sched_getaffinity(a0, a1, a2),
         nr::RT_SIGRETURN => task::rt_sigreturn(f),
         nr::IPC_SEND => task::ipc_send(a0, a1, a2),
