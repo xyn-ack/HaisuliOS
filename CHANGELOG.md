@@ -4,7 +4,7 @@ What changed in each version of HaisuliOS. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the goals and the
 roadmap are in [TODO.md](TODO.md).
 
-## Unreleased
+## 0.3.1
 
 In preparation for a second CPU architecture (ARM), the hardware layer is split along two axes:
 `kernel/arch/` is the CPU architecture (one directory per architecture, `arch/x86_64` today,
@@ -20,8 +20,16 @@ architecture implements.
   arguments, the return value, restarting the call, the stack pointer). No generic file names a
   register any more; the upcall frame's layout (Linux's signal frame) belongs to the
   architecture.
+- The second piece, the `PageTables` trait: the page tables' shape, the format of their entries,
+  and how an address space gets the kernel's half and becomes a CPU's (`arch/x86_64/paging.rs`).
+  `vmm` walks them generically (one recursive walk for `task_fork`'s copy and for freeing),
+  with the portable `Prot` (user, write, execute) instead of x86 page flags, and the
+  `AddressSpace` type instead of a PML4 address in a `u64`. The ELF loader takes the machine type
+  from the architecture (`ELF_MACHINE`).
 - `phys::keep_out`: the platform records the boot loader's memory once, and `phys` refuses it
   from then on, instead of asking the platform on every check.
+- [TODO.md](TODO.md) lists the steps that remain before arm64 (the interrupt controller and
+  timers, booting, the ABI and user space, the build and the bring-up).
 
 ### Changed
 
@@ -32,7 +40,8 @@ architecture implements.
 - The `restart` and `eintr` cases of `probe_test` no longer guess when the parent waits: the
   parent announces the wait (a file), the child watches `ps` until the parent sleeps in it, and
   only then signals. They are exact on any number of CPUs now, and `eintr` joined the
-  side-by-side SMP test.
+  side-by-side SMP test. `pause-race`, which is about one CPU's order, always runs on one CPU
+  (`@cpus(1)`), also under `--cpus`.
 
 ### Removed
 

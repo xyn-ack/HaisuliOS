@@ -12,6 +12,7 @@ pub(crate) mod cpu;
 pub(crate) mod entry;
 pub(crate) mod gdt;
 pub(crate) mod idt;
+pub(crate) mod paging;
 pub(crate) mod percpu;
 pub(crate) mod phys;
 pub(crate) mod smp;
@@ -19,3 +20,7 @@ pub(crate) mod upcall;
 pub(crate) mod x86;
 
 pub(crate) use entry::TrapFrame as UserContext;
+pub(crate) use paging::Paging;
+
+/// `e_machine` of the programs this CPU runs: `EM_X86_64`.
+pub(crate) const ELF_MACHINE: u16 = 62;

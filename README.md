@@ -4,7 +4,7 @@ A tiny, bare-bones **microkernel** for **x86_64**, written in **Rust**, with a
 **POSIX-flavoured** syscall ABI. No external crates, no bootloader crate, no
 nightly features: just `core`, inline assembly, and a Multiboot v1 header.
 
-> Status: v0.3. It provides virtual memory, tasks with any number of threads,
+> Status: v0.3.1. It provides virtual memory, tasks with any number of threads,
 > a preemptive scheduler on every CPU of the machine (SMP), IPC and user-space
 > drivers; POSIX processes, `execve` and signals with job control are
 > implemented by a user-space process server, which loads programs from the file
@@ -122,7 +122,7 @@ module    /boot/initrd.tar initrd
 ### Expected output
 
 ```
-HaisuliOS 0.3.0 - x86_64 microkernel
+HaisuliOS 0.3.1 - x86_64 microkernel
 [pmm] 32364 frames free (126 MiB)
 [kernel] started task 1 (init): 71 KiB image
 [kernel] started task 2 (proc): 44 KiB image

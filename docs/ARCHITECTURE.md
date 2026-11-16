@@ -24,18 +24,28 @@ tables, per-CPU data), and `kernel/platform/` is the machine around it (the boot
 interrupt controller, the serial line, firmware tables, power). Each has one implementation per
 architecture or platform, in its own directory, selected at compile time; the rest of the kernel
 uses only what their `mod.rs` files re-export. That re-export list is the contract a new
-architecture implements; its first compiler-checked piece is the `UserRegs` trait, everything
-generic code may do with a thread's saved user registers (read the system call's number and
-arguments, set the return value, restart the call, move the stack pointer), so no generic file
-names a register. The platform may use the architecture; the architecture does not depend on
-the platform, except that the boot entry speaks the boot loader's protocol.
+architecture implements, and traits make the compiler check its parts:
+
+* `UserRegs`: everything generic code may do with a thread's saved user registers (read the
+  system call's number and arguments, set the return value, restart the call, move the stack
+  pointer, tell user mode from kernel mode), so no generic file names a register.
+* `PageTables`: the shape of the page tables (levels, bits per level, page size, which root
+  entries are user space), the format of an entry, and how an address space gets the kernel's
+  half and becomes a CPU's. `vmm` walks them generically, with `Prot` (user, write, execute) for
+  permissions and an `AddressSpace` for a root, so no generic file knows an entry's bits or what
+  a PML4 is.
+
+Plus constants such as `ELF_MACHINE`, the machine type of the programs the CPU runs. The platform
+may use the architecture; the architecture does not depend on the platform, except that the boot
+entry speaks the boot loader's protocol. [TODO.md](../TODO.md) has the steps that remain (the
+interrupt controller and timers, booting, the ABI and user space, then arm64 itself).
 
 ```
 kernel/            the kernel
   main.rs          kmain, panic handler; denies unsafe code crate-wide
   arch/            hardware layer, the CPU architecture: one directory per architecture,
                    selected at compile time behind one contract (see mod.rs: what it
-                   re-exports, and the UserRegs trait over the saved user registers)
+                   re-exports, and the UserRegs and PageTables traits)
     x86_64/
       boot.rs      Multiboot entry, 32->64-bit switch, boot page tables (asm)
       cpu.rs       privileged instructions; port I/O on a fixed list of devices
@@ -47,6 +57,7 @@ kernel/            the kernel
       gdt.rs       GDT + a TSS per CPU (layout chosen for SYSCALL/SYSRET), I/O bitmap
       idt.rs       IDT: every gate; CPU exception handling
       upcall.rs    the frame that enters a handler (Linux x86_64 signal frame layout)
+      paging.rs    the 4-level page-table format (PageTables), the kernel's half (PML4[0])
       phys.rs      physical memory access, limited to allocator-owned frames
       x86.rs       names for the CPU's numbers: register bits, vectors, descriptors
   platform/        hardware layer, the machine around the CPU: one directory per platform
@@ -60,7 +71,8 @@ kernel/            the kernel
   sync.rs          Lock: a ticket spinlock that panics on re-entrant use
   irq.rs           forwarding interrupt lines to drivers; every interrupt's dispatch
   pmm.rs           Physical frame allocator (the loader's memory map)
-  vmm.rs           Paging: map, translate, clone (task_fork), destroy, user-memory copies
+  vmm.rs           address spaces: a generic page-table walk (map, translate, clone for
+                   task_fork, destroy) and every access to user memory
   elf.rs           ELF64 loader for user programs
   program.rs       a program's address space: its image, stack and arguments
   fs.rs            RAM file system (the unpacked ramdisk), open file descriptions
@@ -232,16 +244,20 @@ way, and frees the old address space once they are gone.
 
 ## Virtual address space (per task)
 
+User space is the same on every architecture:
+
 ```
-PML4[0]       kernel: identity map of first 1 GiB (shared, supervisor-only)
-PML4[1..256]  user (private):
-  0x0000_0080_0000_0000  program image   (ELF segments: R-X / R-- / RW-)
-  0x0000_0100_0000_0000  mmap() region   (RW-, NX unless PROT_EXEC)
-  0x0000_7FFF_FFFF_F000  top of stack    (RW-, NX, 32 KiB, grows down)
+0x0000_0080_0000_0000  program image   (ELF segments: R-X / R-- / RW-)
+0x0000_0100_0000_0000  mmap() region   (RW-, NX unless PROT_EXEC)
+0x0000_7FFF_FFFF_F000  top of stack    (RW-, NX, 32 KiB, grows down)
 ```
 
+How the kernel's half gets there is the architecture's business. On x86_64, PML4 entry 0, the
+identity map of the first 1 GiB (supervisor only), is shared by every address space, and user
+space is entries 1 to 255.
+
 User pages are mapped 4 KiB at a time, so `task_fork` is a deep copy (no COW yet).
-W^X is enforced for the image/stack/mmap via the NX bit (EFER.NXE is on); the
+W^X is enforced for the image/stack/mmap (on x86_64 with the NX bit; EFER.NXE is on); the
 ELF loader refuses segments that are both writable and executable.
 
 ## Syscall ABI

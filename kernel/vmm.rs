@@ -2,28 +2,29 @@
 
 //! Virtual memory manager.
 //!
-//! Manages 4-level x86_64 page tables and all access to user memory.
+//! Manages the user half of every address space, and all access to user memory.
 //!
-//! Address-space layout (every task):
+//! User-space layout (every task):
 //!
 //! ```text
-//! PML4[0]        kernel: identity map of the first 1 GiB (shared, supervisor only)
-//! PML4[1..256]   user space (private per task, 4 KiB pages only)
-//!
 //! 0x0000_0080_0000_0000  USER_BASE       program image
 //! 0x0000_0100_0000_0000  MMAP_BASE       anonymous mmap() region
 //! 0x0000_7FFF_FFFF_F000  USER_STACK_TOP  (stack grows down)
 //! ```
+//!
+//! The page tables are the architecture's ([`PageTables`]): this module walks them generically
+//! (a root table and the levels below it), and the architecture encodes the entries and puts the
+//! kernel's half into every new address space. User space is mapped with 4 KiB pages only.
 //!
 //! Page tables and user pages are allocator frames, read and written through [`crate::arch::phys`].
 //! User memory is only ever reached through the page tables of its address space (never by
 //! dereferencing a user pointer), which also checks that it is mapped, user-accessible and, for
 //! writes, writable.
 
-use crate::arch::x86::PageFlag;
-use crate::arch::{boot, cpu, phys};
+use crate::arch::{phys, PageTables, Paging, Prot};
 use crate::pmm::{self, PAGE_SIZE};
 use crate::sync::Lock;
+use haisuli_abi::mman::{PROT_EXEC, PROT_WRITE};
 
 /// Serialises the changes to user page tables and the walks that copy them.
 ///
@@ -34,49 +35,49 @@ use crate::sync::Lock;
 /// is only destroyed once nothing uses it.
 static MAP_LOCK: Lock<()> = Lock::new(());
 
-/// The bits of a page-table entry that hold the physical address it points to.
-const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// The bits of an address below its page: the offset in the page.
 const PAGE_OFFSET: u64 = PAGE_SIZE - 1;
 /// Entries per page table, at every level.
-const TABLE_ENTRIES: usize = 512;
+const TABLE_ENTRIES: usize = 1 << Paging::INDEX_BITS;
 /// Bytes per page-table entry.
-const ENTRY_SIZE: u64 = 8;
-/// Address bits that each table level translates (log2 of [`TABLE_ENTRIES`]).
-const INDEX_BITS: u32 = 9;
-/// log2 of [`PAGE_SIZE`]: the address bits below the page-table index.
-const PAGE_SHIFT: u32 = 12;
-/// Table levels: 0 is the PML4, then the PDPT, the page directory and the page table.
-const LEVELS: usize = 4;
-/// The bits a task may not keep when its pages are copied: the CPU's
-/// record of use, which starts afresh for the copy.
-const USAGE_BITS: u64 = PageFlag::bits(&[PageFlag::Accessed, PageFlag::Dirty]);
+const ENTRY_SIZE: u64 = size_of::<u64>() as u64;
+/// The level of the tables whose entries map pages.
+const PAGE_LEVEL: usize = Paging::LEVELS - 1;
+const _: () = assert!(
+    1 << Paging::PAGE_SHIFT == PAGE_SIZE,
+    "the architecture's pages"
+);
 
 pub(crate) const USER_BASE: u64 = 0x0000_0080_0000_0000;
 pub(crate) const MMAP_BASE: u64 = 0x0000_0100_0000_0000;
 pub(crate) const USER_STACK_TOP: u64 = haisuli_abi::USER_STACK_TOP;
 pub(crate) const USER_LIMIT: u64 = haisuli_abi::USER_LIMIT;
 
-/// PML4 slots holding user space: the lower half of the address space,
-/// except slot 0, the shared kernel mapping.
-const USER_SLOTS: core::ops::Range<usize> = 1..TABLE_ENTRIES / 2;
+/// An address space: the physical address of its root page table.
+///
+/// Only this module makes them, so every one (but [`AddressSpace::NONE`]) is a root that
+/// [`new_address_space`] prepared, or the kernel's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct AddressSpace(u64);
 
-/// The boot PML4 doubles as the kernel's own address space.
-pub(crate) fn kernel_pml4() -> u64 {
-    boot::kernel_pml4()
+impl AddressSpace {
+    /// No address space: what an unused task record holds. Never switched to or walked.
+    pub(crate) const NONE: AddressSpace = AddressSpace(0);
+
+    /// The address space with no user pages, for a CPU that runs no thread.
+    pub(crate) fn kernel() -> AddressSpace {
+        AddressSpace(Paging::kernel_root())
+    }
 }
 
-/// The page flags of a user mapping with the `mmap` protection `prot` (readable either way;
+/// The protection of a user mapping with the `mmap` protection `prot` (readable either way;
 /// never executable unless asked).
-pub(crate) fn user_flags(prot: u64) -> u64 {
-    let mut flags = PageFlag::User as u64;
-    if prot & haisuli_abi::mman::PROT_WRITE != 0 {
-        flags |= PageFlag::Writable as u64;
+pub(crate) fn user_prot(prot: u64) -> Prot {
+    Prot {
+        user: true,
+        write: prot & PROT_WRITE != 0,
+        exec: prot & PROT_EXEC != 0,
     }
-    if prot & haisuli_abi::mman::PROT_EXEC == 0 {
-        flags |= PageFlag::NoExecute as u64;
-    }
-    flags
 }
 
 fn entry(table: u64, i: usize) -> u64 {
@@ -87,50 +88,35 @@ fn set_entry(table: u64, i: usize, v: u64) {
     phys::write_u64(table + ENTRY_SIZE * i as u64, v)
 }
 
-/// Whether page-table entry (or entry flags) `e` has `flag`.
-fn has(e: u64, flag: PageFlag) -> bool {
-    e & flag as u64 != 0
-}
-
-/// Whether page-table entry `e` is in use.
-fn present(e: u64) -> bool {
-    has(e, PageFlag::Present)
-}
-
-/// The lowest address bit that the table at `level` translates.
+/// The lowest address bit that the tables at `level` translate.
 const fn shift(level: usize) -> u32 {
-    PAGE_SHIFT + INDEX_BITS * (LEVELS - 1 - level) as u32
+    Paging::PAGE_SHIFT + Paging::INDEX_BITS * (PAGE_LEVEL - level) as u32
 }
 
-/// Table index at `level` (see [`LEVELS`]).
+/// The index of `virt` in a table at `level`.
 fn idx(virt: u64, level: usize) -> usize {
     ((virt >> shift(level)) as usize) & (TABLE_ENTRIES - 1)
 }
 
-/// Makes `pml4` this CPU's address space (unless it is already).
-pub(crate) fn switch(pml4: u64) {
-    if cpu::page_table() != pml4 {
-        cpu::set_page_table(pml4);
-    }
+/// Makes `space` this CPU's address space (unless it is already).
+pub(crate) fn switch(space: AddressSpace) {
+    Paging::activate(space.0);
 }
 
 /// Create an address space that shares the kernel mapping and has no user pages.
-pub(crate) fn new_address_space() -> Option<u64> {
-    let f = pmm::alloc_zeroed()?;
-    set_entry(f, 0, boot::kernel_pml4_entry());
-    Some(f)
+pub(crate) fn new_address_space() -> Option<AddressSpace> {
+    let root = pmm::alloc_zeroed()?;
+    Paging::init_root(root);
+    Some(AddressSpace(root))
 }
 
-/// Maps one 4 KiB user page.
-///
-/// `flags` are [`PageFlag::User`], optionally with [`PageFlag::Writable`] and
-/// [`PageFlag::NoExecute`]; [`PageFlag::Present`] is added.
+/// Maps one user page.
 ///
 /// # Panics
 ///
 /// Panics if `frame` is not an allocator frame: user space must never see
 /// kernel memory.
-fn map_user(pml4: u64, virt: u64, frame: u64, flags: u64) -> Result<(), ()> {
+fn map_user(space: AddressSpace, virt: u64, frame: u64, prot: Prot) -> Result<(), ()> {
     if !(USER_BASE..USER_LIMIT).contains(&virt) || virt & PAGE_OFFSET != 0 {
         return Err(());
     }
@@ -140,28 +126,21 @@ fn map_user(pml4: u64, virt: u64, frame: u64, flags: u64) -> Result<(), ()> {
         "mapping a non-allocator frame {:#x} into user space",
         frame
     );
-    // Intermediate tables allow everything; the leaf entry restricts.
-    let table_entry = PageFlag::bits(&[PageFlag::Present, PageFlag::Writable, PageFlag::User]);
-    let leaf = LEVELS - 1;
-    let mut t = pml4;
-    for lvl in 0..leaf {
+    let mut t = space.0;
+    for lvl in 0..PAGE_LEVEL {
         let e = entry(t, idx(virt, lvl));
-        t = if !present(e) {
+        t = if !Paging::is_present(e) {
             let f = pmm::alloc_zeroed().ok_or(())?;
-            set_entry(t, idx(virt, lvl), f | table_entry);
+            set_entry(t, idx(virt, lvl), Paging::table_entry(f));
             f
         } else {
-            e & ADDR_MASK
+            Paging::target(e)
         };
     }
-    if present(entry(t, idx(virt, leaf))) {
+    if Paging::is_present(entry(t, idx(virt, PAGE_LEVEL))) {
         return Err(());
     }
-    set_entry(
-        t,
-        idx(virt, leaf),
-        (frame & ADDR_MASK) | flags | PageFlag::Present as u64,
-    );
+    set_entry(t, idx(virt, PAGE_LEVEL), Paging::page_entry(frame, prot));
     Ok(())
 }
 
@@ -170,7 +149,13 @@ fn map_user(pml4: u64, virt: u64, frame: u64, flags: u64) -> Result<(), ()> {
 /// `data` is placed at `virt` (which need not be page aligned); the rest is
 /// zero. Fails if out of memory or if a page is already mapped; pages mapped
 /// before the failure stay mapped (they are freed with the address space).
-pub(crate) fn map_init(pml4: u64, virt: u64, size: u64, data: &[u8], flags: u64) -> Result<(), ()> {
+pub(crate) fn map_init(
+    space: AddressSpace,
+    virt: u64,
+    size: u64,
+    data: &[u8],
+    prot: Prot,
+) -> Result<(), ()> {
     let _serialised = MAP_LOCK.lock();
     let end = virt.checked_add(size).ok_or(())?;
     if (data.len() as u64) > size {
@@ -189,7 +174,7 @@ pub(crate) fn map_init(pml4: u64, virt: u64, size: u64, data: &[u8], flags: u64)
                 &data[(lo - virt) as usize..(hi - virt) as usize],
             );
         }
-        if map_user(pml4, page, f, flags).is_err() {
+        if map_user(space, page, f, prot).is_err() {
             pmm::free_frame(f);
             return Err(());
         }
@@ -198,28 +183,31 @@ pub(crate) fn map_init(pml4: u64, virt: u64, size: u64, data: &[u8], flags: u64)
     Ok(())
 }
 
-/// Walks the page tables for a user address and returns its physical address and leaf flags.
-pub(crate) fn translate(pml4: u64, virt: u64) -> Option<(u64, u64)> {
+/// Walks the page tables for a user address and returns its physical address and protection.
+pub(crate) fn translate(space: AddressSpace, virt: u64) -> Option<(u64, Prot)> {
     if !(USER_BASE..USER_LIMIT).contains(&virt) {
-        return None; // PML4[0] (kernel, 2 MiB pages) is not walked here.
+        return None; // The kernel's half is not walked here.
     }
-    let mut t = pml4;
-    for lvl in 0..LEVELS - 1 {
+    let mut t = space.0;
+    for lvl in 0..PAGE_LEVEL {
         let e = entry(t, idx(virt, lvl));
-        if !present(e) {
+        if !Paging::is_present(e) {
             return None;
         }
-        t = e & ADDR_MASK;
+        t = Paging::target(e);
     }
-    let e = entry(t, idx(virt, LEVELS - 1));
-    if !present(e) {
+    let e = entry(t, idx(virt, PAGE_LEVEL));
+    if !Paging::is_present(e) {
         return None;
     }
-    Some(((e & ADDR_MASK) | (virt & PAGE_OFFSET), e & !ADDR_MASK))
+    Some((
+        Paging::target(e) | (virt & PAGE_OFFSET),
+        Paging::page_prot(e),
+    ))
 }
 
 /// Returns whether `[ptr, ptr + len)` is entirely mapped user memory (writable if `write`).
-pub(crate) fn user_range_ok(pml4: u64, ptr: u64, len: u64, write: bool) -> bool {
+pub(crate) fn user_range_ok(space: AddressSpace, ptr: u64, len: u64, write: bool) -> bool {
     if len == 0 {
         return true;
     }
@@ -232,9 +220,8 @@ pub(crate) fn user_range_ok(pml4: u64, ptr: u64, len: u64, write: bool) -> bool 
     }
     let mut a = ptr & !PAGE_OFFSET;
     while a < end {
-        match translate(pml4, a) {
-            Some((_, fl)) if has(fl, PageFlag::User) && (!write || has(fl, PageFlag::Writable)) => {
-            }
+        match translate(space, a) {
+            Some((_, prot)) if prot.user && (!write || prot.write) => {}
             _ => return false,
         }
         a += PAGE_SIZE;
@@ -243,8 +230,10 @@ pub(crate) fn user_range_ok(pml4: u64, ptr: u64, len: u64, write: bool) -> bool 
 }
 
 /// Physical address of user address `va`, which `user_range_ok` accepted.
-fn user_phys(pml4: u64, va: u64) -> u64 {
-    translate(pml4, va).expect("validated user page vanished").0
+fn user_phys(space: AddressSpace, va: u64) -> u64 {
+    translate(space, va)
+        .expect("validated user page vanished")
+        .0
 }
 
 /// Bytes from `va` to the end of its page.
@@ -252,31 +241,31 @@ fn page_rest(va: u64) -> u64 {
     PAGE_SIZE - (va & (PAGE_SIZE - 1))
 }
 
-/// Copy `src` to user memory at `dst` in address space `pml4`.
-pub(crate) fn copy_to_user(pml4: u64, dst: u64, src: &[u8]) -> bool {
-    if !user_range_ok(pml4, dst, src.len() as u64, true) {
+/// Copy `src` to user memory at `dst` in address space `space`.
+pub(crate) fn copy_to_user(space: AddressSpace, dst: u64, src: &[u8]) -> bool {
+    if !user_range_ok(space, dst, src.len() as u64, true) {
         return false;
     }
     let mut done = 0;
     while done < src.len() {
         let va = dst + done as u64;
         let n = (page_rest(va) as usize).min(src.len() - done);
-        phys::write(user_phys(pml4, va), &src[done..done + n]);
+        phys::write(user_phys(space, va), &src[done..done + n]);
         done += n;
     }
     true
 }
 
-/// Fill `dst` from user memory at `src` in address space `pml4`.
-pub(crate) fn copy_from_user(pml4: u64, src: u64, dst: &mut [u8]) -> bool {
-    if !user_range_ok(pml4, src, dst.len() as u64, false) {
+/// Fill `dst` from user memory at `src` in address space `space`.
+pub(crate) fn copy_from_user(space: AddressSpace, src: u64, dst: &mut [u8]) -> bool {
+    if !user_range_ok(space, src, dst.len() as u64, false) {
         return false;
     }
     let mut done = 0;
     while done < dst.len() {
         let va = src + done as u64;
         let n = (page_rest(va) as usize).min(dst.len() - done);
-        phys::read(user_phys(pml4, va), &mut dst[done..done + n]);
+        phys::read(user_phys(space, va), &mut dst[done..done + n]);
         done += n;
     }
     true
@@ -284,63 +273,71 @@ pub(crate) fn copy_from_user(pml4: u64, src: u64, dst: &mut [u8]) -> bool {
 
 /// Copy `len` bytes of user memory from one address space to another.
 pub(crate) fn copy_user_to_user(
-    dst_pml4: u64,
+    dst_space: AddressSpace,
     dst: u64,
-    src_pml4: u64,
+    src_space: AddressSpace,
     src: u64,
     len: u64,
 ) -> bool {
-    if !user_range_ok(src_pml4, src, len, false) || !user_range_ok(dst_pml4, dst, len, true) {
+    if !user_range_ok(src_space, src, len, false) || !user_range_ok(dst_space, dst, len, true) {
         return false;
     }
     let mut done = 0;
     while done < len {
         let (s, d) = (src + done, dst + done);
         let n = page_rest(s).min(page_rest(d)).min(len - done);
-        phys::copy(user_phys(dst_pml4, d), user_phys(src_pml4, s), n as usize);
+        phys::copy(user_phys(dst_space, d), user_phys(src_space, s), n as usize);
         done += n;
     }
     true
 }
 
-/// Call `f(virt, leaf entry)` for every mapped user page of `pml4`.
-fn for_each_user_page(pml4: u64, mut f: impl FnMut(u64, u64)) {
-    for i4 in USER_SLOTS {
-        let e4 = entry(pml4, i4);
-        if !present(e4) {
-            continue;
-        }
-        for i3 in 0..TABLE_ENTRIES {
-            let e3 = entry(e4 & ADDR_MASK, i3);
-            if !present(e3) {
-                continue;
-            }
-            for i2 in 0..TABLE_ENTRIES {
-                let e2 = entry(e3 & ADDR_MASK, i2);
-                if !present(e2) {
-                    continue;
-                }
-                for i1 in 0..TABLE_ENTRIES {
-                    let e1 = entry(e2 & ADDR_MASK, i1);
-                    if present(e1) {
-                        let virt = (i4 as u64) << shift(0)
-                            | (i3 as u64) << shift(1)
-                            | (i2 as u64) << shift(2)
-                            | (i1 as u64) << shift(3);
-                        f(virt, e1);
-                    }
-                }
-            }
+/// What [`walk`] visits.
+enum Visit {
+    /// A mapped user page: its virtual address and page entry.
+    Page(u64, u64),
+    /// A page table below the root, once everything below it has been visited.
+    Table(u64),
+}
+
+/// Visits the user part of `space`, depth first: every mapped page, and every table below the
+/// root after what it points to (so that the tables can be freed as they are visited).
+fn walk(space: AddressSpace, mut f: impl FnMut(Visit)) {
+    for i in Paging::USER_ROOT_ENTRIES {
+        let e = entry(space.0, i);
+        if Paging::is_present(e) {
+            walk_table(Paging::target(e), 1, (i as u64) << shift(0), &mut f);
         }
     }
 }
 
+/// [`walk`] below the root: the table at `table`, at `level`, which maps the addresses from
+/// `base` on.
+fn walk_table(table: u64, level: usize, base: u64, f: &mut impl FnMut(Visit)) {
+    for i in 0..TABLE_ENTRIES {
+        let e = entry(table, i);
+        if !Paging::is_present(e) {
+            continue;
+        }
+        let virt = base | (i as u64) << shift(level);
+        if level == PAGE_LEVEL {
+            f(Visit::Page(virt, e));
+        } else {
+            walk_table(Paging::target(e), level + 1, virt, f);
+        }
+    }
+    f(Visit::Table(table));
+}
+
 /// Deep-copy all user pages (used by `task_fork`; no copy-on-write yet).
-pub(crate) fn clone_user_space(src: u64) -> Option<u64> {
+pub(crate) fn clone_user_space(src: AddressSpace) -> Option<AddressSpace> {
     let dst = new_address_space()?;
     let serialised = MAP_LOCK.lock();
     let mut ok = true;
-    for_each_user_page(src, |virt, e| {
+    walk(src, |visit| {
+        let Visit::Page(virt, e) = visit else {
+            return;
+        };
         if !ok {
             return;
         }
@@ -348,9 +345,9 @@ pub(crate) fn clone_user_space(src: u64) -> Option<u64> {
             ok = false;
             return;
         };
-        phys::copy(f, e & ADDR_MASK, PAGE_SIZE as usize);
-        let flags = e & !ADDR_MASK & !USAGE_BITS;
-        if map_user(dst, virt, f, flags).is_err() {
+        phys::copy(f, Paging::target(e), PAGE_SIZE as usize);
+        // The same permissions; the CPU's record of use starts afresh for the copy.
+        if map_user(dst, virt, f, Paging::page_prot(e)).is_err() {
             pmm::free_frame(f);
             ok = false;
         }
@@ -363,31 +360,13 @@ pub(crate) fn clone_user_space(src: u64) -> Option<u64> {
     Some(dst)
 }
 
-/// Frees every user page and page table, then the PML4 itself.
+/// Frees every user page and page table, then the root itself.
 ///
-/// Never call this on the active CR3.
-pub(crate) fn destroy_user_space(pml4: u64) {
-    for_each_user_page(pml4, |_, e| pmm::free_frame(e & ADDR_MASK));
-    // Then the tables themselves, bottom up.
-    for i4 in USER_SLOTS {
-        let e4 = entry(pml4, i4);
-        if !present(e4) {
-            continue;
-        }
-        for i3 in 0..TABLE_ENTRIES {
-            let e3 = entry(e4 & ADDR_MASK, i3);
-            if !present(e3) {
-                continue;
-            }
-            for i2 in 0..TABLE_ENTRIES {
-                let e2 = entry(e3 & ADDR_MASK, i2);
-                if present(e2) {
-                    pmm::free_frame(e2 & ADDR_MASK);
-                }
-            }
-            pmm::free_frame(e3 & ADDR_MASK);
-        }
-        pmm::free_frame(e4 & ADDR_MASK);
-    }
-    pmm::free_frame(pml4);
+/// Never call this on an address space that a CPU uses.
+pub(crate) fn destroy_user_space(space: AddressSpace) {
+    walk(space, |visit| match visit {
+        Visit::Page(_, e) => pmm::free_frame(Paging::target(e)),
+        Visit::Table(table) => pmm::free_frame(table),
+    });
+    pmm::free_frame(space.0);
 }

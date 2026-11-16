@@ -10,7 +10,8 @@
 //! System V x86_64 layout, as on Linux, so a libc ported later finds them where it expects them.
 
 use crate::arch::{UserContext, UserRegs};
-use crate::{elf, vmm};
+use crate::elf;
+use crate::vmm::{self, AddressSpace};
 use haisuli_abi::errno::{E2BIG, EINVAL, ENOENT, ENOEXEC, ENOMEM};
 use haisuli_abi::exec::{HEADER, STRINGS_MAX};
 use haisuli_abi::mman::{PROT_READ, PROT_WRITE};
@@ -84,27 +85,27 @@ impl<'a> Args<'a> {
 ///
 /// Returns its page tables and the registers to enter user mode with. Nothing
 /// is left behind on error.
-pub(crate) fn load(image: &[u8], args: &Args<'_>) -> Result<(u64, UserContext), Error> {
-    let pml4 = vmm::new_address_space().ok_or((-ENOMEM, "out of memory"))?;
+pub(crate) fn load(image: &[u8], args: &Args<'_>) -> Result<(AddressSpace, UserContext), Error> {
+    let space = vmm::new_address_space().ok_or((-ENOMEM, "out of memory"))?;
     let setup = || -> Result<UserContext, Error> {
-        let entry = elf::load(pml4, image).map_err(|why| (-ENOEXEC, why))?;
+        let entry = elf::load(space, image).map_err(|why| (-ENOEXEC, why))?;
         let stack = STACK_PAGES * PAGE_SIZE;
-        let flags = vmm::user_flags(PROT_READ | PROT_WRITE);
-        vmm::map_init(pml4, vmm::USER_STACK_TOP - stack, stack, &[], flags)
+        let flags = vmm::user_prot(PROT_READ | PROT_WRITE);
+        vmm::map_init(space, vmm::USER_STACK_TOP - stack, stack, &[], flags)
             .map_err(|_| (-ENOMEM, "out of memory"))?;
-        Ok(UserContext::new_program(entry, push_args(pml4, args)?))
+        Ok(UserContext::new_program(entry, push_args(space, args)?))
     };
     match setup() {
-        Ok(frame) => Ok((pml4, frame)),
+        Ok(frame) => Ok((space, frame)),
         Err(e) => {
-            vmm::destroy_user_space(pml4);
+            vmm::destroy_user_space(space);
             Err(e)
         }
     }
 }
 
 /// Writes the initial stack (see [`haisuli_abi::exec`]) and returns the stack pointer.
-fn push_args(pml4: u64, args: &Args<'_>) -> Result<u64, Error> {
+fn push_args(space: AddressSpace, args: &Args<'_>) -> Result<u64, Error> {
     const NO_ROOM: Error = (-E2BIG, "arguments do not fit on the stack");
     let top = vmm::USER_STACK_TOP;
     let strings = (top - args.strings.len() as u64) & !7;
@@ -114,13 +115,13 @@ fn push_args(pml4: u64, args: &Args<'_>) -> Result<u64, Error> {
     if top - sp > STACK_PAGES * PAGE_SIZE {
         return Err(NO_ROOM);
     }
-    if !vmm::copy_to_user(pml4, strings, args.strings) {
+    if !vmm::copy_to_user(space, strings, args.strings) {
         return Err(NO_ROOM);
     }
     // argc, argv[], NULL, envp[], NULL, AT_NULL.
     let mut at = sp;
     let mut put = |word: u64| {
-        let ok = vmm::copy_to_user(pml4, at, &word.to_ne_bytes());
+        let ok = vmm::copy_to_user(space, at, &word.to_ne_bytes());
         at += 8;
         ok
     };

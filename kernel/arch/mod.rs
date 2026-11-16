@@ -22,8 +22,9 @@
 #[path = "x86_64/mod.rs"]
 mod imp;
 
-pub(crate) use imp::UserContext;
-pub(crate) use imp::{apic, boot, context, cpu, entry, gdt, idt, percpu, phys, smp, upcall, x86};
+use core::ops::Range;
+pub(crate) use imp::{apic, context, cpu, entry, gdt, idt, percpu, phys, smp, upcall, x86};
+pub(crate) use imp::{Paging, UserContext, ELF_MACHINE};
 
 /// What generic code may know about a thread's saved user registers ([`UserContext`]).
 ///
@@ -60,8 +61,58 @@ pub(crate) trait UserRegs: Copy {
     fn set_sp(&mut self, sp: u64);
 }
 
-// The architecture's context must implement the contract.
+/// What a user page may be used for.
+///
+/// Readable always; the page-table format encodes the rest its own way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Prot {
+    /// User mode may access it (otherwise only the kernel).
+    pub(crate) user: bool,
+    /// It may be written.
+    pub(crate) write: bool,
+    /// Instructions may be fetched from it.
+    pub(crate) exec: bool,
+}
+
+/// The architecture's page tables: their shape, and the format of their entries.
+///
+/// [`crate::vmm`] walks them generically: a root table, then `LEVELS - 1` levels of tables
+/// below it, each translating `INDEX_BITS` bits of the virtual address above a page offset of
+/// `PAGE_SHIFT` bits, with 8-byte entries; the last level's entries map pages. Everything about
+/// the bits of an entry, and about how the kernel's half of an address space gets into a new one
+/// (a shared root entry on x86_64, a root register of its own on arm64), is the architecture's.
+pub(crate) trait PageTables {
+    /// Levels of tables, the root's included.
+    const LEVELS: usize;
+    /// Virtual address bits that each level translates (a table has `2^INDEX_BITS` entries).
+    const INDEX_BITS: u32;
+    /// Bits of the page offset: a page is `2^PAGE_SHIFT` bytes.
+    const PAGE_SHIFT: u32;
+    /// The root entries that map user space (and nothing else).
+    const USER_ROOT_ENTRIES: Range<usize>;
+
+    /// Whether `entry` is in use.
+    fn is_present(entry: u64) -> bool;
+    /// The physical address of the table or page that `entry` points to.
+    fn target(entry: u64) -> u64;
+    /// An entry that points to the next level's table at `table`.
+    fn table_entry(table: u64) -> u64;
+    /// An entry that maps the page at `frame` with `prot`.
+    fn page_entry(frame: u64, prot: Prot) -> u64;
+    /// What a page entry allows.
+    fn page_prot(entry: u64) -> Prot;
+    /// The root of the address space with no user pages, for a CPU that runs no thread.
+    fn kernel_root() -> u64;
+    /// Gives the new, zeroed root table at `root` the kernel's part of every address space.
+    fn init_root(root: u64);
+    /// Makes `root` this CPU's address space (unless it is already).
+    fn activate(root: u64);
+}
+
+// The architecture's types must implement the contract.
 const _: () = {
-    const fn conforms<T: UserRegs>() {}
-    conforms::<UserContext>();
+    const fn regs<T: UserRegs>() {}
+    const fn tables<T: PageTables>() {}
+    regs::<UserContext>();
+    tables::<Paging>();
 };
