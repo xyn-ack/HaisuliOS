@@ -5,7 +5,7 @@
 //! The PC's COM1 UART (a 16550), write-only: the kernel's log goes out of it, and input belongs
 //! to the user-space console server, which drives the rest of the UART itself.
 
-use crate::arch::cpu::Device::Com1;
+use crate::arch::x86_64::cpu::Device::Com1;
 use haisuli_abi::uart::{
     FifoControl, LineControl, LineStatus, ModemControl, Register, DIVISOR_38400,
 };

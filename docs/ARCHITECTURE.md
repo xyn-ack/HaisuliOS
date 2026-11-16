@@ -20,48 +20,85 @@ servers built on them. The [README](../README.md) has the overview and how to bu
 
 The kernel's hardware layer has two axes, so that another CPU architecture (ARM, say) can be
 added beside the first: `kernel/arch/` is the CPU architecture (traps, context switch, page
-tables, per-CPU data), and `kernel/platform/` is the machine around it (the boot protocol, the
-interrupt controller, the serial line, firmware tables, power). Each has one implementation per
-architecture or platform, in its own directory, selected at compile time; the rest of the kernel
-uses only what their `mod.rs` files re-export. That re-export list is the contract a new
-architecture implements, and traits make the compiler check its parts:
+tables, per-CPU data, the CPU's own interrupts), and `kernel/platform/` is the machine around it
+(the boot protocol, the interrupt controller, the serial line, firmware tables, power). Each has
+one implementation per architecture or platform, in its own directory, selected at compile time;
+the rest of the kernel uses only what their `mod.rs` files re-export, and never names an
+architecture's or a platform's directory (`arch::x86_64`, `platform::pc`). That re-export list is
+the contract a new architecture or platform implements, and traits make the compiler check it.
 
-* `UserRegs`: everything generic code may do with a thread's saved user registers (read the
-  system call's number and arguments, set the return value, restart the call, move the stack
-  pointer, tell user mode from kernel mode), so no generic file names a register.
-* `PageTables`: the shape of the page tables (levels, bits per level, page size, which root
-  entries are user space), the format of an entry, and how an address space gets the kernel's
-  half and becomes a CPU's. `vmm` walks them generically, with `Prot` (user, write, execute) for
-  permissions and an `AddressSpace` for a root, so no generic file knows an entry's bits or what
-  a PML4 is.
+The architecture's contract (`kernel/arch/mod.rs`):
 
-Plus constants such as `ELF_MACHINE`, the machine type of the programs the CPU runs. The platform
-may use the architecture; the architecture does not depend on the platform, except that the boot
-entry speaks the boot loader's protocol. [TODO.md](../TODO.md) has the steps that remain (the
-interrupt controller and timers, booting, the ABI and user space, then arm64 itself).
+* `UserRegs`, for `UserContext`: everything generic code may do with a thread's saved user
+  registers (read the system call's number and arguments, set the return value, restart the
+  call, move the stack pointer, tell user mode from kernel mode), so no generic file names a
+  register.
+* `PageTables`, for `Paging`: the shape of the page tables (levels, bits per level, page size,
+  which root entries are user space), the format of an entry, and how an address space gets the
+  kernel's half and becomes a CPU's. `vmm` walks them generically, with `Prot` (user, write,
+  execute) for permissions and an `AddressSpace` for a root, so no generic file knows an entry's
+  bits or what a PML4 is.
+* `Processor`, for `Cpu`: setting up a CPU (`init_cpu`: on x86_64 the GDT and TSS, the IDT, the
+  local APIC and its timer's calibration, `syscall`), starting the others from the hardware ids
+  the platform lists (`start_cpus`), preparing a CPU for a thread (`prepare_thread`: on x86_64
+  the TSS's kernel stack and I/O bitmap, and the `syscall` stack), waiting for an interrupt and
+  halting.
+* `CpuInterrupts`, for `Cpu`: the CPU's own interrupts: starting the tick, sending the
+  reschedule IPI to a CPU (by the kernel's index for it, not a hardware id), end of interrupt.
+  The architecture's interrupt entry tells the generic dispatch (`irq::dispatch`) where an
+  interrupt came from as an `Interrupt`: the tick, a reschedule, a platform interrupt line, or
+  nothing (spurious), so `irq` knows no vectors.
+
+Plus the modules that every architecture provides with the same interface, `context` (kernel
+stacks, the context switch), `percpu`, `phys` and `upcall` (the upcall frame), and constants such
+as `ELF_MACHINE`, the machine type of the programs the CPU runs.
+
+The platform's contract (`kernel/platform/mod.rs`), all for `Board`:
+
+* `Machine`: the early console (where the kernel's log goes), a busy-wait for the delays of
+  booting, the hardware ids of the CPUs the firmware lists (`CpuIds`), and powering off.
+* `BootInfo`: what the boot loader left, in platform-neutral terms: the available memory, the
+  memory its own data takes (which the kernel keeps out of the allocator), and the boot modules
+  (`Module`: contents and name). Multiboot on the PC; a device tree on arm64.
+* `InterruptController`: the platform's interrupt lines: how many, which are reserved, masking,
+  unmasking, and acknowledging one that fired.
+
+The platform may use the architecture it is built on, by name (the PC's devices are reached with
+`arch::x86_64`'s port I/O); the architecture does not depend on the platform, except that the
+boot entry speaks the boot loader's protocol (x86_64's takes the Multiboot handshake from
+`platform::pc`). So booting reads, in `main.rs`: the platform's early console, the architecture's
+`init_cpu` (with the platform's delays), the frame allocator from the platform's memory map, the
+platform's interrupt controller, the boot modules, then the architecture's `start_cpus` for the
+platform's `cpus()`. [TODO.md](../TODO.md) has the steps that remain (the ABI and user space,
+then arm64 itself).
 
 ```
 kernel/            the kernel
-  main.rs          kmain, panic handler; denies unsafe code crate-wide
+  main.rs          kmain (booting, through the contracts), panic handler; denies unsafe code
+                   crate-wide
   arch/            hardware layer, the CPU architecture: one directory per architecture,
                    selected at compile time behind one contract (see mod.rs: what it
-                   re-exports, and the UserRegs and PageTables traits)
+                   re-exports, and the UserRegs, PageTables, Processor and CpuInterrupts traits)
     x86_64/
+      mod.rs       Cpu: the Processor and CpuInterrupts traits, on the modules below
       boot.rs      Multiboot entry, 32->64-bit switch, boot page tables (asm)
       cpu.rs       privileged instructions; port I/O on a fixed list of devices
       percpu.rs    each CPU's own block, through GS (swapgs on every user/kernel switch)
-      apic.rs      local APICs: the tick, IPIs, starting CPUs
+      apic.rs      local APICs: the tick, IPIs (each CPU's APIC id), starting CPUs
       smp.rs       starting the other CPUs: the real-mode trampoline (asm)
       entry.rs     exception/IRQ/syscall entry stubs, UserRegs, return to user mode (asm)
       context.rs   kernel stacks, per-CPU idle contexts, context switch
       gdt.rs       GDT + a TSS per CPU (layout chosen for SYSCALL/SYSRET), I/O bitmap
-      idt.rs       IDT: every gate; CPU exception handling
+      idt.rs       IDT: every gate; CPU exception handling; vectors to interrupt sources
       upcall.rs    the frame that enters a handler (Linux x86_64 signal frame layout)
       paging.rs    the 4-level page-table format (PageTables), the kernel's half (PML4[0])
       phys.rs      physical memory access, limited to allocator-owned frames
       x86.rs       names for the CPU's numbers: register bits, vectors, descriptors
-  platform/        hardware layer, the machine around the CPU: one directory per platform
+  platform/        hardware layer, the machine around the CPU: one directory per platform,
+                   behind one contract (see mod.rs: the Machine, BootInfo and
+                   InterruptController traits)
     pc/
+      mod.rs       Board (the PC): the platform's traits, on the modules below
       multiboot.rs boot-loader information: memory map, boot modules
       acpi.rs      the CPUs the firmware's MADT lists
       pic.rs       the 8259 interrupt controllers
@@ -69,8 +106,9 @@ kernel/            the kernel
       uart.rs      the COM1 16550, the serial line's transmitter
       power.rs     powering off (QEMU's isa-debug-exit)
   sync.rs          Lock: a ticket spinlock that panics on re-entrant use
-  irq.rs           forwarding interrupt lines to drivers; every interrupt's dispatch
-  pmm.rs           Physical frame allocator (the loader's memory map)
+  irq.rs           forwarding interrupt lines to drivers; every interrupt's dispatch, by
+                   source (the tick, a reschedule, a line)
+  pmm.rs           Physical frame allocator (the platform's memory map)
   vmm.rs           address spaces: a generic page-table walk (map, translate, clone for
                    task_fork, destroy) and every access to user memory
   elf.rs           ELF64 loader for user programs

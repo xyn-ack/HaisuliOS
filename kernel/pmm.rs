@@ -3,10 +3,10 @@
 //! Physical memory manager.
 //!
 //! A bitmap frame allocator over the first 1 GiB, the range identity-mapped by the boot page
-//! tables.
+//! tables, filled from the memory that the platform's boot loader describes.
 
 use crate::arch::phys;
-use crate::platform::multiboot::{self, MemoryType};
+use crate::platform::{Board, BootInfo};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub(crate) use crate::arch::phys::{MAX_PHYS, PAGE_SIZE};
@@ -42,14 +42,11 @@ fn reserve(from: u64, to: u64) {
     }
 }
 
-/// Populate the allocator from the Multiboot memory map.
+/// Populate the allocator from the boot loader's description of the memory.
 pub(crate) fn init() {
-    for (base, len, kind) in multiboot::memory_map() {
-        if kind != MemoryType::Available {
-            continue;
-        }
-        let start = (base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let stop = ((base + len) & !(PAGE_SIZE - 1)).min(MAX_PHYS);
+    for range in Board::memory() {
+        let start = (range.start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let stop = (range.end & !(PAGE_SIZE - 1)).min(MAX_PHYS);
         let mut a = start;
         while a < stop {
             mark_free((a / PAGE_SIZE) as usize);
@@ -62,9 +59,9 @@ pub(crate) fn init() {
     // Boot modules (user programs, ramdisk) and the boot information that
     // describes them stay in use: keep them intact, and tell `phys`, which
     // refuses them from then on.
-    for (start, end) in multiboot::reserved_ranges() {
-        phys::keep_out(start, end);
-        reserve(start, end);
+    for range in Board::boot_data() {
+        phys::keep_out(range.start, range.end);
+        reserve(range.start, range.end);
     }
     // Everything still free becomes allocator-owned memory.
     for f in 0..FRAMES {

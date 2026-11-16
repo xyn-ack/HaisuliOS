@@ -54,26 +54,18 @@ Done:
 3. **The page tables** behind the `PageTables` trait (geometry, entry format, putting the
    kernel's half into a new address space, switching), with a generic walker in `vmm`, the
    portable `Prot`, the `AddressSpace` type and the architecture's `ELF_MACHINE`.
+4. **The machine and the CPU's own devices behind contracts.** The architecture's `Processor`
+   (`init_cpu(boot_cpu)`, `start_cpus`, `prepare_thread`: one call that prepares the CPU for a
+   thread, on x86_64 the TSS and the `syscall` stack) and `CpuInterrupts` (the tick, the
+   reschedule IPI by CPU index, end of interrupt), for `arch::Cpu`; an interrupt dispatch in
+   `irq` that deals in sources (`arch::Interrupt`: tick, reschedule, line, spurious) rather than
+   vectors. The platform's `Machine` (early console, start-up delays, `cpus()`, power-off),
+   `BootInfo` (memory, the boot loader's own data and the boot modules, platform-neutral) and
+   `InterruptController` (lines, mask, unmask, acknowledge), for `platform::Board`. No generic
+   file names `arch::{apic, idt, gdt, smp, entry}`, `arch::x86_64` or `platform::pc`.
 
 To do:
 
-4. **The machine and the CPU's own devices behind contracts.** What generic code still takes from
-   the hardware layer directly:
-   - the local APIC (`arch::apic`: vectors, IPIs, end of interrupt, the timer) and the IDT's
-     vector numbers, in `irq.rs`, `task.rs` and `main.rs`: an interrupt contract (the platform's
-     controller: lines, mask, unmask, acknowledge; the CPU's: the tick, the reschedule IPI, end
-     of interrupt), with a dispatch that deals in interrupt sources rather than x86 vectors;
-   - switching to a thread (`task::switch`: the TSS's kernel stack and I/O bitmap, the `syscall`
-     stack): one `arch` call that prepares the CPU for a thread, whatever it needs;
-   - booting (`main.rs` calls `gdt`, `idt`, `apic`, `smp`, `acpi`, `pit` in the PC's order):
-     `arch::init_cpu(boot_cpu)`, and the platform's `cpus()`, start-up delays, early console and
-     power-off behind one interface;
-   - the boot loader's data (`pmm.rs` and `task.rs` read `platform::multiboot`): the platform's
-     memory map and boot modules as a platform-neutral interface (device tree on `virt`).
-
-   Done when no generic kernel file uses `arch::{apic, idt, gdt, smp, entry}` or a
-   `platform::pc` module by name, and the new contracts are compiler-checked like `UserRegs` and
-   `PageTables`.
 5. **The ABI and user space.**
    - `abi::nr`: "Linux numbers" are per architecture (arm64 uses the generic table: `read` is
      63, `clone` 220, and there is no `open` or `dup2`, only `openat` and `dup3`), so the numbers
@@ -100,6 +92,11 @@ To do:
      a restart backs up 4 bytes), the context switch, per-CPU data in `TPIDR_EL1`, the page
      tables (`TTBR0_EL1` for user space, `TTBR1_EL1` for the kernel, so `init_root` has nothing to
      copy), the GIC and the generic timer; one CPU first, then the others through PSCI `CPU_ON`.
+   - Step 4's contracts there: `BootInfo` and `Machine::cpus()` from the device tree (`/memory`,
+     `/chosen`'s initrd, MPIDR values from `/cpus`), `InterruptController` on the GIC's
+     distributor, `CpuInterrupts` on the generic timer and the GIC's CPU interface (an SGI for
+     the reschedule IPI; the entry decodes the interrupt id into an `arch::Interrupt`). The GIC's
+     per-CPU part may need a per-CPU hook in `InterruptController`, which the PC has no use for.
 
    Done when `make check ARCH=aarch64` passes the same tests as on x86_64, then
    `TEST_EXPLICIT="smp"`.

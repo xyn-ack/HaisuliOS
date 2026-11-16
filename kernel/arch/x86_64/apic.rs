@@ -15,9 +15,13 @@
 //! The APIC has no clock of its own that the kernel knows: whoever calibrates the timer or
 //! starts a CPU passes a `wait` function that busy-waits for some microseconds (the PC platform
 //! measures with the PIT).
+//!
+//! Every CPU records its APIC id when it enables its APIC ([`init`]), so that the rest of the
+//! kernel can name CPUs by their index ([`send_reschedule`]).
 
 use super::boot::APIC_BASE;
 use super::cpu;
+use super::percpu::{self, MAX_CPUS};
 use super::x86::Msr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -84,6 +88,8 @@ pub(crate) const SPURIOUS_VECTOR: u8 = 0xFF;
 pub(crate) const TICK_MS: u32 = 10;
 /// APIC timer counts per tick, measured by [`calibrate_timer`].
 static TIMER_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Each CPU's APIC id, by CPU index (recorded by [`init`]).
+static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 
 fn read(reg: Reg) -> u32 {
     let addr = (APIC_BASE + reg as u64) as *const u32;
@@ -100,7 +106,8 @@ fn write(reg: Reg, v: u32) {
     unsafe { core::ptr::write_volatile(addr, v) }
 }
 
-/// Enables this CPU's local APIC; the boot CPU's passes the PIC's interrupts through.
+/// Enables this CPU's local APIC, and records its id; the boot CPU's passes the PIC's
+/// interrupts through.
 ///
 /// # Panics
 ///
@@ -124,6 +131,7 @@ pub(crate) fn init(boot_cpu: bool) {
         write(Reg::LvtLint1, LVT_MASKED);
     }
     write(Reg::LvtTimer, LVT_MASKED);
+    APIC_IDS[percpu::index()].store(id(), Ordering::Relaxed);
 }
 
 /// This CPU's APIC id.
@@ -166,9 +174,12 @@ fn send(apic_id: u32, command: u32) {
     }
 }
 
-/// Interrupts the CPU with APIC id `apic_id` with `vector`.
-pub(crate) fn send_ipi(apic_id: u32, vector: u8) {
-    send(apic_id, vector as u32);
+/// Interrupts CPU `cpu` (an index, not an APIC id) with the reschedule IPI.
+pub(crate) fn send_reschedule(cpu: usize) {
+    send(
+        APIC_IDS[cpu].load(Ordering::Relaxed),
+        RESCHEDULE_VECTOR as u32,
+    );
 }
 
 /// Starts the CPU with APIC id `apic_id` at physical address `page` (below 1 MiB, page aligned)

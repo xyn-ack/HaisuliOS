@@ -170,7 +170,7 @@ pub(crate) enum Exception {
     InvalidOpcode = 6,
     /// #NM.
     DeviceNotAvailable = 7,
-    /// #DF, which gets its own stack (see [`crate::gdt::DOUBLE_FAULT_IST`]).
+    /// #DF, which gets its own stack (see [`super::gdt::DOUBLE_FAULT_IST`]).
     DoubleFault = 8,
     /// Vector 9, on CPUs before the 486.
     CoprocessorSegmentOverrun = 9,

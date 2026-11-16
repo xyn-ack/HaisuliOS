@@ -98,7 +98,7 @@ the Makefile builds for it (`--target x86_64-unknown-none`). Each image's
 the bare-metal target too; outputs land in `target/x86_64-unknown-none/`.
 
 Why the `objcopy` step? QEMU's `-kernel` loader only accepts 32-bit ELF files;
-the kernel itself switches to long mode in `kernel/arch/boot.rs`.
+the kernel itself switches to long mode in `kernel/arch/x86_64/boot.rs`.
 QEMU passes the boot modules with `-initrd "build/init,build/proc,build/initrd.tar"`.
 With GRUB you can boot the 64-bit ELF directly:
 

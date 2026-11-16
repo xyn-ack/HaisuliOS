@@ -6,7 +6,7 @@
 //! its counter 2 can be polled, so no interrupt is needed. The local APIC timer is calibrated
 //! against it, and the delays of waking the other CPUs come from it.
 
-use crate::arch::cpu::Device;
+use crate::arch::x86_64::cpu::Device;
 
 /// The PIT's input clock, in Hz.
 const PIT_HZ: u64 = 1_193_182;

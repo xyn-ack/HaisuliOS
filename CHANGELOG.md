@@ -4,6 +4,45 @@ What changed in each version of HaisuliOS. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the goals and the
 roadmap are in [TODO.md](TODO.md).
 
+## Unreleased
+
+The fourth step toward a second CPU architecture: the machine and the CPU's own devices are behind
+contracts too. Generic kernel code no longer names the local APIC, the IDT, the GDT, the SMP
+start-up or the entry stubs, nor any module of the PC platform; it boots, schedules and takes
+interrupts through traits that the compiler checks, like `UserRegs` and `PageTables`.
+
+### Added
+
+- The architecture's `Processor` trait (for `arch::Cpu`): `init_cpu(boot_cpu, wait)` sets up a
+  CPU (on x86_64 the GDT and TSS, the IDT, the local APIC and its timer, `syscall`),
+  `start_cpus` starts the others from the hardware ids the platform lists, `prepare_thread` is
+  the one call that prepares a CPU for a thread (on x86_64 the TSS's kernel stack and I/O bitmap
+  and the `syscall` stack), plus `wait_for_interrupt` and `halt`.
+- The architecture's `CpuInterrupts` trait: the tick, the reschedule IPI, end of interrupt. IPIs
+  name CPUs by the kernel's index; the APIC keeps each CPU's APIC id itself.
+- `arch::Interrupt`: the architecture's interrupt entry tells `irq::dispatch` where an interrupt
+  came from (the tick, a reschedule, a platform line, or nothing) instead of passing an x86
+  vector.
+- The platform's traits (for `platform::Board`): `Machine` (the early console, start-up delays,
+  the CPUs the firmware lists, power-off), `BootInfo` (the available memory, the boot loader's own
+  data and the boot modules, without Multiboot's types) and `InterruptController` (lines, mask,
+  unmask, acknowledge).
+
+### Changed
+
+- Booting (`main.rs`) goes through the contracts only. The boot CPU sets itself up before the
+  frame allocator and the 8259s rather than around them (interrupts are off throughout, so the
+  order does not matter to the hardware).
+- `arch::x86_64` and `platform::pc` are named only by the hardware layer: by the PC for its
+  port I/O and vectors, and by x86_64's boot entry for the Multiboot handshake.
+- A task's pending IRQ lines are a 64-bit set (the platform says how many lines there are; the
+  compiler checks that they fit).
+
+### Removed
+
+- `kernel/process/` (`signal.rs`, `group.rs`), dead code left over from 0.1 that no module
+  included since `kernel/process.rs` went in 0.3.1.
+
 ## 0.3.1
 
 In preparation for a second CPU architecture (ARM), the hardware layer is split along two axes:

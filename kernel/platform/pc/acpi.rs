@@ -11,8 +11,8 @@
 //! allocator frame or kernel data overlaps; every table is checked (signature, length and
 //! checksum) before it is used.
 
-use crate::arch::percpu::MAX_CPUS;
 use crate::arch::phys::{self, MAX_PHYS, PAGE_SIZE};
+use crate::platform::CpuIds;
 
 /// Where the BIOS data area keeps the segment of the extended BIOS data area.
 const EBDA_SEGMENT_POINTER: u64 = 0x40E;
@@ -97,14 +97,14 @@ fn table(addr: u64) -> Option<&'static [u8]> {
     firmware(addr, len).filter(|t| checksum_ok(t))
 }
 
-/// The local APIC ids of the enabled CPUs, in the MADT's order (at most [`MAX_CPUS`]).
+/// The local APIC ids of the enabled CPUs, in the MADT's order (at most
+/// [`MAX_CPUS`](crate::arch::percpu::MAX_CPUS)).
 ///
 /// Empty if the firmware has no (valid) MADT: then the kernel runs on the boot CPU alone.
-pub(crate) fn cpus() -> ([u32; MAX_CPUS], usize) {
-    let mut ids = [0; MAX_CPUS];
-    let mut n = 0;
+pub(crate) fn cpus() -> CpuIds {
+    let mut ids = CpuIds::new();
     let Some(rsdt) = rsdp().and_then(|r| table(u32_at(r, RSDP_RSDT) as u64)) else {
-        return (ids, 0);
+        return ids;
     };
     let madt = rsdt[HEADER_LEN..]
         .as_chunks::<4>()
@@ -113,10 +113,10 @@ pub(crate) fn cpus() -> ([u32; MAX_CPUS], usize) {
         .filter_map(|p| table(u32::from_le_bytes(*p) as u64))
         .find(|t| t.starts_with(MADT_SIGNATURE));
     let Some(madt) = madt else {
-        return (ids, 0);
+        return ids;
     };
     let mut at = MADT_ENTRIES;
-    while at + 2 <= madt.len() && n < MAX_CPUS {
+    while at + 2 <= madt.len() {
         let (kind, len) = (madt[at], madt[at + 1] as usize);
         if len < 2 || at + len > madt.len() {
             break;
@@ -124,11 +124,11 @@ pub(crate) fn cpus() -> ([u32; MAX_CPUS], usize) {
         if kind == MADT_LOCAL_APIC
             && len >= LOCAL_APIC_FLAGS + 4
             && u32_at(madt, at + LOCAL_APIC_FLAGS) & LOCAL_APIC_ENABLED != 0
+            && !ids.push(madt[at + LOCAL_APIC_ID] as u64)
         {
-            ids[n] = madt[at + LOCAL_APIC_ID] as u32;
-            n += 1;
+            break; // `MAX_CPUS` of them.
         }
         at += len;
     }
-    (ids, n)
+    ids
 }

@@ -39,7 +39,7 @@ pub(crate) const IO_DENY_ALL: IoBitmap = [DENY_8_PORTS; IO_BITMAP_BYTES];
 /// SYSCALL loads kernel code from STAR and kernel data from the next entry;
 /// SYSRET loads user data and then user code from the two entries after
 /// another base in STAR. Hence kernel data right after kernel code, and user
-/// data right before user code (see [`crate::arch::entry::init_syscalls`]).
+/// data right before user code (see [`super::entry::init_syscalls`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub(crate) enum Selector {
@@ -183,14 +183,12 @@ struct Stack([AtomicU64; 1024]);
 static DOUBLE_FAULT_STACKS: [Stack; MAX_CPUS] =
     [const { Stack([const { AtomicU64::new(0) }; 1024]) }; MAX_CPUS];
 
-/// Stack this CPU switches to on a user->kernel interrupt/exception.
-pub(crate) fn set_kernel_stack(top: u64) {
-    TSS[percpu::index()].lock().rsp0 = top;
-}
-
-/// Install the I/O permissions of the task about to run on this CPU.
-pub(crate) fn set_io_bitmap(bitmap: &IoBitmap) {
-    TSS[percpu::index()].lock().io_bitmap = *bitmap;
+/// Prepares this CPU's TSS for a thread: `top` is its kernel stack, which the CPU switches to on
+/// an interrupt or exception from user mode, and `bitmap` its task's I/O permissions.
+pub(crate) fn set_thread(top: u64, bitmap: &IoBitmap) {
+    let mut tss = TSS[percpu::index()].lock();
+    tss.rsp0 = top;
+    tss.io_bitmap = *bitmap;
 }
 
 /// Loads the GDT and this CPU's TSS; every CPU calls it once, with its own index.

@@ -11,16 +11,16 @@
 //! piece. The console server sends the terminal's output through here too (`serial_write`), so
 //! that the line has one transmitter, and log lines never mix with terminal output.
 
-use crate::platform::uart;
+use crate::platform::{Board, Machine};
 use crate::sync::Lock;
 use core::fmt::{self, Write};
 
 /// Sets the serial line up for output.
 pub(crate) fn init() {
-    uart::init();
+    Board::console_init();
 }
 
-/// The UART, for one message at a time.
+/// The serial line (the platform's early console), for one message at a time.
 pub(crate) struct Serial;
 
 static LOG: Lock<Serial> = Lock::new(Serial);
@@ -32,7 +32,7 @@ pub(crate) fn lock() -> crate::sync::Guard<'static, Serial> {
 
 impl Serial {
     fn write_byte(&mut self, b: u8) {
-        uart::write_byte(b);
+        Board::console_write(b);
     }
 
     /// Writes `s` as it is.

@@ -6,7 +6,7 @@
 //! (shifted: the host sees `code << 1 | 1`). On other machines the write does nothing, and the
 //! caller halts.
 
-use crate::arch::cpu::Device;
+use crate::arch::x86_64::cpu::Device;
 
 /// Powers the machine off, as far as it can (see the module documentation).
 pub(crate) fn off(code: u32) {

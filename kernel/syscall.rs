@@ -10,7 +10,7 @@
 //! process management is not here: the process server implements it on top of the task control
 //! calls.
 
-use crate::arch::{entry, UserContext, UserRegs};
+use crate::arch::{UserContext, UserRegs};
 use crate::fs::{self, Transfer};
 use crate::task::{self, Access, Why};
 use crate::{irq, serial, vmm};
@@ -19,18 +19,8 @@ use haisuli_abi::errno::{EBADF, EFAULT, ENAMETOOLONG, ENOSYS, EPERM};
 use haisuli_abi::fcntl::PATH_MAX;
 use haisuli_abi::nr;
 
-/// Enables system calls on this CPU.
-pub(crate) fn init() {
-    entry::init_syscalls();
-}
-
-/// Kernel stack for the next `syscall` on this CPU (the running thread's).
-pub(crate) fn set_kernel_stack(top: u64) {
-    entry::set_syscall_stack(top);
-}
-
-/// Called by `syscall_entry` in `arch::entry` with the saved user registers;
-/// the result goes back in rax.
+/// Called by the architecture's system call entry with the saved user registers; the result
+/// goes back to the thread with [`UserRegs::set_return`].
 ///
 /// On the way back to user mode it takes the last step of [`task::return_to_user`]: the
 /// thread may end, wait, or enter its pending upcall, which redirects `f` to a handler.

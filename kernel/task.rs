@@ -52,16 +52,16 @@
 //! All scheduler state lives in one `Table` behind a [`Lock`]. Functions take it for short,
 //! explicit scopes and always release it before switching context or idling.
 
-use crate::arch::gdt::IoBitmap;
 use crate::arch::percpu::{self, MAX_CPUS};
 use crate::arch::upcall::{Frame, SavedContext};
-use crate::arch::{apic, context, cpu, gdt, UserContext, UserRegs};
-use crate::platform::{multiboot::Module, power};
+use crate::arch::{self, context, CpuInterrupts, Processor, UserContext, UserRegs};
+use crate::arch::{IoBitmap, IO_DENY_ALL};
+use crate::platform::{Board, BootInfo, Machine, Module};
 use crate::program::{self, Args};
 use crate::sync::{Guard, Lock};
 use crate::upcall::{is_user_address, Upcall};
 use crate::vmm::AddressSpace;
-use crate::{elf, fs, irq, platform, syscall, vmm};
+use crate::{elf, fs, irq, vmm};
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use haisuli_abi::clone::THREAD_FLAGS;
@@ -110,8 +110,6 @@ static KICK_LATER: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; M
 /// The CPUs (one bit each) that this CPU is to interrupt once it lets go of the scheduler's
 /// lock (see [`TableGuard`]).
 static IPIS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
-/// Each CPU's APIC id, for sending it IPIs without the lock.
-static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 const _: () = assert!(MAX_CPUS <= 32, "IPI sets are u32 bit masks");
 /// Tasks that are dying, for [`reap`] to look at.
 static DYING: AtomicUsize = AtomicUsize::new(0);
@@ -283,9 +281,10 @@ struct Task {
     /// Boot modules may; a copy made with `task_fork` may not.
     privileged: bool,
     io_bitmap: IoBitmap,
-    /// IRQ lines that fired and have not been delivered by `ipc_recv` yet.
-    irq_pending: u16,
+    /// IRQ lines that fired and have not been delivered by `ipc_recv` yet, one bit each.
+    irq_pending: u64,
 }
+const _: () = assert!(irq::LINES <= 64, "pending IRQ lines are u64 bit masks");
 
 impl Task {
     const EMPTY: Task = Task {
@@ -306,7 +305,7 @@ impl Task {
         mb_len: 0,
         name: Name([0; NAME_LEN]),
         privileged: false,
-        io_bitmap: gdt::IO_DENY_ALL,
+        io_bitmap: IO_DENY_ALL,
         irq_pending: 0,
     };
 
@@ -340,7 +339,6 @@ impl core::fmt::Display for Name {
 struct Cpu {
     /// Whether the CPU runs the scheduler.
     online: bool,
-    apic_id: u32,
     /// The thread slot it runs, or [`IDLE`].
     current: usize,
     /// The thread slot it ran last: the round robin goes on after it.
@@ -355,7 +353,6 @@ struct Cpu {
 impl Cpu {
     const OFFLINE: Cpu = Cpu {
         online: false,
-        apic_id: 0,
         current: IDLE,
         // So that the first scan starts at slot 0: boot tasks start in order.
         last: MAX_THREADS - 1,
@@ -674,10 +671,7 @@ impl Drop for TableGuard {
         drop(self.0.take());
         let cpus = IPIS[percpu::index()].swap(0, Ordering::Relaxed);
         for cpu in (0..MAX_CPUS).filter(|&c| cpus & (1 << c) != 0) {
-            apic::send_ipi(
-                APIC_IDS[cpu].load(Ordering::Relaxed),
-                apic::RESCHEDULE_VECTOR,
-            );
+            arch::Cpu::send_reschedule(cpu);
         }
     }
 }
@@ -702,14 +696,10 @@ pub(crate) fn is_alive(tid: u64) -> bool {
 
 // ---- CPUs ---------------------------------------------------------------------
 
-/// Makes this CPU one that runs threads, with its APIC id.
-pub(crate) fn cpu_online(apic_id: u32) {
+/// Makes this CPU one that runs threads (once [`Processor::init_cpu`] has set it up).
+pub(crate) fn cpu_online() {
     let mut t = table();
-    let cpu = percpu::index();
-    APIC_IDS[cpu].store(apic_id, Ordering::Relaxed);
-    let c = &mut t.cpus[cpu];
-    c.online = true;
-    c.apic_id = apic_id;
+    t.cpus[percpu::index()].online = true;
 }
 
 /// How many CPUs run threads.
@@ -726,23 +716,23 @@ pub(crate) fn cpus_online() -> usize {
 /// ([`fs::init`]). (The process server adopts the boot tasks as processes,
 /// with their task ids as pids.)
 pub(crate) fn spawn_boot_modules() {
-    let ramdisk = platform::multiboot::modules().find(|m| !elf::is_elf(m.data));
+    let ramdisk = Board::modules().find(|m| !elf::is_elf(m.data));
     fs::init(ramdisk.map_or(&[][..], |r| r.data));
     let mut started = 0;
-    for m in platform::multiboot::modules().filter(|m| elf::is_elf(m.data)) {
+    for m in Board::modules().filter(|m| elf::is_elf(m.data)) {
         match spawn(&m) {
             Ok(tid) => {
                 crate::println!(
                     "[kernel] started task {} ({}): {} KiB image",
                     tid,
-                    Name::new(m.name()),
+                    Name::new(m.name),
                     m.data.len().div_ceil(1024),
                 );
                 started += 1;
             }
             Err((_, why)) => crate::println!(
                 "[kernel] cannot start boot module \"{}\": {}",
-                Name::new(m.name()),
+                Name::new(m.name),
                 why
             ),
         }
@@ -750,7 +740,7 @@ pub(crate) fn spawn_boot_modules() {
     if let Some(r) = ramdisk {
         crate::println!(
             "[kernel] ramdisk \"{}\": {} KiB",
-            Name::new(r.name()),
+            Name::new(r.name),
             r.data.len().div_ceil(1024)
         );
     }
@@ -761,7 +751,7 @@ pub(crate) fn spawn_boot_modules() {
 
 /// Starts boot module `m`, with its name as its only argument.
 fn spawn(m: &Module) -> Result<u64, program::Error> {
-    let name = core::str::from_utf8(m.name()).unwrap_or("?");
+    let name = core::str::from_utf8(m.name).unwrap_or("?");
     let mut block = [0u8; 64];
     let len = exec::build(name, &[name], &[], &mut block).map_err(|e| (e, "name too long"))?;
     let args = Args::parse(&block[..len])?;
@@ -856,7 +846,7 @@ fn pick(t: &mut Table) -> Next {
         return Next {
             slot: IDLE,
             space: AddressSpace::kernel(),
-            io_bitmap: gdt::IO_DENY_ALL,
+            io_bitmap: IO_DENY_ALL,
         };
     };
     c.current = slot;
@@ -871,8 +861,9 @@ fn pick(t: &mut Table) -> Next {
     }
 }
 
-/// Switches this CPU to `next`: its address space, kernel stack and I/O permissions, then its
-/// context. Returns when the thread that calls it runs again.
+/// Switches this CPU to `next`: its address space, whatever else the CPU needs for the thread
+/// ([`Processor::prepare_thread`]), then its context. Returns when the thread that calls it runs
+/// again.
 ///
 /// The address space changes first: once the old context is off this CPU (which is what lets
 /// another CPU free the old address space, see [`reap`]), this CPU no longer uses it.
@@ -881,10 +872,7 @@ fn switch(next: Next) {
     if next.slot == IDLE {
         context::switch_to(context::idle(percpu::index()));
     } else {
-        let top = context::stack_top(next.slot);
-        gdt::set_kernel_stack(top);
-        gdt::set_io_bitmap(&next.io_bitmap);
-        syscall::set_kernel_stack(top);
+        arch::Cpu::prepare_thread(next.slot, &next.io_bitmap);
         context::switch_to(context::thread(next.slot));
     }
 }
@@ -928,7 +916,7 @@ pub(crate) fn schedule() {
 /// progress possible any more, the machine powers off.
 pub(crate) fn idle() -> ! {
     context::enter_idle();
-    apic::start_timer();
+    arch::Cpu::start_tick();
     let cpu = percpu::index();
     loop {
         reap();
@@ -951,7 +939,7 @@ pub(crate) fn idle() -> ! {
                 // Until someone says there may be work (a kick, also from an interrupt handler
                 // on this CPU), or it is time to look anyway.
                 loop {
-                    cpu::wait_for_interrupt();
+                    arch::Cpu::wait_for_interrupt();
                     if KICKED[cpu].swap(false, Ordering::Acquire)
                         || TICKS[cpu].load(Ordering::Relaxed) >= IDLE_CHECK_TICKS
                     {
@@ -1000,11 +988,10 @@ fn check_deadlock(t: &Table) {
     } else {
         crate::println!("[kernel] all tasks have ended - shutting down");
     }
-    power::off(0);
-    cpu::halt();
+    Board::power_off(0);
 }
 
-/// The scheduler's tick, on every CPU (from the APIC timer's interrupt).
+/// The scheduler's tick, on every CPU (from its [`CpuInterrupts::start_tick`] interrupt).
 ///
 /// Once the running thread has had its quantum, and another thread waits for a CPU, it is
 /// preempted on its way back to user mode (see [`return_to_user`]).
@@ -1775,8 +1762,7 @@ pub(crate) fn power_off() -> i64 {
         return -EPERM;
     }
     crate::println!("[kernel] powering off");
-    power::off(0);
-    cpu::halt()
+    Board::power_off(0)
 }
 
 // ---- Upcalls ------------------------------------------------------------------
@@ -1912,6 +1898,7 @@ pub(crate) fn mmap(len: u64, prot: u64) -> i64 {
 /// task get the new permissions the next time they are switched to.
 pub(crate) fn ioperm(from: u64, num: u64, turn_on: u64) -> i64 {
     let mut t = table();
+    let me = t.me();
     let p = t.cur_mut();
     if !p.privileged {
         return -EPERM;
@@ -1928,7 +1915,8 @@ pub(crate) fn ioperm(from: u64, num: u64, turn_on: u64) -> i64 {
             p.io_bitmap[byte] |= 1 << bit;
         }
     }
-    gdt::set_io_bitmap(&p.io_bitmap); // Takes effect on return to user mode.
+    // Takes effect on return to user mode.
+    arch::Cpu::prepare_thread(me, &p.io_bitmap);
     0
 }
 

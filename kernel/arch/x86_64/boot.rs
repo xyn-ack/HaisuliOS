@@ -14,7 +14,7 @@
 
 use super::gdt::Selector;
 use super::x86::{segment_descriptor, Cr0, Cr4, Efer, Msr, PageFlag, SegmentAccess, SegmentFlag};
-use crate::platform::multiboot::{self, Magic, HEADER_CHECKSUM, HEADER_FLAGS};
+use crate::platform::pc::multiboot::{self, Magic, HEADER_CHECKSUM, HEADER_FLAGS};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -77,7 +77,7 @@ const APIC_PDPT_INDEX: u64 = APIC_BASE >> 30;
 const APIC_PD_INDEX: u64 = (APIC_BASE >> HUGE_PAGE_SHIFT) & (TABLE_ENTRIES as u64 - 1);
 
 /// The temporary GDT's code segment: 64-bit kernel code (long mode ignores
-/// the base and limit; the GDT proper comes from [`crate::gdt`]).
+/// the base and limit; the GDT proper comes from [`super::gdt`]).
 const BOOT_CODE_SEGMENT: u64 = segment_descriptor(
     SegmentAccess::bits(&[
         SegmentAccess::Present,

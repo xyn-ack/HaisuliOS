@@ -5,9 +5,10 @@
 //! Every way into and out of the kernel: exception, interrupt and system call entry stubs.
 //!
 //! The stubs save the interrupted state and call ordinary (safe) Rust handlers, which they
-//! reference with `sym` operands: [`crate::idt::exception_handler`],
-//! [`crate::irq::interrupt_dispatch`] and [`crate::syscall::syscall_dispatch`]. `trap_return` is
-//! the common way back to user mode after a system call.
+//! reference with `sym` operands: [`super::idt::exception_handler`],
+//! [`super::idt::interrupt_handler`] (which tells the generic [`crate::irq::dispatch`] where the
+//! interrupt came from) and [`crate::syscall::syscall_dispatch`]. `trap_return` is the common way
+//! back to user mode after a system call.
 //!
 //! Every entry from user mode executes `swapgs` first, and every return to user mode last, so
 //! that kernel code always finds its CPU's [`super::percpu`] block through GS (see there).
@@ -338,15 +339,10 @@ irq_common:
     iretq
 .popsection
 "#,
-    dispatch = sym crate::irq::interrupt_dispatch,
+    dispatch = sym super::idt::interrupt_handler,
 );
 
 // ---- System calls ----------------------------------------------------------------
-
-/// Kernel stack to switch to on `syscall` on this CPU (the running thread's).
-pub(crate) fn set_syscall_stack(top: u64) {
-    percpu::set_syscall_stack(top);
-}
 
 /// STAR: `syscall` loads the kernel code segment from bits 32..48 (and the
 /// kernel data segment from the next GDT entry). `sysret` loads the user data

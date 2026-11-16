@@ -2,8 +2,8 @@
 
 //! Starting the other CPUs.
 //!
-//! The boot CPU wakes every other CPU that the ACPI tables list ([`super::acpi::cpus`]) with the
-//! INIT / start-up IPI sequence. A CPU wakes up in 16-bit real mode at a page below 1 MiB, so the
+//! The boot CPU wakes every other CPU that the platform lists (by APIC id: on a PC, the ACPI
+//! tables' MADT) with the INIT / start-up IPI sequence. A CPU wakes up in 16-bit real mode at a page below 1 MiB, so the
 //! boot CPU first copies a *trampoline* there: it switches to protected mode and then to long
 //! mode with the boot page tables (the kernel half that every address space shares), and calls
 //! [`crate::ap_main`] on a stack of its own.
@@ -246,12 +246,12 @@ fn set_parameter(label: *const u8, value: u64) {
     unsafe { core::ptr::write_volatile(parameter(label), value) };
 }
 
-/// Starts the CPUs with APIC ids `apic_ids` (the boot CPU's among them is skipped), with
-/// `wait(us)` for the delays of the start-up sequence.
+/// Starts the CPUs with APIC ids `apic_ids` (the boot CPU's among them is skipped, and so is
+/// anything that cannot be an APIC id), with `wait(us)` for the delays of the start-up sequence.
 ///
 /// Each started CPU gets the next index, from 1. Returns how many CPUs run, the boot CPU
 /// included.
-pub(crate) fn start_cpus(apic_ids: &[u32], wait: fn(u32)) -> usize {
+pub(crate) fn start_cpus(apic_ids: &[u64], wait: fn(u32)) -> usize {
     let page = (TRAMPOLINE, TRAMPOLINE + 4096);
     assert!(
         !phys::is_kept_out(page.0, page.1),
@@ -269,7 +269,11 @@ pub(crate) fn start_cpus(apic_ids: &[u32], wait: fn(u32)) -> usize {
     set_parameter(&raw const ap_entry, ap_start as *const () as u64);
     let me = apic::id();
     let mut running = 1;
-    for &id in apic_ids.iter().filter(|&&id| id != me) {
+    let others = apic_ids
+        .iter()
+        .filter_map(|&id| u32::try_from(id).ok())
+        .filter(|&id| id != me);
+    for id in others {
         if running == MAX_CPUS {
             break;
         }
