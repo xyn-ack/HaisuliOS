@@ -6,11 +6,12 @@
 //!
 //! Only *managed* frames can be accessed: frames handed to the frame allocator at boot, which hold
 //! page tables and user pages and nothing else. No Rust object ever lives in one (kernel code,
-//! data, statics and stacks are all in the kernel image; boot-loader data stays reserved), and this
-//! module never hands out references into them, only copies. That is what makes these functions
-//! safe. Whether a page table *says* the right thing is [`crate::vmm`]'s business.
+//! data, statics and stacks are all in the kernel image; the boot loader's memory is recorded
+//! here first, with [`keep_out`], and refused), and this module never hands out references into
+//! them, only copies. That is what makes these functions safe. Whether a page table *says* the
+//! right thing is [`crate::vmm`]'s business.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub(crate) const PAGE_SIZE: u64 = 4096;
 /// Top of the identity-mapped range; RAM above is unused.
@@ -39,12 +40,45 @@ fn overlaps(a: (u64, u64), b: (u64, u64)) -> bool {
     a.0 < b.1 && b.0 < a.1
 }
 
+/// Memory that holds the boot loader's data, recorded with [`keep_out`]: never managed.
+const KEEP_OUT_MAX: usize = 24;
+static KEEP_OUT: [[AtomicU64; 2]; KEEP_OUT_MAX] =
+    [const { [AtomicU64::new(0), AtomicU64::new(0)] }; KEEP_OUT_MAX];
+static KEEP_OUT_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Records `[from, to)` as the boot loader's memory: [`manage`] will refuse it.
+///
+/// The platform calls this for everything the loader left, before any frame is managed.
+///
+/// # Panics
+///
+/// Panics if more than [`KEEP_OUT_MAX`] ranges are recorded.
+pub(crate) fn keep_out(from: u64, to: u64) {
+    let i = KEEP_OUT_LEN.fetch_add(1, Ordering::Relaxed);
+    assert!(i < KEEP_OUT_MAX, "too many boot-loader ranges");
+    KEEP_OUT[i][0].store(from, Ordering::Relaxed);
+    KEEP_OUT[i][1].store(to, Ordering::Release);
+}
+
+/// Whether `[from, to)` overlaps memory recorded with [`keep_out`].
+pub(crate) fn is_kept_out(from: u64, to: u64) -> bool {
+    (0..KEEP_OUT_LEN.load(Ordering::Acquire)).any(|i| {
+        overlaps(
+            (from, to),
+            (
+                KEEP_OUT[i][0].load(Ordering::Relaxed),
+                KEEP_OUT[i][1].load(Ordering::Relaxed),
+            ),
+        )
+    })
+}
+
 /// Hands `frame` to the allocator.
 ///
 /// # Panics
 ///
 /// Panics for any frame that might hold something Rust code refers to: below
-/// 1 MiB, in the kernel image, in boot-loader data, or above `MAX_PHYS`.
+/// 1 MiB, in the kernel image, in boot-loader data ([`keep_out`]), or above `MAX_PHYS`.
 pub(crate) fn manage(frame: u64) {
     let range = (frame, frame + PAGE_SIZE);
     assert!(frame.is_multiple_of(PAGE_SIZE) && frame >= LOW_MEMORY && range.1 <= MAX_PHYS);
@@ -54,7 +88,7 @@ pub(crate) fn manage(frame: u64) {
         frame
     );
     assert!(
-        super::multiboot::reserved_ranges().all(|r| !overlaps(range, r)),
+        !is_kept_out(range.0, range.1),
         "frame {:#x} holds boot-loader data",
         frame
     );

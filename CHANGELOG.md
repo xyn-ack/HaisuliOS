@@ -4,6 +4,40 @@ What changed in each version of HaisuliOS. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the goals and the
 roadmap are in [TODO.md](TODO.md).
 
+## Unreleased
+
+In preparation for a second CPU architecture (ARM), the hardware layer is split along two axes:
+`kernel/arch/` is the CPU architecture (one directory per architecture, `arch/x86_64` today,
+selected at compile time) and `kernel/platform/` is the machine around it (`platform/pc`: the
+boot loader's data, the 8259 PICs, the COM1 UART, the 8254 timer, the ACPI tables, power-off).
+Each is used only through what its `mod.rs` re-exports: that list is the contract a new
+architecture implements.
+
+### Added
+
+- The first compiler-checked piece of the architecture contract: the `UserRegs` trait, everything
+  generic code may do with a thread's saved user registers (the system call's number and
+  arguments, the return value, restarting the call, the stack pointer). No generic file names a
+  register any more; the upcall frame's layout (Linux's signal frame) belongs to the
+  architecture.
+- `phys::keep_out`: the platform records the boot loader's memory once, and `phys` refuses it
+  from then on, instead of asking the platform on every check.
+
+### Changed
+
+- The GDT, IDT and TSS moved into `arch/x86_64` (the IDT now installs every gate itself); the
+  8259, COM1, 8254, ACPI, Multiboot and power-off code into `platform/pc`. The local APIC's
+  timer calibration and CPU start-up take the platform's `wait` function instead of using the
+  PIT themselves.
+- The `restart` and `eintr` cases of `probe_test` no longer guess when the parent waits: the
+  parent announces the wait (a file), the child watches `ps` until the parent sleeps in it, and
+  only then signals. They are exact on any number of CPUs now, and `eintr` joined the
+  side-by-side SMP test.
+
+### Removed
+
+- The dead files `kernel/process.rs` and `kernel/signal.rs`, left over from 0.1.
+
 ## 0.3.0
 
 Multiple CPUs, threads and preemption. The kernel runs on every CPU of the machine, a task can

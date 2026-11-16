@@ -9,7 +9,8 @@
 //! [`crate::arch::context`]). A task starts with one thread, its *leader*, whose id is also the
 //! task's id; `clone` adds threads, `exit` ends one, and the task ends when its last thread does
 //! (or when it is killed, faults or calls `task_exit`: then all of its threads end). All
-//! user-to-kernel transitions build a [`TrapFrame`] at the top of the thread's kernel stack.
+//! user-to-kernel transitions save the user registers (a [`UserContext`]) at the top of the
+//! thread's kernel stack.
 //!
 //! Every CPU runs the same scheduler over all threads: a thread is *runnable* if it is ready,
 //! on no CPU, and its task is alive and not stopped; each CPU takes the next runnable thread after
@@ -51,23 +52,21 @@
 //! All scheduler state lives in one `Table` behind a [`Lock`]. Functions take it for short,
 //! explicit scopes and always release it before switching context or idling.
 
-use crate::arch::entry::TrapFrame;
-use crate::arch::multiboot::{self, Module};
+use crate::arch::gdt::IoBitmap;
 use crate::arch::percpu::{self, MAX_CPUS};
-use crate::arch::x86::{PageFlag, RFlag};
-use crate::arch::{apic, context, cpu};
-use crate::gdt::IoBitmap;
+use crate::arch::upcall::{Frame, SavedContext};
+use crate::arch::{apic, context, cpu, gdt, UserContext, UserRegs};
+use crate::platform::{multiboot::Module, power};
 use crate::program::{self, Args};
 use crate::sync::{Guard, Lock};
-use crate::upcall::{self as frames, Frame, SavedContext, Upcall};
-use crate::{elf, fs, gdt, irq, syscall, vmm};
+use crate::upcall::{is_user_address, Upcall};
+use crate::{elf, fs, irq, platform, syscall, vmm};
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use haisuli_abi::clone::THREAD_FLAGS;
 use haisuli_abi::errno::*;
 use haisuli_abi::exec::{self, ARG_MAX};
 use haisuli_abi::fcntl::{F_DUPFD, OPEN_MAX};
-use haisuli_abi::mman::{PROT_EXEC, PROT_WRITE};
 use haisuli_abi::{svc, task_state, upcall, TaskInfo, IO_PORTS, TASK_INFO_LEN};
 use haisuli_abi::{KMSG_IRQ, KMSG_TASK_EXIT, KMSG_TASK_FAULT, PID_KERNEL};
 
@@ -77,14 +76,10 @@ pub(crate) const MAX_THREADS: usize = 64;
 pub(crate) const MAX_TASKS: usize = 16;
 const MBOX_SIZE: usize = 8;
 const NAME_LEN: usize = 16;
-/// RFLAGS of a new task: interrupts enabled (and the reserved bit 1).
-pub(crate) const USER_RFLAGS: u64 = RFlag::bits(&[RFlag::Interrupt, RFlag::Reserved1]);
 /// A file descriptor that is not open.
 const NO_FD: u8 = u8::MAX;
 /// Descriptors per task.
 const FDS: usize = OPEN_MAX as usize;
-/// Bytes of the `syscall` instruction, to make an interrupted call again.
-const SYSCALL_LEN: u64 = 2;
 /// [`Thread::cpu`] of a thread that is on no CPU.
 const NO_CPU: usize = usize::MAX;
 /// [`Cpu::current`] of a CPU that idles.
@@ -730,10 +725,10 @@ pub(crate) fn cpus_online() -> usize {
 /// ([`fs::init`]). (The process server adopts the boot tasks as processes,
 /// with their task ids as pids.)
 pub(crate) fn spawn_boot_modules() {
-    let ramdisk = multiboot::modules().find(|m| !elf::is_elf(m.data));
+    let ramdisk = platform::multiboot::modules().find(|m| !elf::is_elf(m.data));
     fs::init(ramdisk.map_or(&[][..], |r| r.data));
     let mut started = 0;
-    for m in multiboot::modules().filter(|m| elf::is_elf(m.data)) {
+    for m in platform::multiboot::modules().filter(|m| elf::is_elf(m.data)) {
         match spawn(&m) {
             Ok(tid) => {
                 crate::println!(
@@ -808,7 +803,7 @@ fn install(
     t: &mut Table,
     slot: usize,
     pml4: u64,
-    frame: &TrapFrame,
+    frame: &UserContext,
     name: Name,
     privileged: bool,
     fds: [u8; FDS],
@@ -1004,7 +999,7 @@ fn check_deadlock(t: &Table) {
     } else {
         crate::println!("[kernel] all tasks have ended - shutting down");
     }
-    cpu::qemu_exit(0);
+    power::off(0);
     cpu::halt();
 }
 
@@ -1198,8 +1193,8 @@ fn release_server_state(t: &mut Table, tid: u64) {
 
 /// Starts a thread in the running task (the `clone` system call): a copy of the calling thread
 /// `f`, which returns 0 on `stack`. Returns its id.
-pub(crate) fn clone(f: &TrapFrame, flags: u64, stack: u64) -> i64 {
-    if flags != THREAD_FLAGS || stack == 0 || !frames::is_user_address(stack) {
+pub(crate) fn clone(f: &UserContext, flags: u64, stack: u64) -> i64 {
+    if flags != THREAD_FLAGS || stack == 0 || !is_user_address(stack) {
         return -EINVAL;
     }
     let mut t = table();
@@ -1212,11 +1207,9 @@ pub(crate) fn clone(f: &TrapFrame, flags: u64, stack: u64) -> i64 {
     let Some(slot) = t.free_slot() else {
         return -EAGAIN;
     };
-    let frame = TrapFrame {
-        rax: 0,
-        rsp: stack,
-        ..*f
-    };
+    let mut frame = *f;
+    frame.set_return(0); // What the new thread's `clone` gives back.
+    frame.set_sp(stack);
     context::init(slot, &frame);
     t.next_slot = slot + 1;
     t.threads[slot] = Thread {
@@ -1440,10 +1433,8 @@ pub(crate) fn task_fork(client: u64) -> i64 {
     let (Some(pml4), Ok(cslot)) = (pml4, t.controlled_client(client)) else {
         unreachable!("checked above");
     };
-    let frame = TrapFrame {
-        rax: 0, // The result of the copy's call.
-        ..context::user_frame(cslot)
-    };
+    let mut frame = context::user_frame(cslot);
+    frame.set_return(0); // The result of the copy's call.
     let mmap_next = t.tasks[parent].mmap_next;
     let id = install(&mut t, slot, pml4, &frame, name, false, fds);
     t.tasks[slot].mmap_next = mmap_next;
@@ -1613,7 +1604,7 @@ static EXEC: Lock<ExecBuffers> = Lock::new(ExecBuffers {
 /// from the file system, and builds the program's address space.
 ///
 /// Returns the address space, the registers to start with and the program's name.
-fn load_program(block: u64, len: u64, flags: u64) -> Result<(u64, TrapFrame, Name), i64> {
+fn load_program(block: u64, len: u64, flags: u64) -> Result<(u64, UserContext, Name), i64> {
     if flags & !exec::PRIVILEGED != 0 {
         return Err(-EINVAL);
     }
@@ -1779,7 +1770,7 @@ pub(crate) fn power_off() -> i64 {
         return -EPERM;
     }
     crate::println!("[kernel] powering off");
-    cpu::qemu_exit(0);
+    power::off(0);
     cpu::halt()
 }
 
@@ -1824,13 +1815,13 @@ enum Before {
 }
 
 /// The last step on every way back to user mode, with the user registers `f`: at the end of
-/// every system call (number `nr`, whose result is in `f.rax`) and of every interrupt that
+/// every system call (number `nr`, whose result is in `f`) and of every interrupt that
 /// arrived in user mode (`nr` is `None`).
 ///
 /// The thread ends if its task has ended, waits while its task is stopped, gives way once it
 /// has had its quantum and others wait (preemption), and enters its upcall, if it has one. A
 /// thread whose stack cannot take the upcall's frame has faulted.
-pub(crate) fn return_to_user(f: &mut TrapFrame, nr: Option<u64>) {
+pub(crate) fn return_to_user(f: &mut UserContext, nr: Option<u64>) {
     // After an interrupt, only if something concerns this CPU's thread (see `kick`, `tick`).
     if nr.is_none() && !ATTENTION[percpu::index()].swap(false, Ordering::Acquire) {
         return;
@@ -1859,16 +1850,14 @@ pub(crate) fn return_to_user(f: &mut TrapFrame, nr: Option<u64>) {
         return;
     };
     if let Some(nr) = nr {
-        if f.rax as i64 == -EINTR && up.restart {
-            // Back up to the `syscall` instruction, so that returning from the
-            // handler makes the call again.
-            f.rip = f.rip.wrapping_sub(SYSCALL_LEN);
-            f.rax = nr;
+        if f.returned() == -EINTR && up.restart {
+            // So that returning from the handler makes the call again.
+            f.restart_syscall(nr);
         }
     }
     let frame = Frame::new(&up, f);
     // `copy_to_user` only accepts mapped, writable user memory.
-    match Frame::address(f.rsp) {
+    match Frame::address(f.sp()) {
         Some(addr) if vmm::copy_to_user(current_pml4(), addr, frame.as_bytes()) => {
             Frame::enter_handler(f, &up, addr);
         }
@@ -1883,10 +1872,10 @@ pub(crate) fn return_to_user(f: &mut TrapFrame, nr: Option<u64>) {
 /// there, and returns the interrupted `rax`, so that the system call
 /// dispatcher hands it back unchanged. A frame that cannot be read, or that
 /// would resume at a kernel address, is a fault.
-pub(crate) fn rt_sigreturn(f: &mut TrapFrame) -> i64 {
+pub(crate) fn rt_sigreturn(f: &mut UserContext) -> i64 {
     let mut saved = SavedContext::empty();
-    if vmm::copy_from_user(current_pml4(), f.rsp, saved.as_mut_bytes()) && saved.restore(f) {
-        f.rax as i64
+    if vmm::copy_from_user(current_pml4(), f.sp(), saved.as_mut_bytes()) && saved.restore(f) {
+        f.returned()
     } else {
         end_current(Why::Fault)
     }
@@ -1906,14 +1895,7 @@ pub(crate) fn mmap(len: u64, prot: u64) -> i64 {
         p.mmap_next = base + (pages + 1) * 4096; // Leave a guard page.
         (p.pml4, base)
     };
-    let mut flags = PageFlag::User as u64;
-    if prot & PROT_WRITE != 0 {
-        flags |= PageFlag::Writable as u64;
-    }
-    if prot & PROT_EXEC == 0 {
-        flags |= PageFlag::NoExecute as u64;
-    }
-    if vmm::map_init(pml4, base, pages * 4096, &[], flags).is_err() {
+    if vmm::map_init(pml4, base, pages * 4096, &[], vmm::user_flags(prot)).is_err() {
         return -ENOMEM;
     }
     base as i64

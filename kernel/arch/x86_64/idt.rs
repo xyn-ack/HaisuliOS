@@ -2,17 +2,20 @@
 
 //! Interrupt descriptor table.
 //!
-//! Installs the IDT and handles CPU exceptions (vectors 0 to 31).
-//!
-//! Hardware interrupts (vectors 32 to 47, and the local APIC's) are installed by
-//! [`crate::irq::init`].
+//! Installs the IDT: the gates of the CPU exceptions (vectors 0 to 31), of the platform's
+//! interrupt lines (from [`IRQ_VECTOR_BASE`] on) and of the local APIC's vectors; and handles
+//! the exceptions.
 
-use crate::arch::cpu;
-use crate::arch::entry::{stub_address, ExceptionFrame, EXCEPTION_STUBS};
-use crate::arch::x86::{gate_descriptor, Exception, GateType, PrivilegeLevel};
-use crate::gdt::{DOUBLE_FAULT_IST, KERNEL_CS};
+use super::apic::{RESCHEDULE_VECTOR, SPURIOUS_VECTOR, TIMER_VECTOR};
+use super::cpu;
+use super::entry::{stub_address, ExceptionFrame, APIC_STUBS, EXCEPTION_STUBS, IRQ_STUBS};
+use super::gdt::{DOUBLE_FAULT_IST, KERNEL_CS};
+use super::x86::{gate_descriptor, Exception, GateType, PrivilegeLevel};
 use crate::task::{self, Why};
 use core::sync::atomic::{AtomicU64, Ordering};
+
+/// The first vector after the CPU's own: where the platform's interrupt lines start.
+pub(crate) const IRQ_VECTOR_BASE: usize = Exception::VECTORS;
 
 /// Vectors in the IDT: every vector there is.
 const GATES: usize = 256;
@@ -36,7 +39,7 @@ fn set_gate(vector: usize, handler: u64, ist: u8) {
     IDT[2 * vector + 1].store(high, Ordering::Relaxed);
 }
 
-/// Fills in the exception gates and loads the IDT on the boot CPU.
+/// Fills in every gate and loads the IDT on the boot CPU.
 pub(crate) fn init() {
     for (vector, &stub) in EXCEPTION_STUBS.iter().enumerate() {
         let ist = if vector == Exception::DoubleFault as usize {
@@ -46,17 +49,21 @@ pub(crate) fn init() {
         };
         set_gate(vector, stub_address(stub), ist);
     }
+    for (line, &stub) in IRQ_STUBS.iter().enumerate() {
+        set_gate(IRQ_VECTOR_BASE + line, stub_address(stub), NO_IST);
+    }
+    for (vector, &stub) in [TIMER_VECTOR, RESCHEDULE_VECTOR, SPURIOUS_VECTOR]
+        .iter()
+        .zip(APIC_STUBS.iter())
+    {
+        set_gate(*vector as usize, stub_address(stub), NO_IST);
+    }
     load();
 }
 
 /// Loads the IDT (shared by every CPU) on this CPU.
 pub(crate) fn load() {
     cpu::load_idt(&IDT);
-}
-
-/// Install the gate for a hardware interrupt vector.
-pub(crate) fn set_handler(vector: usize, handler: u64) {
-    set_gate(vector, handler, 0);
 }
 
 /// Called by the exception stubs in `arch::entry`.

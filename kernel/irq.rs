@@ -2,186 +2,66 @@
 
 //! Hardware interrupts.
 //!
-//! Drives the legacy 8259 PICs and forwards interrupts to user-space drivers as IPC notifications.
+//! Forwards the platform's interrupt lines to user-space drivers as IPC notifications, and
+//! dispatches every interrupt to where it belongs.
 //!
 //! The kernel contains no device drivers. A privileged task binds an IRQ line (`irq_bind`); when
-//! the line fires, the kernel masks it, acknowledges the PIC and posts a `[PID_KERNEL, KMSG_IRQ,
-//! line]` notification to the owner. The driver services its device and re-enables the line with
-//! `irq_ack`. Lines without an owner stay masked.
+//! the line fires, the platform's interrupt controller ([`crate::platform::pic`]) masks it and
+//! the kernel posts a `[PID_KERNEL, KMSG_IRQ, line, 0]` notification to the owner. The driver
+//! services its device and re-enables the line with `irq_ack`. Lines without an owner stay
+//! masked.
 //!
-//! The PICs deliver to the boot CPU only (through its local APIC's LINT0). The local APICs'
-//! own interrupts, the scheduler's tick and the reschedule IPI, arrive here too
-//! ([`interrupt_dispatch`]); on the way back to user mode, any of them may preempt the thread or
-//! make it enter an upcall, exactly as the end of a system call does.
+//! The CPU's own interrupts, the scheduler's tick and the reschedule IPI
+//! ([`crate::arch::apic`]), arrive here too ([`interrupt_dispatch`]); on the way back to user
+//! mode, any interrupt may preempt the thread or make it enter an upcall, exactly as the end of
+//! a system call does.
 //!
 //! Interrupts are only ever enabled in user mode and while a CPU idles
 //! ([`crate::task::idle`]), never elsewhere in the kernel.
 
 use crate::arch::apic::{self, RESCHEDULE_VECTOR, SPURIOUS_VECTOR, TIMER_VECTOR};
-use crate::arch::cpu::Device::{self, Pic1, Pic2, PostCode};
-use crate::arch::entry::{stub_address, TrapFrame, APIC_STUBS, IRQ_STUBS};
-use crate::arch::x86::{Exception, PrivilegeLevel};
-use crate::{idt, task};
+use crate::arch::idt::IRQ_VECTOR_BASE;
+use crate::arch::{UserContext, UserRegs};
+use crate::platform::pic;
+use crate::task;
 use core::sync::atomic::{AtomicU64, Ordering};
 use haisuli_abi::errno::{EBUSY, EINVAL, EPERM};
 
-/// Lines of each 8259.
-const LINES_PER_PIC: u64 = 8;
-/// Lines of the master and slave PIC together.
-pub(crate) const LINES: usize = 2 * LINES_PER_PIC as usize;
-/// IDT vector of IRQ line 0: the first after the CPU's exception vectors, so
-/// lines 0..15 use vectors 32..47.
-const VECTOR_BASE: usize = Exception::VECTORS;
-
-/// IRQ lines with a fixed role in the master/slave pair of 8259s.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(u64)]
-enum Line {
-    /// The master's line 2, which the slave is wired to: never a device.
-    Cascade = 2,
-    /// The master's lowest-priority line, which it also raises for a
-    /// spurious interrupt (one that went away before it was acknowledged).
-    MasterSpurious = 7,
-    /// The slave's lowest-priority line, which it raises for its spurious ones.
-    SlaveSpurious = 15,
-}
-
-/// The two registers (I/O ports) of an 8259.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(u16)]
-enum Register {
-    /// Command (ICW1, OCW2, OCW3) and status.
-    Command = 0,
-    /// Data: the other initialisation words, and the mask of disabled lines.
-    Data = 1,
-}
-
-/// Commands written to [`Register::Command`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-enum Command {
-    /// ICW1: start initialisation (bit 4), with an ICW4 to follow (bit 0).
-    Initialize = 0x11,
-    /// OCW2: non-specific end of interrupt, for the highest line in service.
-    EndOfInterrupt = 0x20,
-    /// OCW3: make the next read of [`Register::Command`] return the
-    /// in-service register (bit 3: OCW3; bit 1: read; bit 0: ISR, not IRR).
-    ReadInService = 0x0B,
-}
-
-/// ICW4: 8086 mode (not the MCS-80/85 of the original PC design).
-const ICW4_8086: u8 = 0x01;
-/// A mask that disables every line of a PIC.
-const ALL_MASKED: u8 = 0xFF;
+/// Interrupt lines the platform has.
+pub(crate) const LINES: usize = pic::LINES;
 
 /// The task owning each line (0 = unbound).
 static OWNER: [AtomicU64; LINES] = [const { AtomicU64::new(0) }; LINES];
 
-/// Short delay between PIC initialisation words (write to an unused port).
-fn io_wait() {
-    PostCode.write8(0, 0);
-}
-
-/// Remap the PICs to vectors 32..47 (by default IRQ 0-7 would alias CPU
-/// exceptions 8-15), mask every device line and install the IDT gates.
+/// Sets the platform's interrupt controller up, with every device line masked.
 pub(crate) fn init() {
-    let cascade = Line::Cascade as u64;
-    for (pic, offset, wiring) in [
-        (Pic1, VECTOR_BASE as u8, 1 << cascade),
-        (
-            Pic2,
-            (VECTOR_BASE as u64 + LINES_PER_PIC) as u8,
-            cascade as u8,
-        ),
-    ] {
-        pic.write8(Register::Command as u16, Command::Initialize as u8);
-        io_wait();
-        pic.write8(Register::Data as u16, offset); // ICW2: vector of its line 0.
-        io_wait();
-        // ICW3: the master gets a bit mask of the lines with a slave on them;
-        // the slave gets the number of the master's line it is wired to.
-        pic.write8(Register::Data as u16, wiring);
-        io_wait();
-        pic.write8(Register::Data as u16, ICW4_8086);
-        io_wait();
-    }
-    // Everything masked but the cascade.
-    Pic1.write8(Register::Data as u16, ALL_MASKED & !(1u8 << cascade));
-    Pic2.write8(Register::Data as u16, ALL_MASKED);
-    for (line, &stub) in IRQ_STUBS.iter().enumerate() {
-        idt::set_handler(VECTOR_BASE + line, stub_address(stub));
-    }
-    for (vector, &stub) in [TIMER_VECTOR, RESCHEDULE_VECTOR, SPURIOUS_VECTOR]
-        .iter()
-        .zip(APIC_STUBS.iter())
-    {
-        idt::set_handler(*vector as usize, stub_address(stub));
-    }
-}
-
-/// The PIC that `line` belongs to, and its bit in that PIC's registers.
-fn pic_of(line: u64) -> (Device, u8) {
-    let pic = if line < LINES_PER_PIC { Pic1 } else { Pic2 };
-    (pic, 1 << (line % LINES_PER_PIC))
-}
-
-fn set_masked(line: u64, masked: bool) {
-    let (pic, bit) = pic_of(line);
-    let m = pic.read8(Register::Data as u16);
-    pic.write8(
-        Register::Data as u16,
-        if masked { m | bit } else { m & !bit },
-    );
-}
-
-/// Whether `line` is really being serviced (according to its PIC's
-/// in-service register), rather than a spurious interrupt.
-fn in_service(line: Line) -> bool {
-    let (pic, bit) = pic_of(line as u64);
-    pic.write8(Register::Command as u16, Command::ReadInService as u8);
-    pic.read8(Register::Command as u16) & bit != 0
-}
-
-/// Acknowledges the interrupt on `pic`.
-fn end_of_interrupt(pic: Device) {
-    pic.write8(Register::Command as u16, Command::EndOfInterrupt as u8);
+    pic::init();
 }
 
 /// Called (with interrupts disabled) by the interrupt stubs in `arch::entry`, with the vector
 /// and the interrupted registers.
-pub(crate) extern "C" fn interrupt_dispatch(vector: u64, f: &mut TrapFrame) {
-    let pic_vectors = VECTOR_BASE as u64..(VECTOR_BASE + LINES) as u64;
+pub(crate) extern "C" fn interrupt_dispatch(vector: u64, f: &mut UserContext) {
+    let pic_vectors = IRQ_VECTOR_BASE as u64..(IRQ_VECTOR_BASE + LINES) as u64;
     match vector {
-        v if pic_vectors.contains(&v) => pic_interrupt(v - VECTOR_BASE as u64),
+        v if pic_vectors.contains(&v) => pic_interrupt(v - IRQ_VECTOR_BASE as u64),
         v if v == TIMER_VECTOR as u64 => {
             apic::end_of_interrupt();
             task::tick();
         }
         v if v == RESCHEDULE_VECTOR as u64 => apic::end_of_interrupt(),
-        _ => {} // Spurious: no end of interrupt.
+        v if v == SPURIOUS_VECTOR as u64 => {} // Needs no end of interrupt.
+        _ => {}
     }
-    if PrivilegeLevel::of_selector(f.cs) == PrivilegeLevel::User {
+    if f.in_user_mode() {
         task::return_to_user(f, None);
     }
 }
 
-/// PIC line `line` fired.
+/// An interrupt line fired: tell its owner.
 fn pic_interrupt(line: u64) {
-    // Spurious interrupts (raised without being in service) must not be
-    // acknowledged on their own PIC.
-    if line == Line::MasterSpurious as u64 && !in_service(Line::MasterSpurious) {
-        return;
+    if !pic::acknowledge(line) {
+        return; // Spurious.
     }
-    if line == Line::SlaveSpurious as u64 && !in_service(Line::SlaveSpurious) {
-        end_of_interrupt(Pic1); // The master did see the cascade.
-        return;
-    }
-    // Keep the line quiet until its driver has serviced the device.
-    set_masked(line, true);
-    if line >= LINES_PER_PIC {
-        end_of_interrupt(Pic2);
-    }
-    end_of_interrupt(Pic1);
     let owner = OWNER[line as usize].load(Ordering::Relaxed);
     if owner != 0 {
         task::irq_notify(owner, line);
@@ -195,7 +75,7 @@ pub(crate) fn owner(line: usize) -> u64 {
 
 /// Routes IRQ `line` to the calling, privileged task (the `irq_bind` system call).
 pub(crate) fn bind(line: u64) -> i64 {
-    if line >= LINES as u64 || line == Line::Cascade as u64 {
+    if line >= LINES as u64 || line == pic::RESERVED_LINE {
         return -EINVAL;
     }
     if !task::current_privileged() {
@@ -207,7 +87,7 @@ pub(crate) fn bind(line: u64) -> i64 {
         return -EBUSY;
     }
     OWNER[line as usize].store(me, Ordering::Relaxed);
-    set_masked(line, false);
+    pic::unmask(line);
     0
 }
 
@@ -219,7 +99,7 @@ pub(crate) fn ack(line: u64) -> i64 {
     if owner(line as usize) != task::current_tid() {
         return -EPERM;
     }
-    set_masked(line, false);
+    pic::unmask(line);
     0
 }
 
@@ -228,7 +108,7 @@ pub(crate) fn release_all(tid: u64) {
     for (line, owner) in OWNER.iter().enumerate() {
         if owner.load(Ordering::Relaxed) == tid {
             owner.store(0, Ordering::Relaxed);
-            set_masked(line as u64, true);
+            pic::mask(line as u64);
         }
     }
 }

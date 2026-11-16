@@ -15,9 +15,9 @@
 //! context switch: this is how user-space drivers get access to exactly the device registers they
 //! were granted (`ioperm`). Ports at or above `IO_PORTS` lie beyond the TSS limit and always fault.
 
-use crate::arch::cpu;
-use crate::arch::percpu::{self, MAX_CPUS};
-use crate::arch::x86::{
+use super::cpu;
+use super::percpu::{self, MAX_CPUS};
+use super::x86::{
     segment_descriptor, system_descriptor, PrivilegeLevel, SegmentAccess, SegmentFlag,
     SystemSegment,
 };

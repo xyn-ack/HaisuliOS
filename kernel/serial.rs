@@ -2,50 +2,22 @@
 
 //! Serial debug log.
 //!
-//! Writes the kernel's debug log to the COM1 UART and provides the `print!` and `println!` macros.
+//! Writes the kernel's debug log to the platform's serial line and provides the `print!` and
+//! `println!` macros.
 //!
-//! The kernel only ever writes to the UART; input belongs to the user-space console server.
+//! The kernel only ever writes to the line; input belongs to the user-space console server.
 //!
 //! Every CPU logs: a lock keeps each message (a `println!`, or one `debug_log` call) in one
 //! piece. The console server sends the terminal's output through here too (`serial_write`), so
 //! that the line has one transmitter, and log lines never mix with terminal output.
 
-use crate::arch::cpu::Device::Com1;
+use crate::platform::uart;
 use crate::sync::Lock;
 use core::fmt::{self, Write};
-use haisuli_abi::uart::{
-    FifoControl, LineControl, LineStatus, ModemControl, Register, DIVISOR_38400,
-};
 
-fn write(reg: Register, value: u8) {
-    Com1.write8(reg as u16, value);
-}
-
-/// Sets up COM1 for output: 38400 baud, 8N1, FIFOs on, no interrupts.
+/// Sets the serial line up for output.
 pub(crate) fn init() {
-    write(Register::InterruptEnable, 0);
-    write(Register::LineControl, LineControl::DivisorLatch as u8);
-    let [low, high] = DIVISOR_38400.to_le_bytes();
-    write(Register::DIVISOR_LOW, low);
-    write(Register::DIVISOR_HIGH, high);
-    write(Register::LineControl, LineControl::Word8 as u8); // Also ends DLAB.
-    write(
-        Register::FifoControl,
-        FifoControl::bits(&[
-            FifoControl::Enable,
-            FifoControl::ClearReceive,
-            FifoControl::ClearTransmit,
-            FifoControl::Trigger14,
-        ]),
-    );
-    write(
-        Register::ModemControl,
-        ModemControl::bits(&[
-            ModemControl::DataTerminalReady,
-            ModemControl::RequestToSend,
-            ModemControl::Out2,
-        ]),
-    );
+    uart::init();
 }
 
 /// The UART, for one message at a time.
@@ -60,8 +32,7 @@ pub(crate) fn lock() -> crate::sync::Guard<'static, Serial> {
 
 impl Serial {
     fn write_byte(&mut self, b: u8) {
-        while Com1.read8(Register::LineStatus as u16) & LineStatus::TransmitterEmpty as u8 == 0 {}
-        write(Register::Data, b);
+        uart::write_byte(b);
     }
 
     /// Writes `s` as it is.

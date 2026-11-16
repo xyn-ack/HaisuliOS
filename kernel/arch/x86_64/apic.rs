@@ -12,11 +12,12 @@
 //! `ExtINT` mode, the PC's "virtual wire"), and the other CPUs mask them, so device IRQs always
 //! reach the boot CPU.
 //!
-//! Time is measured with the PIT's counter 2, which needs no interrupt: [`wait_us`] busy-waits
-//! on it while the kernel starts the other CPUs, and the APIC timer is calibrated against it.
+//! The APIC has no clock of its own that the kernel knows: whoever calibrates the timer or
+//! starts a CPU passes a `wait` function that busy-waits for some microseconds (the PC platform
+//! measures with the PIT).
 
 use super::boot::APIC_BASE;
-use super::cpu::{self, Device};
+use super::cpu;
 use super::x86::Msr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -135,12 +136,12 @@ pub(crate) fn end_of_interrupt() {
     write(Reg::EndOfInterrupt, 0);
 }
 
-/// Measures the APIC timer against the PIT: how many counts make a tick.
-pub(crate) fn calibrate_timer() {
+/// Measures the APIC timer: how many counts make a tick, with `wait(us)` as the ruler.
+pub(crate) fn calibrate_timer(wait: fn(u32)) {
     write(Reg::TimerDivide, DIVIDE_BY_16);
     write(Reg::LvtTimer, LVT_MASKED);
     write(Reg::TimerInitial, u32::MAX);
-    wait_us(TICK_MS * 1000);
+    wait(TICK_MS * 1000);
     let elapsed = u32::MAX - read(Reg::TimerCurrent);
     write(Reg::TimerInitial, 0);
     TIMER_COUNT.store(elapsed.max(1000), Ordering::Relaxed);
@@ -171,56 +172,17 @@ pub(crate) fn send_ipi(apic_id: u32, vector: u8) {
 }
 
 /// Starts the CPU with APIC id `apic_id` at physical address `page` (below 1 MiB, page aligned)
-/// in real mode: INIT, then the start-up IPI twice, as the MultiProcessor Specification says.
-/// `started` tells whether it is running yet, so that the second IPI can be skipped.
-pub(crate) fn start_cpu(apic_id: u32, page: u64, started: impl Fn() -> bool) {
+/// in real mode: INIT, then the start-up IPI twice, as the MultiProcessor Specification says,
+/// with `wait(us)` for the delays in between. `started` tells whether it is running yet, so
+/// that the second IPI can be skipped.
+pub(crate) fn start_cpu(apic_id: u32, page: u64, wait: fn(u32), started: impl Fn() -> bool) {
     send(apic_id, DELIVERY_INIT | LEVEL_ASSERT);
-    wait_us(10_000);
+    wait(10_000);
     for _ in 0..2 {
         send(apic_id, DELIVERY_STARTUP | (page >> 12) as u32);
-        wait_us(200);
+        wait(200);
         if started() {
             return;
         }
     }
-}
-
-// ---- The PIT, as a stopwatch -----------------------------------------------------------------
-
-/// The PIT's input clock, in Hz.
-const PIT_HZ: u64 = 1_193_182;
-/// PIT registers: counter 2's data, and the mode register.
-const PIT_COUNTER2: u16 = 2;
-const PIT_MODE: u16 = 3;
-/// Mode register: counter 2, low byte then high byte, mode 0 (interrupt on terminal count).
-const PIT_COUNTER2_ONE_SHOT: u8 = 0b1011_0000;
-/// System control port B: counter 2's gate, the speaker, and counter 2's output.
-const GATE2: u8 = 1 << 0;
-const SPEAKER: u8 = 1 << 1;
-const OUT2: u8 = 1 << 5;
-/// The longest wait counter 2 can time in one go (16 bits at `PIT_HZ`).
-const PIT_MAX_US: u32 = 50_000;
-
-/// Busy-waits for about `us` microseconds.
-pub(crate) fn wait_us(mut us: u32) {
-    while us > 0 {
-        let step = us.min(PIT_MAX_US);
-        pit_wait(step);
-        us -= step;
-    }
-}
-
-fn pit_wait(us: u32) {
-    let count = (PIT_HZ * us as u64 / 1_000_000).clamp(1, 0xFFFF) as u16;
-    let port_b = Device::SystemControl.read8(0) & !(GATE2 | SPEAKER);
-    Device::SystemControl.write8(0, port_b);
-    Device::Pit.write8(PIT_MODE, PIT_COUNTER2_ONE_SHOT);
-    let [low, high] = count.to_le_bytes();
-    Device::Pit.write8(PIT_COUNTER2, low);
-    Device::Pit.write8(PIT_COUNTER2, high);
-    Device::SystemControl.write8(0, port_b | GATE2);
-    while Device::SystemControl.read8(0) & OUT2 == 0 {
-        core::hint::spin_loop();
-    }
-    Device::SystemControl.write8(0, port_b);
 }

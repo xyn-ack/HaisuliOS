@@ -10,8 +10,9 @@
 //! live in user-space servers that the boot loader hands over as Multiboot modules (see `user/`):
 //! POSIX processes, for one, are implemented by the process server on top of the kernel's tasks.
 //!
-//! Unsafe code is confined to [`arch`] (the hardware layer) and [`sync`] (the kernel's lock); the
-//! compiler rejects it anywhere else.
+//! Unsafe code is confined to the hardware layer, [`arch`] (the CPU architecture) and
+//! [`platform`] (the machine around it), and to [`sync`] (the kernel's lock); the compiler
+//! rejects it anywhere else.
 
 #![no_std]
 #![no_main]
@@ -22,12 +23,12 @@ mod serial;
 #[expect(unsafe_code)]
 mod arch;
 #[expect(unsafe_code)]
+mod platform;
+#[expect(unsafe_code)]
 mod sync;
 
 mod elf;
 mod fs;
-mod gdt;
-mod idt;
 mod irq;
 mod pmm;
 mod program;
@@ -36,7 +37,8 @@ mod task;
 mod upcall;
 mod vmm;
 
-use arch::{acpi, apic, cpu, multiboot, smp};
+use arch::{apic, cpu, gdt, idt, smp};
+use platform::{acpi, multiboot, pit, power};
 
 /// Called by `arch::boot` once the boot CPU is in 64-bit mode.
 pub fn kmain() -> ! {
@@ -53,7 +55,7 @@ pub fn kmain() -> ! {
     pmm::init();
     irq::init();
     apic::init(true);
-    apic::calibrate_timer();
+    apic::calibrate_timer(pit::wait_us);
     syscall::init();
     task::cpu_online(apic::id());
     task::spawn_boot_modules();
@@ -65,7 +67,7 @@ pub fn kmain() -> ! {
 /// Starts the other CPUs that the firmware lists, and reports how many run.
 fn start_cpus() {
     let (ids, n) = acpi::cpus();
-    let running = smp::start_cpus(&ids[..n]);
+    let running = smp::start_cpus(&ids[..n], pit::wait_us);
     // Each one says it is online (`ap_main`) right after it starts.
     while task::cpus_online() < running {
         core::hint::spin_loop();
@@ -95,6 +97,6 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
         arch::percpu::index(),
         info
     ));
-    cpu::qemu_exit(1);
+    power::off(1);
     cpu::halt()
 }

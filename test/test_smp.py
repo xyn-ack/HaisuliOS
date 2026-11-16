@@ -30,9 +30,9 @@ Nothing here needs preemption: every test leaves at least one CPU to the shell a
 So the tests hold whether or not the kernel preempts (it does).
 
 Some tests pass on one CPU already (`test_*_side_by_side`, `test_*_at_once`): they become real
-tests of SMP once other CPUs run tasks too, and guard the kernel's locking then. Two cases of
-`probe_test` are left out of them on purpose: `eintr` and `pause-race` rely on the order in which
-one CPU's cooperative scheduler runs a parent and its child, which several CPUs do not keep.
+tests of SMP once other CPUs run tasks too, and guard the kernel's locking then. One case of
+`probe_test` is left out of them on purpose: `pause-race` makes a race of one CPU's cooperative
+scheduling happen, which several CPUs need not reproduce.
 """
 import contextlib
 import re
@@ -60,7 +60,7 @@ JOB_NOTICE = re.compile(r"^\n?\[\d+\][+-]? *[^\d\s][^\n]*\n", re.M)
 SPINNING = "smp_test: spinning\n"
 
 # The `probe_test` cases that do not depend on the order in which tasks run (see above).
-ORDER_INDEPENDENT_PROBES = ("restart", "fault", "task-exit", "two-signals", "exec")
+ORDER_INDEPENDENT_PROBES = ("restart", "eintr", "fault", "task-exit", "two-signals", "exec")
 
 
 class Job:

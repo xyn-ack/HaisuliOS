@@ -16,7 +16,7 @@
 
 use super::percpu::MAX_CPUS;
 use super::x86::{segment_descriptor, Cr0, Cr4, Efer, Msr, SegmentAccess, SegmentFlag};
-use super::{apic, boot, multiboot};
+use super::{apic, boot, phys};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
@@ -246,14 +246,15 @@ fn set_parameter(label: *const u8, value: u64) {
     unsafe { core::ptr::write_volatile(parameter(label), value) };
 }
 
-/// Starts the CPUs with APIC ids `apic_ids` (the boot CPU's among them is skipped).
+/// Starts the CPUs with APIC ids `apic_ids` (the boot CPU's among them is skipped), with
+/// `wait(us)` for the delays of the start-up sequence.
 ///
 /// Each started CPU gets the next index, from 1. Returns how many CPUs run, the boot CPU
 /// included.
-pub(crate) fn start_cpus(apic_ids: &[u32]) -> usize {
+pub(crate) fn start_cpus(apic_ids: &[u32], wait: fn(u32)) -> usize {
     let page = (TRAMPOLINE, TRAMPOLINE + 4096);
     assert!(
-        multiboot::reserved_ranges().all(|(start, end)| end <= page.0 || page.1 <= start),
+        !phys::is_kept_out(page.0, page.1),
         "the boot loader's data is where the CPU trampoline goes"
     );
     let code = trampoline();
@@ -279,10 +280,10 @@ pub(crate) fn start_cpus(apic_ids: &[u32]) -> usize {
             stack.as_ptr() as u64 + STACK_SIZE as u64,
         );
         set_parameter(&raw const ap_cpu, running as u64);
-        apic::start_cpu(id, TRAMPOLINE, arrived);
+        apic::start_cpu(id, TRAMPOLINE, wait, arrived);
         let mut waited = 0;
         while !arrived() && waited < START_TIMEOUT_US {
-            apic::wait_us(1000);
+            wait(1000);
             waited += 1000;
         }
         if arrived() || !settle(Start::Abandoned) {

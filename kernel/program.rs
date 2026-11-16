@@ -9,12 +9,11 @@
 //! come in an *argument block* ([`haisuli_abi::exec`]); the program finds them on its stack in the
 //! System V x86_64 layout, as on Linux, so a libc ported later finds them where it expects them.
 
-use crate::arch::entry::TrapFrame;
-use crate::arch::x86::PageFlag;
-use crate::task::USER_RFLAGS;
-use crate::{elf, gdt, vmm};
+use crate::arch::{UserContext, UserRegs};
+use crate::{elf, vmm};
 use haisuli_abi::errno::{E2BIG, EINVAL, ENOENT, ENOEXEC, ENOMEM};
 use haisuli_abi::exec::{HEADER, STRINGS_MAX};
+use haisuli_abi::mman::{PROT_READ, PROT_WRITE};
 
 /// Pages of a program's stack.
 const STACK_PAGES: u64 = 8;
@@ -85,22 +84,15 @@ impl<'a> Args<'a> {
 ///
 /// Returns its page tables and the registers to enter user mode with. Nothing
 /// is left behind on error.
-pub(crate) fn load(image: &[u8], args: &Args<'_>) -> Result<(u64, TrapFrame), Error> {
+pub(crate) fn load(image: &[u8], args: &Args<'_>) -> Result<(u64, UserContext), Error> {
     let pml4 = vmm::new_address_space().ok_or((-ENOMEM, "out of memory"))?;
-    let setup = || -> Result<TrapFrame, Error> {
+    let setup = || -> Result<UserContext, Error> {
         let entry = elf::load(pml4, image).map_err(|why| (-ENOEXEC, why))?;
         let stack = STACK_PAGES * PAGE_SIZE;
-        let flags = PageFlag::bits(&[PageFlag::User, PageFlag::Writable, PageFlag::NoExecute]);
+        let flags = vmm::user_flags(PROT_READ | PROT_WRITE);
         vmm::map_init(pml4, vmm::USER_STACK_TOP - stack, stack, &[], flags)
             .map_err(|_| (-ENOMEM, "out of memory"))?;
-        Ok(TrapFrame {
-            rip: entry,
-            cs: gdt::USER_CS,
-            rflags: USER_RFLAGS,
-            rsp: push_args(pml4, args)?,
-            ss: gdt::USER_DS,
-            ..TrapFrame::default()
-        })
+        Ok(UserContext::new_program(entry, push_args(pml4, args)?))
     };
     match setup() {
         Ok(frame) => Ok((pml4, frame)),
