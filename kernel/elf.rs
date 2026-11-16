@@ -2,15 +2,16 @@
 
 //! ELF loader.
 //!
-//! Loads static x86_64 ELF64 executables (`ET_EXEC`) into a user address space.
+//! Loads static ELF64 executables (`ET_EXEC`) for this CPU ([`ELF_MACHINE`]) into a user address
+//! space.
 //!
 //! Every `PT_LOAD` segment is copied into freshly allocated pages of the target address space with
 //! matching permissions: writable only if `PF_W`, no-execute unless `PF_X`. Segments that are both
 //! writable and executable are refused (W^X), as are segments outside the program-image region
 //! `[USER_BASE, MMAP_BASE)` and segments sharing a page with another segment.
 
-use crate::arch::x86::PageFlag;
-use crate::vmm;
+use crate::arch::{Prot, ELF_MACHINE};
+use crate::vmm::{self, AddressSpace};
 
 /// The file starts with these four bytes (`e_ident[EI_MAG0..4]`).
 const MAGIC: &[u8; 4] = b"\x7fELF";
@@ -20,8 +21,6 @@ const CLASS_64: u8 = 2;
 const DATA_LITTLE_ENDIAN: u8 = 1;
 /// `e_type` of a (static) executable, `ET_EXEC`.
 const TYPE_EXECUTABLE: u16 = 2;
-/// `e_machine` of x86_64, `EM_X86_64`.
-const MACHINE_X86_64: u16 = 62;
 /// `p_type` of a segment to load, `PT_LOAD`.
 const SEGMENT_LOAD: u32 = 1;
 
@@ -120,11 +119,11 @@ impl Segment {
     }
 }
 
-/// Loads `image` into the (empty) user half of `pml4` and returns its entry point.
+/// Loads `image` into the (empty) user half of `space` and returns its entry point.
 ///
 /// On error the address space may be partially populated; the caller
 /// destroys it.
-pub(crate) fn load(pml4: u64, image: &[u8]) -> Result<u64, &'static str> {
+pub(crate) fn load(space: AddressSpace, image: &[u8]) -> Result<u64, &'static str> {
     const BAD: &str = "malformed ELF header";
     let byte = |field: Header| image.get(field as usize).copied();
     if !is_elf(image)
@@ -135,9 +134,8 @@ pub(crate) fn load(pml4: u64, image: &[u8]) -> Result<u64, &'static str> {
     }
     let u16_field = |field: Header| u16_at(image, field as usize).ok_or(BAD);
     let u64_field = |field: Header| u64_at(image, field as usize).ok_or(BAD);
-    if u16_field(Header::Type)? != TYPE_EXECUTABLE || u16_field(Header::Machine)? != MACHINE_X86_64
-    {
-        return Err("not a static x86_64 executable");
+    if u16_field(Header::Type)? != TYPE_EXECUTABLE || u16_field(Header::Machine)? != ELF_MACHINE {
+        return Err("not a static executable for this CPU");
     }
     let entry = u64_field(Header::Entry)?;
     let phoff = u64_field(Header::ProgramHeaders)? as usize;
@@ -170,16 +168,15 @@ pub(crate) fn load(pml4: u64, image: &[u8]) -> Result<u64, &'static str> {
             .get(s.offset as usize..file_end as usize)
             .ok_or("segment past end of file")?;
 
-        let mut flags = PageFlag::User as u64;
-        if s.has(SegmentFlag::Write) {
-            flags |= PageFlag::Writable as u64;
-        }
-        if !s.has(SegmentFlag::Execute) {
-            flags |= PageFlag::NoExecute as u64;
-        } else if (s.vaddr..s.vaddr + s.memsz).contains(&entry) {
+        let prot = Prot {
+            user: true,
+            write: s.has(SegmentFlag::Write),
+            exec: s.has(SegmentFlag::Execute),
+        };
+        if prot.exec && (s.vaddr..s.vaddr + s.memsz).contains(&entry) {
             entry_ok = true;
         }
-        vmm::map_init(pml4, s.vaddr, s.memsz, data, flags)
+        vmm::map_init(space, s.vaddr, s.memsz, data, prot)
             .map_err(|_| "out of memory, or segments share a page")?;
         loaded += 1;
     }

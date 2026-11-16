@@ -287,10 +287,6 @@ flags! {
         WriteThrough = 1 << 3,
         /// PCD: caching disabled (device registers).
         CacheDisable = 1 << 4,
-        /// A: set by the CPU when the entry is used.
-        Accessed = 1 << 5,
-        /// D: set by the CPU when the page is written.
-        Dirty = 1 << 6,
         /// PS, in a page-directory entry: it maps a 2 MiB page.
         Huge = 1 << 7,
         /// XD: instruction fetches fault (needs [`Efer::NoExecute`]).

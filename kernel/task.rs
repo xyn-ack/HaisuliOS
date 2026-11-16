@@ -60,6 +60,7 @@ use crate::platform::{multiboot::Module, power};
 use crate::program::{self, Args};
 use crate::sync::{Guard, Lock};
 use crate::upcall::{is_user_address, Upcall};
+use crate::vmm::AddressSpace;
 use crate::{elf, fs, irq, platform, syscall, vmm};
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -271,7 +272,7 @@ struct Task {
     /// File descriptors: the open file description each refers to ([`fs`]),
     /// or [`NO_FD`].
     fds: [u8; FDS],
-    pml4: u64,
+    space: AddressSpace,
     mmap_next: u64,
     mbox: [Msg; MBOX_SIZE],
     mb_head: usize,
@@ -294,7 +295,7 @@ impl Task {
         threads: 0,
         pins: 0,
         fds: [NO_FD; FDS],
-        pml4: 0,
+        space: AddressSpace::NONE,
         mmap_next: vmm::MMAP_BASE,
         mbox: [Msg {
             from: 0,
@@ -689,8 +690,8 @@ fn table() -> TableGuard {
 pub(crate) fn current_tid() -> u64 {
     table().cur().id
 }
-pub(crate) fn current_pml4() -> u64 {
-    table().cur().pml4
+pub(crate) fn current_space() -> AddressSpace {
+    table().cur().space
 }
 pub(crate) fn current_privileged() -> bool {
     table().cur().privileged
@@ -771,12 +772,12 @@ fn spawn(m: &Module) -> Result<u64, program::Error> {
         slot
     };
     match program::load(m.data, &args) {
-        Ok((pml4, frame)) => {
+        Ok((space, frame)) => {
             let fds = console_fds();
             Ok(install(
                 &mut table(),
                 slot,
-                pml4,
+                space,
                 &frame,
                 Name::new(args.name()),
                 true,
@@ -797,12 +798,12 @@ fn console_fds() -> [u8; FDS] {
     fds
 }
 
-/// Makes the reserved `slot` a new task running `pml4` from `frame`, with one thread; returns
+/// Makes the reserved `slot` a new task running `space` from `frame`, with one thread; returns
 /// its id. The task owns the references of `fds`.
 fn install(
     t: &mut Table,
     slot: usize,
-    pml4: u64,
+    space: AddressSpace,
     frame: &UserContext,
     name: Name,
     privileged: bool,
@@ -814,7 +815,7 @@ fn install(
         life: Life::Alive,
         id,
         threads: 1,
-        pml4,
+        space,
         name,
         privileged,
         fds,
@@ -834,7 +835,7 @@ fn install(
 /// Where a CPU goes next: a thread (with what it needs to run), or idling.
 struct Next {
     slot: usize,
-    pml4: u64,
+    space: AddressSpace,
     io_bitmap: IoBitmap,
 }
 
@@ -854,7 +855,7 @@ fn pick(t: &mut Table) -> Next {
         c.current = IDLE;
         return Next {
             slot: IDLE,
-            pml4: vmm::kernel_pml4(),
+            space: AddressSpace::kernel(),
             io_bitmap: gdt::IO_DENY_ALL,
         };
     };
@@ -865,7 +866,7 @@ fn pick(t: &mut Table) -> Next {
     let task = &t.tasks[t.threads[slot].task];
     Next {
         slot,
-        pml4: task.pml4,
+        space: task.space,
         io_bitmap: task.io_bitmap,
     }
 }
@@ -876,7 +877,7 @@ fn pick(t: &mut Table) -> Next {
 /// The address space changes first: once the old context is off this CPU (which is what lets
 /// another CPU free the old address space, see [`reap`]), this CPU no longer uses it.
 fn switch(next: Next) {
-    vmm::switch(next.pml4);
+    vmm::switch(next.space);
     if next.slot == IDLE {
         context::switch_to(context::idle(percpu::index()));
     } else {
@@ -1109,7 +1110,7 @@ fn exit_current() -> ! {
 
 /// What [`reap`] leaves for its caller to free outside the lock.
 struct Dead {
-    pml4: u64,
+    space: AddressSpace,
     fds: [u8; FDS],
 }
 
@@ -1130,7 +1131,7 @@ pub(crate) fn reap() {
             }
             let p = &mut t.tasks[slot];
             let dead = Dead {
-                pml4: p.pml4,
+                space: p.space,
                 fds: p.fds,
             };
             *p = Task::EMPTY;
@@ -1140,7 +1141,7 @@ pub(crate) fn reap() {
         for &ofd in dead.fds.iter().filter(|&&fd| fd != NO_FD) {
             fs::release(ofd as usize);
         }
-        vmm::destroy_user_space(dead.pml4);
+        vmm::destroy_user_space(dead.space);
     }
 }
 
@@ -1230,9 +1231,9 @@ pub(crate) fn gettid() -> i64 {
 /// Stores the caller's CPU in `*cpu` and 0 in `*node` (the `getcpu` system call); null
 /// pointers are skipped.
 pub(crate) fn getcpu(cpu_out: u64, node_out: u64) -> i64 {
-    let (pml4, cpu) = (current_pml4(), percpu::index() as u32);
+    let (space, cpu) = (current_space(), percpu::index() as u32);
     for (ptr, value) in [(cpu_out, cpu), (node_out, 0)] {
-        if ptr != 0 && !vmm::copy_to_user(pml4, ptr, &value.to_ne_bytes()) {
+        if ptr != 0 && !vmm::copy_to_user(space, ptr, &value.to_ne_bytes()) {
             return -EFAULT;
         }
     }
@@ -1248,11 +1249,11 @@ pub(crate) fn sched_getaffinity(pid: u64, len: u64, mask: u64) -> i64 {
     if len < 8 {
         return -EINVAL;
     }
-    let (pml4, online) = {
+    let (space, online) = {
         let t = table();
-        (t.cur().pml4, t.online_mask())
+        (t.cur().space, t.online_mask())
     };
-    if !vmm::copy_to_user(pml4, mask, &online.to_ne_bytes()) {
+    if !vmm::copy_to_user(space, mask, &online.to_ne_bytes()) {
         return -EFAULT;
     }
     8
@@ -1390,7 +1391,7 @@ pub(crate) fn fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
 /// descriptors, which share their open file descriptions. It gets no privileges, I/O
 /// permissions, IRQs, messages or upcalls. Returns the new task's id.
 pub(crate) fn task_fork(client: u64) -> i64 {
-    let (parent, slot, parent_pml4, fds, name) = {
+    let (parent, slot, parent_space, fds, name) = {
         let mut t = table();
         let cslot = match t.controlled_client(client) {
             Ok(slot) => slot,
@@ -1408,12 +1409,12 @@ pub(crate) fn task_fork(client: u64) -> i64 {
         for &ofd in p.fds.iter().filter(|&&fd| fd != NO_FD) {
             fs::retain(ofd as usize);
         }
-        (parent, slot, p.pml4, p.fds, p.name)
+        (parent, slot, p.space, p.fds, p.name)
     };
-    let pml4 = vmm::clone_user_space(parent_pml4);
+    let space = vmm::clone_user_space(parent_space);
     let mut t = table();
     t.tasks[parent].pins -= 1;
-    let failed = match (pml4, t.controlled_client(client)) {
+    let failed = match (space, t.controlled_client(client)) {
         (None, _) => Some(-ENOMEM),
         (Some(_), Err(e)) => Some(e), // The task ended meanwhile.
         (Some(_), Ok(_)) => None,
@@ -1424,19 +1425,19 @@ pub(crate) fn task_fork(client: u64) -> i64 {
         for &ofd in fds.iter().filter(|&&fd| fd != NO_FD) {
             fs::release(ofd as usize);
         }
-        if let Some(pml4) = pml4 {
-            vmm::destroy_user_space(pml4);
+        if let Some(space) = space {
+            vmm::destroy_user_space(space);
         }
         reap();
         return e;
     }
-    let (Some(pml4), Ok(cslot)) = (pml4, t.controlled_client(client)) else {
+    let (Some(space), Ok(cslot)) = (space, t.controlled_client(client)) else {
         unreachable!("checked above");
     };
     let mut frame = context::user_frame(cslot);
     frame.set_return(0); // The result of the copy's call.
     let mmap_next = t.tasks[parent].mmap_next;
-    let id = install(&mut t, slot, pml4, &frame, name, false, fds);
+    let id = install(&mut t, slot, space, &frame, name, false, fds);
     t.tasks[slot].mmap_next = mmap_next;
     id as i64
 }
@@ -1500,7 +1501,7 @@ pub(crate) fn task_cont(tid: u64) -> i64 {
 /// now.
 pub(crate) fn task_upcall(tid: u64, request: u64) -> i64 {
     let mut bytes = [0u8; upcall::WORDS * 8];
-    if !vmm::copy_from_user(current_pml4(), request, &mut bytes) {
+    if !vmm::copy_from_user(current_space(), request, &mut bytes) {
         return -EFAULT;
     }
     let mut words = [0u64; upcall::WORDS];
@@ -1557,7 +1558,7 @@ pub(crate) fn task_info(tid: u64, buf: u64, len: u64) -> i64 {
     if len < TASK_INFO_LEN as u64 {
         return -EINVAL;
     }
-    let (info, pml4) = {
+    let (info, space) = {
         let t = table();
         let Some(slot) = t.live_slot(tid) else {
             return -ESRCH;
@@ -1579,9 +1580,9 @@ pub(crate) fn task_info(tid: u64, buf: u64, len: u64) -> i64 {
             threads: p.threads as u64,
             name: p.name.0,
         };
-        (info, t.cur().pml4)
+        (info, t.cur().space)
     };
-    if !vmm::copy_to_user(pml4, buf, &info.to_bytes()) {
+    if !vmm::copy_to_user(space, buf, &info.to_bytes()) {
         return -EFAULT;
     }
     0
@@ -1604,7 +1605,11 @@ static EXEC: Lock<ExecBuffers> = Lock::new(ExecBuffers {
 /// from the file system, and builds the program's address space.
 ///
 /// Returns the address space, the registers to start with and the program's name.
-fn load_program(block: u64, len: u64, flags: u64) -> Result<(u64, UserContext, Name), i64> {
+fn load_program(
+    block: u64,
+    len: u64,
+    flags: u64,
+) -> Result<(AddressSpace, UserContext, Name), i64> {
     if flags & !exec::PRIVILEGED != 0 {
         return Err(-EINVAL);
     }
@@ -1617,13 +1622,13 @@ fn load_program(block: u64, len: u64, flags: u64) -> Result<(u64, UserContext, N
     let mut buffers = EXEC.lock();
     let ExecBuffers { block: args, image } = &mut *buffers;
     let args = &mut args[..len as usize];
-    if !vmm::copy_from_user(current_pml4(), block, args) {
+    if !vmm::copy_from_user(current_space(), block, args) {
         return Err(-EFAULT);
     }
     let args = Args::parse(args).map_err(|(e, _)| e)?;
     let size = fs::read_file(args.path(), image)?;
-    let (pml4, frame) = program::load(&image[..size], &args).map_err(|(e, _)| e)?;
-    Ok((pml4, frame, Name::new(args.name())))
+    let (space, frame) = program::load(&image[..size], &args).map_err(|(e, _)| e)?;
+    Ok((space, frame, Name::new(args.name())))
 }
 
 /// Makes the task of thread `client` run a program from the file system (the `task_exec`
@@ -1639,18 +1644,18 @@ pub(crate) fn task_exec(client: u64, block: u64, len: u64, flags: u64) -> i64 {
     if let Err(e) = table().controlled_client(client) {
         return e;
     }
-    let (pml4, frame, name) = match load_program(block, len, flags) {
+    let (space, frame, name) = match load_program(block, len, flags) {
         Ok(loaded) => loaded,
         Err(e) => return e,
     };
-    let (slot, old_pml4, old_threads) = {
+    let (slot, old_space, old_threads) = {
         let mut t = table();
         let cslot = match t.controlled_client(client) {
             Ok(slot) => slot,
             Err(e) => {
                 // The task ended meanwhile.
                 drop(t);
-                vmm::destroy_user_space(pml4);
+                vmm::destroy_user_space(space);
                 return e;
             }
         };
@@ -1681,7 +1686,7 @@ pub(crate) fn task_exec(client: u64, block: u64, len: u64, flags: u64) -> i64 {
             ..Thread::EMPTY
         };
         let p = &mut t.tasks[slot];
-        let old_pml4 = p.pml4;
+        let old_space = p.space;
         *p = Task {
             life: Life::Alive,
             id: p.id,
@@ -1690,7 +1695,7 @@ pub(crate) fn task_exec(client: u64, block: u64, len: u64, flags: u64) -> i64 {
             // slot reused) meanwhile, even if it ends.
             pins: p.pins + 1,
             stopped: p.stopped,
-            pml4,
+            space,
             name,
             privileged: flags & exec::PRIVILEGED != 0,
             fds: p.fds,
@@ -1700,7 +1705,7 @@ pub(crate) fn task_exec(client: u64, block: u64, len: u64, flags: u64) -> i64 {
         release_server_state(&mut t, id);
         irq::release_all(id);
         t.kick_later();
-        (slot, old_pml4, old_threads)
+        (slot, old_space, old_threads)
     };
     // The old address space goes once nothing uses it: no old thread on a CPU, no copy (only
     // this function's own pin left).
@@ -1722,7 +1727,7 @@ pub(crate) fn task_exec(client: u64, block: u64, len: u64, flags: u64) -> i64 {
         }
         t.tasks[slot].pins -= 1;
     }
-    vmm::destroy_user_space(old_pml4);
+    vmm::destroy_user_space(old_space);
     reap();
     0
 }
@@ -1745,7 +1750,7 @@ pub(crate) fn task_spawn(block: u64, len: u64, flags: u64) -> i64 {
         t.reserve(slot);
         slot
     };
-    let (pml4, frame, name) = match load_program(block, len, flags) {
+    let (space, frame, name) = match load_program(block, len, flags) {
         Ok(loaded) => loaded,
         Err(e) => {
             table().unreserve(slot);
@@ -1756,7 +1761,7 @@ pub(crate) fn task_spawn(block: u64, len: u64, flags: u64) -> i64 {
     install(
         &mut table(),
         slot,
-        pml4,
+        space,
         &frame,
         name,
         privileged,
@@ -1858,7 +1863,7 @@ pub(crate) fn return_to_user(f: &mut UserContext, nr: Option<u64>) {
     let frame = Frame::new(&up, f);
     // `copy_to_user` only accepts mapped, writable user memory.
     match Frame::address(f.sp()) {
-        Some(addr) if vmm::copy_to_user(current_pml4(), addr, frame.as_bytes()) => {
+        Some(addr) if vmm::copy_to_user(current_space(), addr, frame.as_bytes()) => {
             Frame::enter_handler(f, &up, addr);
         }
         _ => end_current(Why::Fault),
@@ -1874,7 +1879,7 @@ pub(crate) fn return_to_user(f: &mut UserContext, nr: Option<u64>) {
 /// would resume at a kernel address, is a fault.
 pub(crate) fn rt_sigreturn(f: &mut UserContext) -> i64 {
     let mut saved = SavedContext::empty();
-    if vmm::copy_from_user(current_pml4(), f.sp(), saved.as_mut_bytes()) && saved.restore(f) {
+    if vmm::copy_from_user(current_space(), f.sp(), saved.as_mut_bytes()) && saved.restore(f) {
         f.returned()
     } else {
         end_current(Why::Fault)
@@ -1888,14 +1893,14 @@ pub(crate) fn mmap(len: u64, prot: u64) -> i64 {
     }
     let pages = len.div_ceil(4096);
     // Take the range first: another thread of the task may map memory at the same time.
-    let (pml4, base) = {
+    let (space, base) = {
         let mut t = table();
         let p = t.cur_mut();
         let base = p.mmap_next;
         p.mmap_next = base + (pages + 1) * 4096; // Leave a guard page.
-        (p.pml4, base)
+        (p.space, base)
     };
-    if vmm::map_init(pml4, base, pages * 4096, &[], vmm::user_flags(prot)).is_err() {
+    if vmm::map_init(space, base, pages * 4096, &[], vmm::user_prot(prot)).is_err() {
         return -ENOMEM;
     }
     base as i64
@@ -1965,8 +1970,8 @@ const RECV_LEN: usize = 4 * 8;
 /// and `[0, KMSG_TASK_FAULT, tid, 0]`), mailbox messages `[task, a, b, task]`, then the oldest
 /// pending call `[client thread, op, len, client task]`.
 pub(crate) fn ipc_recv(out: u64) -> i64 {
-    let pml4 = current_pml4();
-    if !vmm::user_range_ok(pml4, out, RECV_LEN as u64, true) {
+    let space = current_space();
+    if !vmm::user_range_ok(space, out, RECV_LEN as u64, true) {
         return -EFAULT;
     }
     loop {
@@ -1986,7 +1991,7 @@ pub(crate) fn ipc_recv(out: u64) -> i64 {
         for (chunk, word) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(msg) {
             *chunk = word.to_ne_bytes();
         }
-        vmm::copy_to_user(pml4, out, &bytes);
+        vmm::copy_to_user(space, out, &bytes);
         return 0;
     }
 }
@@ -2061,7 +2066,7 @@ pub(crate) fn ipc_call(
         if server == t.my_task() {
             return -EDEADLK;
         }
-        if !vmm::user_range_ok(t.cur().pml4, buf, len, false) {
+        if !vmm::user_range_ok(t.cur().space, buf, len, false) {
             return -EFAULT;
         }
         t.call_seq += 1;
@@ -2106,7 +2111,7 @@ pub(crate) fn ipc_reply(client: u64, status: u64) -> i64 {
 /// copied, or `-EACCES` if the call's [`Access`] does not allow this
 /// direction. The client's task is *pinned* meanwhile: its memory stays, even if it ends.
 pub(crate) fn ipc_transfer(client: u64, offset: u64, local: u64, len: u64, to_client: bool) -> i64 {
-    let (call, task, client_pml4, my_pml4) = {
+    let (call, task, client_space, my_space) = {
         let mut t = table();
         let slot = match t.received_call(client) {
             Ok(slot) => slot,
@@ -2121,14 +2126,14 @@ pub(crate) fn ipc_transfer(client: u64, offset: u64, local: u64, len: u64, to_cl
         }
         let task = t.threads[slot].task;
         t.tasks[task].pins += 1;
-        (call, task, t.tasks[task].pml4, t.cur().pml4)
+        (call, task, t.tasks[task].space, t.cur().space)
     };
     let n = len.min(call.len - offset);
     let remote = call.buf + offset;
     let ok = if to_client {
-        vmm::copy_user_to_user(client_pml4, remote, my_pml4, local, n)
+        vmm::copy_user_to_user(client_space, remote, my_space, local, n)
     } else {
-        vmm::copy_user_to_user(my_pml4, local, client_pml4, remote, n)
+        vmm::copy_user_to_user(my_space, local, client_space, remote, n)
     };
     table().tasks[task].pins -= 1;
     reap();

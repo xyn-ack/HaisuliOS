@@ -23,6 +23,7 @@
 
 use crate::arch::phys;
 use crate::sync::Lock;
+use crate::vmm::AddressSpace;
 use crate::{pmm, vmm};
 use haisuli_abi::errno::*;
 use haisuli_abi::fcntl::*;
@@ -424,8 +425,8 @@ pub(crate) enum Transfer {
 
 /// Reads up to `len` bytes of `ofd` at its offset into user memory at `buf`.
 ///
-/// `buf` must be writable user memory in `pml4` (the caller checks it).
-pub(crate) fn read(ofd: usize, pml4: u64, buf: u64, len: u64) -> Transfer {
+/// `buf` must be writable user memory in `space` (the caller checks it).
+pub(crate) fn read(ofd: usize, space: AddressSpace, buf: u64, len: u64) -> Transfer {
     if ofd == CONSOLE {
         return Transfer::Console;
     }
@@ -444,7 +445,7 @@ pub(crate) fn read(ofd: usize, pml4: u64, buf: u64, len: u64) -> Transfer {
     while done < total {
         let n = CHUNK.min(total - done);
         node.read_at(open.offset + done as u64, &mut chunk[..n]);
-        if !vmm::copy_to_user(pml4, buf + done as u64, &chunk[..n]) {
+        if !vmm::copy_to_user(space, buf + done as u64, &chunk[..n]) {
             break;
         }
         done += n;
@@ -462,7 +463,7 @@ pub(crate) fn read(ofd: usize, pml4: u64, buf: u64, len: u64) -> Transfer {
 ///
 /// Returns how much was written; a full file system or file ends the write
 /// early, and fails it if nothing could be written.
-pub(crate) fn write(ofd: usize, pml4: u64, buf: u64, len: u64) -> Transfer {
+pub(crate) fn write(ofd: usize, space: AddressSpace, buf: u64, len: u64) -> Transfer {
     if ofd == CONSOLE {
         return Transfer::Console;
     }
@@ -484,7 +485,7 @@ pub(crate) fn write(ofd: usize, pml4: u64, buf: u64, len: u64) -> Transfer {
             error = -EFBIG;
             break;
         }
-        if !vmm::copy_from_user(pml4, buf + done as u64, &mut chunk[..n]) {
+        if !vmm::copy_from_user(space, buf + done as u64, &mut chunk[..n]) {
             error = -EFAULT;
             break;
         }
@@ -506,7 +507,7 @@ pub(crate) fn write(ofd: usize, pml4: u64, buf: u64, len: u64) -> Transfer {
 /// `struct linux_dirent64` records) and returns the bytes used (0 at the end).
 ///
 /// The description's offset is the index of the next node to look at.
-pub(crate) fn getdents(ofd: usize, pml4: u64, buf: u64, len: u64) -> i64 {
+pub(crate) fn getdents(ofd: usize, space: AddressSpace, buf: u64, len: u64) -> i64 {
     if ofd == CONSOLE {
         return -ENOTDIR;
     }
@@ -540,7 +541,7 @@ pub(crate) fn getdents(ofd: usize, pml4: u64, buf: u64, len: u64) -> i64 {
             record[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
             record[18] = if is_dir { DT_DIR } else { DT_REG };
             record[DIRENT_HEADER..DIRENT_HEADER + name.len()].copy_from_slice(name);
-            if !vmm::copy_to_user(pml4, buf + written, &record[..reclen]) {
+            if !vmm::copy_to_user(space, buf + written, &record[..reclen]) {
                 return -EFAULT;
             }
             written += reclen as u64;

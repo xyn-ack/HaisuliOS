@@ -9,7 +9,7 @@ only if every check passed. See `user/probe_test/src/main.rs` for what each case
 """
 import re
 
-from haisuli import PROMPT, Timeout
+from haisuli import PROMPT, Timeout, cpus
 
 # The kernel and the process server share the console, so their lines can appear anywhere.
 LOG_LINE = re.compile(r"\[(?:kernel|proc)\] [^\n]*\n")
@@ -62,9 +62,13 @@ def test_two_caught_signals_both_run_their_handlers(sh):
     probe(sh, "two-signals")
 
 
+@cpus(1)
 def test_a_signal_for_a_queued_pause_ends_it(sh):
     # The process server turns the signal into an upcall while the pause request is still queued;
-    # the pause must not go to sleep then. Without that, this case never finishes.
+    # the pause must not go to sleep then. Without that, this case never finishes. The case
+    # relies on the order in which one CPU runs the parent and the child (with more, the handler
+    # may run before the child even asks to pause, and then the pause rightly sleeps: the race
+    # that POSIX's `sigsuspend` exists for), so it always runs on one, whatever `--cpus` says.
     probe(sh, "pause-race")
 
 

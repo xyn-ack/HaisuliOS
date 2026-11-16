@@ -95,14 +95,14 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> i64 {
     let Some(ofd) = task::description(fd) else {
         return -EBADF;
     };
-    let pml4 = task::current_pml4();
-    if !vmm::user_range_ok(pml4, buf, len, true) {
+    let space = task::current_space();
+    if !vmm::user_range_ok(space, buf, len, true) {
         return -EFAULT;
     }
     if len == 0 {
         return 0;
     }
-    match fs::read(ofd.index(), pml4, buf, len) {
+    match fs::read(ofd.index(), space, buf, len) {
         Transfer::Done(n) => n,
         Transfer::Console => task::console_call(OP_READ, buf, len, Access::WriteOnly),
     }
@@ -115,14 +115,14 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
     let Some(ofd) = task::description(fd) else {
         return -EBADF;
     };
-    let pml4 = task::current_pml4();
-    if !vmm::user_range_ok(pml4, buf, len, false) {
+    let space = task::current_space();
+    if !vmm::user_range_ok(space, buf, len, false) {
         return -EFAULT;
     }
     if len == 0 {
         return 0;
     }
-    match fs::write(ofd.index(), pml4, buf, len) {
+    match fs::write(ofd.index(), space, buf, len) {
         Transfer::Done(n) => n,
         Transfer::Console => task::console_call(OP_WRITE, buf, len, Access::ReadOnly),
     }
@@ -142,11 +142,11 @@ fn sys_getdents64(fd: u64, buf: u64, len: u64) -> i64 {
     let Some(ofd) = task::description(fd) else {
         return -EBADF;
     };
-    let pml4 = task::current_pml4();
-    if !vmm::user_range_ok(pml4, buf, len, true) {
+    let space = task::current_space();
+    if !vmm::user_range_ok(space, buf, len, true) {
         return -EFAULT;
     }
-    fs::getdents(ofd.index(), pml4, buf, len)
+    fs::getdents(ofd.index(), space, buf, len)
 }
 
 /// Copies the NUL-terminated string at user address `ptr` into `buf` and
@@ -155,10 +155,10 @@ fn sys_getdents64(fd: u64, buf: u64, len: u64) -> i64 {
 /// A string that does not end within `buf` is `-ENAMETOOLONG`. Bytes are
 /// copied one at a time, so a string may end right before an unmapped page.
 fn user_string(ptr: u64, buf: &mut [u8]) -> Result<usize, i64> {
-    let pml4 = task::current_pml4();
+    let space = task::current_space();
     for (i, out) in buf.iter_mut().enumerate() {
         let mut byte = [0u8];
-        if !vmm::copy_from_user(pml4, ptr.wrapping_add(i as u64), &mut byte) {
+        if !vmm::copy_from_user(space, ptr.wrapping_add(i as u64), &mut byte) {
             return Err(-EFAULT);
         }
         if byte[0] == 0 {
@@ -191,8 +191,8 @@ fn serial_out(buf: u64, len: u64, raw: bool) -> i64 {
     /// Most bytes one call writes; more is cut off (a log line, not a file).
     const SERIAL_OUT_MAX: u64 = 4096;
     let len = len.min(SERIAL_OUT_MAX);
-    let pml4 = task::current_pml4();
-    if !vmm::user_range_ok(pml4, buf, len, false) {
+    let space = task::current_space();
+    if !vmm::user_range_ok(space, buf, len, false) {
         return -EFAULT;
     }
     let mut chunk = [0u8; 256];
@@ -200,7 +200,7 @@ fn serial_out(buf: u64, len: u64, raw: bool) -> i64 {
     let mut log = serial::lock(); // One message, even from several CPUs at once.
     while done < len {
         let n = (len - done).min(chunk.len() as u64) as usize;
-        if !vmm::copy_from_user(pml4, buf + done, &mut chunk[..n]) {
+        if !vmm::copy_from_user(space, buf + done, &mut chunk[..n]) {
             return -EFAULT;
         }
         if raw {
