@@ -38,10 +38,47 @@ interrupts through traits that the compiler checks, like `UserRegs` and `PageTab
 - A task's pending IRQ lines are a 64-bit set (the platform says how many lines there are; the
   compiler checks that they fit).
 
+### Fixed
+
+Races that made tests fail now and then when every machine had several CPUs (`make check
+TEST_ARGS="--cpus 4"`), and that two new tests now provoke on purpose:
+
+- The kernel could lose the wake-up of a thread waiting for a service to register (`svc_wait`,
+  and a terminal `read` or `write` before the console server is up): it looked the service up and
+  went to sleep under two holds of the scheduler's lock, and a registration on another CPU in
+  between left it asleep. At boot, init then never printed anything.
+- `execve` could deadlock the kernel: `task_exec` rebuilt the calling thread's context while
+  holding the scheduler's lock, and waited for the thread to be off its CPU, but that CPU could
+  still be about to switch away from it, which takes the same lock. It happens when a CPU is held
+  up between blocking in its call and switching away (on a busy host, an emulated CPU can be
+  stopped for a long time; `probe_test exec-loop` hung about once in 35 runs then). It now waits
+  without the lock.
+- A signal sent to a job that had only just started could meet the shell's actions instead of
+  the job's: the shell ignores `SIGTERM` and catches `SIGINT` and its trapped signals, and the
+  job resets them only after `fork`. `kill -15` then did nothing (and `wait` waited forever), and
+  a trapped signal ran the shell's handler in the job. The shell now blocks every signal from
+  before the `fork` until the job has reset them.
+- The process server discarded a signal that was ignored when it was sent even if it was
+  blocked, so blocking it did not help either. A blocked signal now stays pending, and the action
+  it meets when it is unblocked decides, as on Linux (POSIX leaves it open).
+- `echo` (the shell's and `/bin/echo`) wrote every word, and the newline, separately: a log line
+  from another CPU could land in the middle of its output. It now writes its line at once.
+
+### Added (tests)
+
+- `probe_test blocked-ignored` (`test_probe.py`): what happens to a signal that is blocked when
+  it is sent, whether or not it is ignored then and when it is unblocked.
+- `test_a_job_signalled_as_soon_as_it_starts_gets_the_default_action` (`test_process.py`): types
+  `kill` together with `pause &`, so that the signal arrives while the job still resets the
+  shell's actions.
+
 ### Removed
 
 - `kernel/process/` (`signal.rs`, `group.rs`), dead code left over from 0.1 that no module
   included since `kernel/process.rs` went in 0.3.1.
+- `user/init/src/jobs.rs`, `signals.rs` and `ustar.rs`, which the shell no longer included.
+- `user/proctest/`, a test program outside the workspace that nothing built (`probe_test`
+  replaced it).
 
 ## 0.3.1
 

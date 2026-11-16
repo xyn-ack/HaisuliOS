@@ -30,7 +30,7 @@ use core::fmt::Write;
 use haisuli_rt::abi::errno::{self, ECHILD, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, ESRCH};
 use haisuli_rt::abi::fcntl::{O_DIRECTORY, O_RDONLY, PATH_MAX};
 use haisuli_rt::abi::proc_state;
-use haisuli_rt::abi::signal::{self, NSIG, SIGINT, SIGTERM};
+use haisuli_rt::abi::signal::{self, NSIG, SIGINT, SIGTERM, SIG_BLOCK, SIG_SETMASK};
 use haisuli_rt::abi::{ProcInfo, Termination};
 use haisuli_rt::io::{tcsetpgrp, write_all, BufWriter, Sink, STDIN, STDOUT};
 use haisuli_rt::{eprintln, print, println, sys};
@@ -45,6 +45,8 @@ const MOTD: &str = "/etc/motd";
 const PROMPT: &str = "haisuli# ";
 /// Background jobs the shell remembers at a time.
 const MAX_JOBS: usize = 8;
+/// Every signal, as a signal set (SIGKILL and SIGSTOP are never blocked anyway).
+const ALL_SIGNALS: u64 = (1 << (NSIG - 1)) - 1;
 /// Status of a command that could not be run, as POSIX prescribes.
 const STATUS_NOT_FOUND: i32 = 127;
 /// Status of a program that was found but could not be run, as POSIX prescribes.
@@ -271,9 +273,14 @@ impl Shell {
 
     /// Runs a command in a child process, as a foreground or background job.
     fn spawn(&mut self, words: &[&str], redirects: &[words::Redirect<'_>], background: bool) {
+        // Until the child has reset the shell's signal actions, a signal sent to it would meet
+        // the shell's (ignored, or the shell's own handler): so every signal is blocked from
+        // before the fork until then, and stays pending meanwhile.
+        let old_mask = sys::sigprocmask(SIG_BLOCK, ALL_SIGNALS).unwrap_or(0);
         let pid = match sys::fork() {
             Ok(pid) => pid,
             Err(e) => {
+                let _ = sys::sigprocmask(SIG_SETMASK, old_mask);
                 eprintln!("init: cannot fork: {}", errno::describe(e.0));
                 self.status = 1;
                 return;
@@ -284,6 +291,7 @@ impl Shell {
             // at their default disposition so that it can be signalled.
             let _ = sys::setpgid(0, 0);
             self.traps.reset_for_job();
+            let _ = sys::sigprocmask(SIG_SETMASK, old_mask);
             if redirect::apply(redirects, false).is_err() {
                 sys::exit(1);
             }
@@ -294,6 +302,7 @@ impl Shell {
             };
             sys::exit(status);
         }
+        let _ = sys::sigprocmask(SIG_SETMASK, old_mask);
         // Both sides set the group, so the job is in it whoever runs first.
         let _ = sys::setpgid(pid, pid);
         if background {
@@ -359,12 +368,14 @@ impl Shell {
                 Outcome::status(0)
             }
             "echo" => {
-                let mut first = true;
-                for w in args {
-                    print!("{}{}", if first { "" } else { " " }, w);
-                    first = false;
+                // One write for the line (as far as the buffer goes), so that other output on
+                // the terminal, such as the log, cannot cut into it.
+                let mut out = BufWriter::new(Sink::Fd(STDOUT));
+                for (i, w) in args.iter().enumerate() {
+                    let _ = write!(out, "{}{}", if i == 0 { "" } else { " " }, w);
                 }
-                println!();
+                let _ = out.write_str("\n");
+                out.flush();
                 Outcome::status(0)
             }
             "ls" => Outcome::status(self.ls(args.first().copied().unwrap_or("/"))),

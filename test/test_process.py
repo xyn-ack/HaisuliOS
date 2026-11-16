@@ -457,6 +457,22 @@ def test_a_signal_from_a_job_runs_the_trap(sh):
     assert run(sh, "echo still reading") == "still reading\n"
 
 
+def test_a_job_signalled_as_soon_as_it_starts_gets_the_default_action(sh):
+    # No waiting until the job is in pause(): right after `fork`, the child still has the shell's
+    # actions (SIGTERM ignored, SIGINT and the trapped USR1 caught) until it has reset them. A
+    # signal sent meanwhile must wait for that, not meet the shell's action.
+    # Both lines are typed at once, so that the shell reads the `kill` right after the `fork`
+    # (the terminal echoes the second line into the output of the first: the job's pid is `$!`).
+    run(sh, "trap 'echo caught by the shell' USR1")
+    since = len(sh.transcript)
+    for option, signal in [("-15", SIGTERM), ("-USR1", SIGUSR1), ("-INT", SIGINT)]:
+        sh.send(f"pause &\rkill {option} $!\r")
+        sh.expect(PROMPT)
+        sh.expect(PROMPT)
+        assert wait_status(sh, "$!") == 128 + signal, option
+    assert "caught by the shell" not in sh.transcript[since:]
+
+
 def test_jobs_do_not_inherit_the_shells_traps(sh):
     run(sh, "trap 'echo caught by the shell' USR1")
     job = start_pause(sh)

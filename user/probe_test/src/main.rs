@@ -18,6 +18,9 @@
 //! - `pause-race`: a signal that becomes an upcall while the `pause` request of its target is
 //!   still queued at the process server ends that `pause` (the target would sleep forever
 //!   otherwise).
+//! - `blocked-ignored`: a signal that is ignored but blocked when it is sent stays pending, and
+//!   the action at the time it is unblocked decides (what a shell's job relies on between `fork`
+//!   and resetting the shell's actions); making it ignored discards it.
 //! - `exec`: what `execve` keeps and what it resets, and that a failed `execve` returns.
 //! - `exec-loop N`: `N` `execve`s in a row: a leak would run out of memory.
 
@@ -31,7 +34,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use haisuli_rt::abi::errno::{E2BIG, EACCES, EINTR, ENOENT, ENOEXEC, EPERM};
 use haisuli_rt::abi::fcntl::{O_CREAT, O_RDONLY, O_RDWR, O_TRUNC};
 use haisuli_rt::abi::signal::{
-    bit, NSIG, SA_RESTART, SIGHUP, SIGSEGV, SIGUSR1, SIGUSR2, SIG_BLOCK, SIG_SETMASK,
+    bit, NSIG, SA_RESTART, SIGHUP, SIGSEGV, SIGTERM, SIGUSR1, SIGUSR2, SIG_BLOCK, SIG_SETMASK,
 };
 use haisuli_rt::abi::{proc_state, ProcInfo, Termination};
 use haisuli_rt::println;
@@ -128,6 +131,7 @@ fn main(info: haisuli_rt::StartInfo) -> i32 {
         "task-exit" => task_exit(&mut c),
         "two-signals" => two_signals(&mut c),
         "pause-race" => pause_race(&mut c),
+        "blocked-ignored" => blocked_ignored(&mut c),
         "exec" => exec(&mut c),
         "exec-stage2" => exec_stage2(&mut c, info),
         "exec-loop" => {
@@ -270,6 +274,52 @@ fn page_fault() {
     // SAFETY: Not safe at all, on purpose: the first page is never mapped, so
     // the CPU faults before anything is written, and the task ends there.
     unsafe { core::ptr::write_volatile(address, 1) };
+}
+
+/// `blocked-ignored`: what happens to a signal sent while it is blocked, depending on whether it
+/// is ignored when it is sent, and when it is unblocked. Each child signals itself.
+fn blocked_ignored(c: &mut Checks) {
+    let cases: [(&str, [SigHandler; 3], WaitStatus); 3] = [
+        (
+            "ignored when sent, default when unblocked: it terminates",
+            [SigHandler::Ignore, SigHandler::Default, SigHandler::Default],
+            killed(SIGTERM),
+        ),
+        (
+            "ignored when sent and when unblocked: it is discarded",
+            [SigHandler::Ignore, SigHandler::Ignore, SigHandler::Ignore],
+            exited(CHILD_OK),
+        ),
+        (
+            "made ignored while pending, then default again: it was discarded",
+            [SigHandler::Default, SigHandler::Ignore, SigHandler::Default],
+            exited(CHILD_OK),
+        ),
+    ];
+    for (what, [when_sent, meanwhile, when_unblocked], expected) in cases {
+        // The child sets `when_sent`, blocks SIGTERM and sends it to itself, then sets
+        // `meanwhile` and `when_unblocked`, and unblocks it.
+        let Some(child) = fork_child(c, || {
+            let ok = sys::sigaction(SIGTERM, when_sent, 0, 0).is_ok()
+                && sys::sigprocmask(SIG_BLOCK, bit(SIGTERM)).is_ok()
+                && sys::kill(sys::getpid() as i64, SIGTERM).is_ok()
+                && sys::sigaction(SIGTERM, meanwhile, 0, 0).is_ok()
+                && sys::sigaction(SIGTERM, when_unblocked, 0, 0).is_ok()
+                && sys::sigprocmask(SIG_SETMASK, 0).is_ok();
+            if ok {
+                CHILD_OK
+            } else {
+                CHILD_FAILED
+            }
+        }) else {
+            return;
+        };
+        let r = sys::waitpid(child as i64, 0);
+        c.check(
+            r == Ok((child, expected)),
+            format_args!("{}: {:?}", what, r),
+        );
+    }
 }
 
 /// `task-exit`: a child ends its task behind the process server's back.

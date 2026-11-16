@@ -72,6 +72,14 @@ def test_a_signal_for_a_queued_pause_ends_it(sh):
     probe(sh, "pause-race")
 
 
+def test_a_blocked_signal_waits_for_the_action_it_meets_when_unblocked(sh):
+    # A signal that is ignored when it is sent, but blocked, stays pending: the action when it is
+    # unblocked decides. A shell's job relies on that: it blocks every signal from before `fork`
+    # until it has reset the shell's actions (the shell ignores SIGTERM), so that a signal sent to
+    # it meanwhile is not lost. Making a pending signal ignored discards it, as POSIX requires.
+    probe(sh, "blocked-ignored")
+
+
 def test_execve_keeps_and_resets_what_posix_says(sh):
     probe(sh, "exec")
 

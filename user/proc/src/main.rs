@@ -730,7 +730,8 @@ impl Server {
 
     // ---- Signals ----------------------------------------------------------------
     //
-    // A signal is first *posted* (`post`): it becomes pending, unless the target ignores it.
+    // A signal is first *posted* (`post`): it becomes pending, unless the target ignores it (and
+    // does not block it).
     // Then `act` does what the pending signals that are not blocked call for:
     //
     // - A default action happens at once: the target is terminated or stopped, whoever sent the
@@ -812,7 +813,11 @@ impl Server {
         } else if default_action(sig) == Action::Stop {
             p.signals.pending.remove(SIGCONT);
         }
-        if disposition != Disposition::Ignore {
+        // An ignored signal is discarded, unless it is blocked: then it stays pending until it
+        // is unblocked, and what happens is up to the action at that time (POSIX leaves this
+        // open; Linux does the same). So a process can block a signal while it changes its
+        // action, as a shell's job does right after `fork`, without losing it meanwhile.
+        if disposition != Disposition::Ignore || p.signals.blocked.contains(sig) {
             p.signals.pending.add(sig);
             p.signals.senders[sig as usize] = sender;
         }

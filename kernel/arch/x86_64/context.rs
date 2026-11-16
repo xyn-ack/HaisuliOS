@@ -145,7 +145,10 @@ pub(crate) fn user_frame(slot: usize) -> TrapFrame {
 /// Prepares thread slot `slot` to enter user mode with the registers in `frame` the next time
 /// it is switched to.
 ///
-/// Waits while a CPU is still leaving the slot's old context.
+/// Waits while a CPU is still leaving the slot's old context: so the caller must not hold a lock
+/// that the leaving CPU needs in order to switch away (the scheduler's). A slot that no thread
+/// runs in, or one whose thread [`on_cpu`] has seen leave and which cannot run meanwhile, is
+/// ready at once.
 ///
 /// # Panics
 ///

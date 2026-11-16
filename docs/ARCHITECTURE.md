@@ -530,7 +530,9 @@ stops it (`task_stop`) or continues it (`task_cont`). POSIX's rules for a stoppe
 continued, and `SIGCONT` discards pending stop signals. Terminating a process
 wakes its parent out of `wait4`, fails the calls it was serving with `-EPIPE`,
 and reparents its children to init. A blocked signal waits until it is
-unblocked.
+unblocked, even one that is ignored when it is sent (as on Linux): the action
+it meets when it is unblocked decides. Making a signal ignored discards it if
+it is pending.
 
 A *caught* signal runs a handler when a thread of its process next returns to
 user mode. The process server asks the kernel for an **upcall**
@@ -566,7 +568,10 @@ that session; the shell hands the terminal to a foreground job with
 `tcsetpgrp()` and takes it back afterwards; and the console server sends
 Ctrl-C's `SIGINT` to whichever group holds the terminal. The shell catches
 `SIGINT` (and ignores the other job control signals), so Ctrl-C interrupts
-the job and not the shell; jobs reset those dispositions right after `fork`.
+the job and not the shell; jobs reset those dispositions (and the traps) right
+after `fork`. The shell blocks every signal from before the `fork` until the
+child has done so, so a signal sent to a job that has only just started waits
+for the job's own dispositions instead of meeting the shell's.
 `trap` attaches commands to signals: the shell's one handler only records the
 signal, and the commands run between commands, as in any POSIX shell.
 

@@ -45,7 +45,7 @@ def test_motd_is_shown_before_the_first_prompt(sh):
 
 def test_motd_appears_exactly_once(sh):
     motd = read_rootfs("etc/motd")
-    assert sh.boot_output.count(motd) == 1
+    assert LOG_LINE.sub("", sh.boot_output).count(motd) == 1
 
 
 def test_shell_responds_after_boot(sh):

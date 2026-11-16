@@ -1628,16 +1628,26 @@ fn load_program(
 /// services, messages and upcalls, and the calls it was serving fail. On error
 /// the task is left as it was.
 pub(crate) fn task_exec(client: u64, block: u64, len: u64, flags: u64) -> i64 {
-    if let Err(e) = table().controlled_client(client) {
-        return e;
-    }
+    let mut cslot = match table().controlled_client(client) {
+        Ok(slot) => slot,
+        Err(e) => return e,
+    };
     let (space, frame, name) = match load_program(block, len, flags) {
         Ok(loaded) => loaded,
         Err(e) => return e,
     };
-    let (slot, old_space, old_threads) = {
+    let (slot, old_space, old_threads) = loop {
+        // The caller's context is rebuilt below, which must wait until it is off its CPU. The
+        // caller may not be yet: it blocked in its call, but its CPU may not have switched away
+        // (an emulated CPU can be held up for a long time). That CPU needs the scheduler's lock
+        // to switch, so wait without holding it, and look again once it is taken: a thread still
+        // blocked in the received call cannot have gone back onto a CPU, and one that is not
+        // any more abandons the exec.
+        while context::on_cpu(cslot) {
+            spin_loop();
+        }
         let mut t = table();
-        let cslot = match t.controlled_client(client) {
+        cslot = match t.controlled_client(client) {
             Ok(slot) => slot,
             Err(e) => {
                 // The task ended meanwhile.
@@ -1646,6 +1656,9 @@ pub(crate) fn task_exec(client: u64, block: u64, len: u64, flags: u64) -> i64 {
                 return e;
             }
         };
+        if context::on_cpu(cslot) {
+            continue;
+        }
         let slot = t.threads[cslot].task;
         let me = percpu::index();
         // POSIX: the other threads end. Those on a CPU notice soon, and use the old address
@@ -1692,7 +1705,7 @@ pub(crate) fn task_exec(client: u64, block: u64, len: u64, flags: u64) -> i64 {
         release_server_state(&mut t, id);
         irq::release_all(id);
         t.kick_later();
-        (slot, old_space, old_threads)
+        break (slot, old_space, old_threads);
     };
     // The old address space goes once nothing uses it: no old thread on a CPU, no copy (only
     // this function's own pin left).
@@ -2158,31 +2171,38 @@ pub(crate) fn svc_register(id: u64) -> i64 {
     0
 }
 
+/// The live task registered as service `id` (valid), if there is one.
+fn service(t: &Table, id: u64) -> Option<u64> {
+    let tid = t.services[id as usize];
+    t.live_slot(tid).map(|_| tid)
+}
+
 /// Returns the task providing service `id` (the `svc_lookup` system call).
 pub(crate) fn svc_lookup(id: u64) -> i64 {
     if id == 0 || id >= svc::MAX {
         return -EINVAL;
     }
-    let t = table();
-    let tid = t.services[id as usize];
-    match t.live_slot(tid) {
-        Some(_) => tid as i64,
-        None => -ESRCH,
-    }
+    service(&table(), id).map_or(-ESRCH, |tid| tid as i64)
 }
 
 /// Returns the task providing service `id`, waiting for it to register (the
 /// `svc_wait` system call).
 ///
 /// `interruptible`: whether an upcall ends the wait with `-EINTR`.
+///
+/// The lookup and going to sleep happen under one hold of the lock: a registration on another
+/// CPU in between would otherwise wake the waiters before this thread is one of them, and it
+/// would sleep until the next registration.
 fn wait_for_service(id: u64, interruptible: bool) -> i64 {
+    if id == 0 || id >= svc::MAX {
+        return -EINVAL;
+    }
     loop {
-        let tid = svc_lookup(id);
-        if tid != -ESRCH {
-            return tid;
-        }
         {
             let mut t = table();
+            if let Some(tid) = service(&t, id) {
+                return tid as i64;
+            }
             let me = t.me();
             if interruptible && interrupting(&t.threads[me]) {
                 return -EINTR;
