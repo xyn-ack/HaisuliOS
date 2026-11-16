@@ -15,12 +15,13 @@
 //! ([`crate::abi::proc`]), made with `ipc_call`, like the terminal's requests to the console
 //! server.
 
+use crate::abi::device::{DeviceInfo, DEVICE_INFO_LEN};
 use crate::abi::errno::{EINTR, EINVAL};
-use crate::abi::fcntl::{F_DUPFD, PATH_MAX};
+use crate::abi::fcntl::{AT_FDCWD, F_DUPFD, F_GETFD, PATH_MAX};
 use crate::abi::proc::*;
 use crate::abi::signal::{SA_RESTORER, SIG_DFL, SIG_IGN};
 use crate::abi::{exec, nr, svc, upcall, ProcInfo, TaskInfo, PROC_INFO_LEN, TASK_INFO_LEN};
-use core::arch::{asm, global_asm};
+use crate::arch;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// An error number from [`crate::abi::errno`] (positive).
@@ -38,18 +39,8 @@ pub type Result<T> = core::result::Result<T, Errno>;
 /// Rust's borrowing rules forbid.
 #[inline(always)]
 pub unsafe fn syscall(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
-    let ret: i64;
     // SAFETY: The caller guarantees the arguments are valid for call `n`.
-    // The kernel preserves every register except rax; rcx and r11 are
-    // clobbered by the `syscall` instruction itself.
-    unsafe {
-        asm!("syscall",
-             inlateout("rax") n as i64 => ret,
-             in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3, in("r8") a4, in("r9") a5,
-             lateout("rcx") _, lateout("r11") _,
-             options(nostack));
-    }
-    ret
+    unsafe { arch::syscall(n, a0, a1, a2, a3, a4, a5) }
 }
 
 /// The permissions `open` asks for when it creates a file: `rw-r--r--`, the
@@ -70,13 +61,14 @@ enum Sys<'a> {
         buf: &'a [u8],
     },
     /// `path` is NUL-terminated.
-    Open {
+    OpenAt {
+        dirfd: u64,
         path: &'a [u8],
         flags: u64,
     },
     Close(u64),
     Dup(u64),
-    Dup2 {
+    Dup3 {
         fd: u64,
         newfd: u64,
     },
@@ -84,6 +76,8 @@ enum Sys<'a> {
         fd: u64,
         min: u64,
     },
+    /// `fcntl(fd, F_GETFD)`.
+    GetFd(u64),
     /// The kernel fills `buf` with directory entries.
     GetDents {
         fd: u64,
@@ -103,11 +97,6 @@ enum Sys<'a> {
     Mmap {
         len: u64,
         prot: u64,
-    },
-    Ioperm {
-        from: u64,
-        num: u64,
-        on: bool,
     },
     IpcSend {
         dest: u64,
@@ -170,6 +159,12 @@ enum Sys<'a> {
         flags: u64,
     },
     PowerOff,
+    /// The kernel fills `buf` with a serialised `DeviceInfo`.
+    DeviceInfo {
+        device: u64,
+        buf: &'a mut [u8; DEVICE_INFO_LEN],
+    },
+    DeviceGrant(u64),
 }
 
 fn invoke(call: Sys<'_>) -> i64 {
@@ -188,11 +183,14 @@ fn invoke(call: Sys<'_>) -> i64 {
             let (p, l) = ro(buf);
             (nr::WRITE, [fd, p, l, 0])
         }
-        Sys::Open { path, flags } => (nr::OPEN, [ro(path).0, flags, NEW_FILE_MODE, 0]),
+        Sys::OpenAt { dirfd, path, flags } => {
+            (nr::OPENAT, [dirfd, ro(path).0, flags, NEW_FILE_MODE])
+        }
         Sys::Close(fd) => (nr::CLOSE, [fd, 0, 0, 0]),
         Sys::Dup(fd) => (nr::DUP, [fd, 0, 0, 0]),
-        Sys::Dup2 { fd, newfd } => (nr::DUP2, [fd, newfd, 0, 0]),
+        Sys::Dup3 { fd, newfd } => (nr::DUP3, [fd, newfd, 0, 0]),
         Sys::DupFrom { fd, min } => (nr::FCNTL, [fd, F_DUPFD, min, 0]),
+        Sys::GetFd(fd) => (nr::FCNTL, [fd, F_GETFD, 0, 0]),
         Sys::GetDents { fd, buf } => {
             let (p, l) = rw(buf);
             (nr::GETDENTS64, [fd, p, l, 0])
@@ -209,7 +207,6 @@ fn invoke(call: Sys<'_>) -> i64 {
             [0, mask.len() as u64, mask.as_mut_ptr() as u64, 0],
         ),
         Sys::Mmap { len, prot } => (nr::MMAP, [0, len, prot, 0]),
-        Sys::Ioperm { from, num, on } => (nr::IOPERM, [from, num, on as u64, 0]),
         Sys::IpcSend { dest, a, b } => (nr::IPC_SEND, [dest, a, b, 0]),
         Sys::IpcRecv(m) => (nr::IPC_RECV, [m as *mut Message as u64, 0, 0, 0]),
         Sys::IpcCall { dest, op, buf } => {
@@ -266,6 +263,11 @@ fn invoke(call: Sys<'_>) -> i64 {
             (nr::TASK_SPAWN, [p, l, flags, 0])
         }
         Sys::PowerOff => (nr::POWER_OFF, [0; 4]),
+        Sys::DeviceInfo { device, buf } => {
+            let (p, l) = rw(buf);
+            (nr::DEVICE_INFO, [device, p, l, 0])
+        }
+        Sys::DeviceGrant(device) => (nr::DEVICE_GRANT, [device, 0, 0, 0]),
     };
     // SAFETY: Every pointer in `args` was taken from a borrow in `call`,
     // which lives until this function returns, with its exact length; it is
@@ -297,14 +299,23 @@ pub fn write(fd: u64, buf: &[u8]) -> Result<usize> {
 
 /// Opens the file at `path` with `O_*` flags ([`crate::abi::fcntl`]) and
 /// returns its file descriptor.
+///
+/// There is no current directory: a relative path starts at the root.
 pub fn open(path: &str, flags: u64) -> Result<u64> {
+    openat(AT_FDCWD, path, flags)
+}
+
+/// Opens the file at `path` with `O_*` flags, and returns its file descriptor; a relative
+/// `path` starts at directory `dirfd` ([`AT_FDCWD`]: the root).
+pub fn openat(dirfd: u64, path: &str, flags: u64) -> Result<u64> {
     // The kernel wants a NUL-terminated path.
     let mut buf = [0u8; 2 * PATH_MAX + 1];
     if path.len() >= buf.len() || path.as_bytes().contains(&0) {
         return Err(Errno(crate::abi::errno::ENAMETOOLONG));
     }
     buf[..path.len()].copy_from_slice(path.as_bytes());
-    check(invoke(Sys::Open {
+    check(invoke(Sys::OpenAt {
+        dirfd,
         path: &buf[..=path.len()],
         flags,
     }))
@@ -327,8 +338,14 @@ pub fn dup_from(fd: u64, min: u64) -> Result<u64> {
 }
 
 /// Makes `newfd` a copy of `fd` (closing whatever `newfd` was first).
+///
+/// If they are the same, this only checks that `fd` is open, as POSIX says.
 pub fn dup2(fd: u64, newfd: u64) -> Result<u64> {
-    check(invoke(Sys::Dup2 { fd, newfd }))
+    if fd == newfd {
+        // `dup3` refuses the same descriptor twice.
+        return check(invoke(Sys::GetFd(fd))).map(|_| fd);
+    }
+    check(invoke(Sys::Dup3 { fd, newfd }))
 }
 
 /// Fills `buf` with directory entries of directory `fd` and returns how many
@@ -509,7 +526,7 @@ pub fn sigaction(sig: u64, handler: SigHandler, flags: u64, mask: u64) -> Result
         SigHandler::Catch(f) => [
             f as usize as u64,
             flags | SA_RESTORER,
-            __haisuli_sigreturn as *const () as usize as u64,
+            arch::sigreturn_restorer(),
             mask,
         ],
     };
@@ -536,36 +553,9 @@ pub fn sigprocmask(how: u64, set: u64) -> Result<u64> {
 /// Hands the signal mask saved in a handler's frame back to the process
 /// server, which then delivers the signals that it unblocks.
 ///
-/// Called only by [`__haisuli_sigreturn`].
-extern "C" fn restore_signal_mask(mask: u64) {
+/// Called only by the architecture's signal restorer, where every handler returns to.
+pub(crate) extern "C" fn restore_signal_mask(mask: u64) {
     let _ = proc_call(OP_SIGRETURN, &mut [mask]);
-}
-
-// Where every signal handler returns to: the kernel's upcall frame has this
-// address as the handler's return address, and the stack pointer then points
-// at the frame's `ucontext`. The signal mask saved there goes back to the
-// process server; then `rt_sigreturn` restores the interrupted registers from
-// the frame (it never returns here). The `call` keeps the SysV alignment: the
-// kernel leaves the stack pointer 16-byte aligned at this point.
-global_asm!(
-    ".pushsection .text.__haisuli_sigreturn, \"ax\"",
-    ".global __haisuli_sigreturn",
-    "__haisuli_sigreturn:",
-    "    mov rdi, [rsp + {uc_sigmask}]",
-    "    call {restore}",
-    "    mov eax, {nr}",
-    "    syscall",
-    "    ud2",
-    ".popsection",
-    uc_sigmask = const upcall::UC_SIGMASK,
-    restore = sym restore_signal_mask,
-    nr = const nr::RT_SIGRETURN,
-);
-
-extern "C" {
-    /// The restorer of every handler that [`sigaction`] installs (only its
-    /// address is used; it is never called from Rust).
-    fn __haisuli_sigreturn();
 }
 
 /// Puts process `pid` (0 = the caller) into process group `pgid` (0 = `pid`).
@@ -685,16 +675,6 @@ pub fn thread_exit() -> ! {
 /// `munmap` yet), and what the caller does with it is up to the caller.
 pub fn mmap(len: u64, prot: u64) -> Result<u64> {
     check(invoke(Sys::Mmap { len, prot }))
-}
-
-/// Grants (or revokes) access to I/O ports `[from, from + num)`.
-pub fn ioperm(from: u64, num: u64, turn_on: bool) -> Result<()> {
-    check(invoke(Sys::Ioperm {
-        from,
-        num,
-        on: turn_on,
-    }))
-    .map(drop)
 }
 
 // ---- IPC ----
@@ -862,4 +842,23 @@ pub fn task_spawn(block: &[u8], flags: u64) -> Result<u64> {
 /// Powers the machine off (privileged tasks only).
 pub fn power_off() -> Result<()> {
     check(invoke(Sys::PowerOff)).map(drop)
+}
+
+// ---- Devices (for drivers: see `crate::device`) ----
+
+/// Describes device `device` (one of the ids in [`crate::abi::device`]).
+pub fn device_info(device: u64) -> Result<DeviceInfo> {
+    let mut buf = [0u8; DEVICE_INFO_LEN];
+    check(invoke(Sys::DeviceInfo {
+        device,
+        buf: &mut buf,
+    }))?;
+    Ok(DeviceInfo::from_bytes(&buf))
+}
+
+/// Gets the registers of device `device` granted (privileged processes only): returns the
+/// first I/O port, or the address where they are mapped. [`crate::device::grant`] turns that
+/// into register access.
+pub fn device_grant(device: u64) -> Result<u64> {
+    check(invoke(Sys::DeviceGrant(device)))
 }

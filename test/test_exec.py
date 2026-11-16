@@ -115,10 +115,10 @@ def test_the_console_server_runs_from_the_file_system(sh):
 
 
 def test_a_program_never_runs_privileged(sh):
-    # The console server run from the shell is an ordinary process: it may not have the UART's
-    # I/O ports, so it gives up at once, and the real console server carries on.
+    # The console server run from the shell is an ordinary process: it may not be granted the
+    # UART (EPERM), so it gives up at once, and the real console server carries on.
     since = len(sh.transcript)
     run(sh, "/sbin/console")
     assert status(sh) == 1
-    assert "[console] ioperm failed: errno 1\n" in sh.transcript[since:]
+    assert "[console] device_grant failed: errno 1\n" in sh.transcript[since:]
     assert run(sh, "echo the terminal still works") == "the terminal still works\n"

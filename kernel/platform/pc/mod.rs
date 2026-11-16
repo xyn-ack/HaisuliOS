@@ -16,10 +16,15 @@ pub(crate) mod pit;
 pub(crate) mod power;
 pub(crate) mod uart;
 
-use super::{BootInfo, CpuIds, InterruptController, Machine, Module};
+use super::{BootInfo, CpuIds, Device, InterruptController, Machine, Module, Registers};
+use crate::arch::x86_64::cpu::Device::Com1;
 use crate::arch::{Cpu, Processor};
 use core::ops::Range;
+use haisuli_abi::device::{CONSOLE, KIND_UART_16550};
 use multiboot::MemoryType;
+
+/// The interrupt line of COM1: ISA IRQ 4, an 8259 line.
+const COM1_IRQ: usize = 4;
 
 /// The PC.
 pub(crate) struct Pc;
@@ -48,6 +53,25 @@ impl Machine for Pc {
     fn power_off(code: u32) -> ! {
         power::off(code);
         Cpu::halt()
+    }
+
+    /// The console is COM1, a 16550 at the standard I/O ports.
+    fn device(id: u64) -> Option<Device> {
+        match id {
+            CONSOLE => {
+                let (base, count) = Com1.ports();
+                Some(Device {
+                    kind: KIND_UART_16550,
+                    registers: Registers::Ports {
+                        base: base as u64,
+                        count: count as u64,
+                    },
+                    irq: Some(COM1_IRQ),
+                    name: "COM1",
+                })
+            }
+            _ => None,
+        }
     }
 }
 

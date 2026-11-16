@@ -43,9 +43,9 @@ traceback and the full console transcript.
 
 What the shell cannot reach, the test program `/bin/probe_test` does:
 `probe_test CASE` runs one case (`restart`, `eintr`, `fault`, `task-exit`,
-`two-signals`, `pause-race`, `blocked-ignored`, `exec`, `exec-loop N`),
-prints `ok` or `FAIL` for each check, and exits with status 0 only if all
-passed. `test_probe.py` runs every case.
+`two-signals`, `pause-race`, `blocked-ignored`, `files`, `devices`, `exec`,
+`exec-loop N`), prints `ok` or `FAIL` for each check, and exits with status 0
+only if all passed. `test_probe.py` runs every case.
 
 `/bin/smp_test` does the same for multiple CPUs and threads (`test_smp.py`): `smp_test CASE [N]`,
 where `N` is the machine's number of CPUs, runs one case (`spin`, `threads`, `parallel N`,
@@ -64,7 +64,8 @@ test/test_exit.py         exit and Ctrl-D power the machine off
 test/test_exec.py         programs from the file system: execve, /bin, /sbin/console
 test/test_probe.py        /bin/probe_test: SA_RESTART, faults, task_exit, back-to-back signals,
                           the queued-pause race, blocked signals that are ignored when sent,
-                          what execve keeps, 1000 execs in a row
+                          openat/dup3 (and x86_64's open/dup2), device descriptions and
+                          grants, what execve keeps, 1000 execs in a row
 test/test_process.py      signals, process groups/sessions, waitpid semantics; jobs signalled
                           the moment they start
 test/test_process_server.py  explicit ("process-server"): process management lives in the
@@ -76,6 +77,14 @@ test/test_smp.py          explicit ("smp"): written before SMP and threads exist
                           their process (exit, kill, fault, execve); fork copies one thread;
                           a signal ends the pause of the thread that waits
 ```
+
+## Portability
+
+`make portcheck` checks what keeps the system portable to a second architecture (see
+[TODO.md](../TODO.md)), without running anything: every user crate builds for
+`aarch64-unknown-none` (without warnings), user space has no assembly outside
+`user/rt/src/arch/`, and the kernel's generic files use the hardware layer through its contracts
+only. `AARCH64_TOOLCHAIN=+<toolchain>` picks the toolchain for the arm64 build.
 
 ## Writing a test
 

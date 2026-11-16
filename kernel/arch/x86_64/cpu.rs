@@ -7,7 +7,7 @@
 use super::x86::Msr;
 use core::arch::asm;
 use core::sync::atomic::AtomicU64;
-use haisuli_abi::uart;
+use haisuli_abi::uart16550;
 
 // ---- Port I/O ---------------------------------------------------------------
 
@@ -35,10 +35,11 @@ pub(crate) enum Device {
 }
 
 impl Device {
-    const fn ports(self) -> (u16, u16) {
+    /// The device's I/O ports: the first, and how many.
+    pub(crate) const fn ports(self) -> (u16, u16) {
         match self {
             // The standard PC I/O ports of each device.
-            Device::Com1 => (uart::COM1, uart::PORTS),
+            Device::Com1 => (0x3F8, uart16550::REGISTERS as u16),
             Device::Pic1 => (0x20, 2),
             Device::Pic2 => (0xA0, 2),
             Device::PostCode => (0x80, 1),

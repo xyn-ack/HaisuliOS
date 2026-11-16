@@ -63,25 +63,17 @@ Done:
    `BootInfo` (memory, the boot loader's own data and the boot modules, platform-neutral) and
    `InterruptController` (lines, mask, unmask, acknowledge), for `platform::Board`. No generic
    file names `arch::{apic, idt, gdt, smp, entry}`, `arch::x86_64` or `platform::pc`.
+5. **The ABI and user space.** Linux numbers per architecture in `abi::nr` (declared side by side;
+   `openat` and `dup3` everywhere, `open` and `dup2` on x86_64 only), with the native calls
+   shared; `UC_SIGMASK` and `O_DIRECTORY` per architecture. Devices described by the machine and
+   granted to drivers (`device_info`, `device_grant`) instead of `ioperm`, with I/O ports as the
+   PC's extension (the opaque `arch::IoPorts`, behind the `IoPermissions` trait) and IRQ lines
+   from the description. `user/rt/src/arch/{x86_64,aarch64}.rs` with all of user space's
+   assembly, and `rt::device` for register access from a grant, so the console server has no
+   unsafe code and chooses its UART driver (16550 or PL011). `make portcheck` keeps it so.
 
 To do:
 
-5. **The ABI and user space.**
-   - `abi::nr`: "Linux numbers" are per architecture (arm64 uses the generic table: `read` is
-     63, `clone` 220, and there is no `open` or `dup2`, only `openat` and `dup3`), so the numbers
-     become per-architecture, with the HaisuliOS-native calls (0x1000 and up) shared;
-     `upcall::UC_SIGMASK` (296) is x86_64's frame layout.
-   - Devices: `ioperm`, `IO_PORTS` and the COM1 constants are PC-only, and ARM has memory-mapped
-     devices only. A device-resource grant instead (map a device's registers into a privileged
-     driver, with I/O ports as the PC's extension), IRQ numbers from the platform's description
-     rather than `COM1_IRQ = 4`, and the console server choosing its UART driver (16550 or
-     PL011). The task's I/O bitmap then becomes part of the x86 arch's thread state.
-   - The runtime: `user/rt/src/arch/{x86_64,aarch64}.rs` for the system call instruction and
-     registers (`syscall` vs `svc #0` with the number in `x8`), `_start`, and the `clone` and
-     sigreturn stubs; the console server's port I/O behind the device grant.
-
-   Done when every user crate builds for `aarch64-unknown-none`, and no inline assembly is left
-   outside `user/rt/src/arch/` (and the drivers' own device access).
 6. **The build, the tests, and the arm64 bring-up.**
    - `make ARCH=x86_64|aarch64`: the target triple, the linker scripts, the 32-bit `objcopy` step
      (Multiboot only), the QEMU binary and machine (`qemu-system-aarch64 -M virt`); the test
@@ -92,6 +84,12 @@ To do:
      a restart backs up 4 bytes), the context switch, per-CPU data in `TPIDR_EL1`, the page
      tables (`TTBR0_EL1` for user space, `TTBR1_EL1` for the kernel, so `init_root` has nothing to
      copy), the GIC and the generic timer; one CPU first, then the others through PSCI `CPU_ON`.
+   - The kernel side of memory-mapped device grants (the PC has none, so it waited for arm64):
+     `platform::Registers::Mmio`, mapping a device's registers uncached into the driver's address
+     space, and keeping those pages out of `task_fork`'s copy and out of the frame allocator when
+     the task ends. The ABI, the runtime's `device` and the console's PL011 driver are ready.
+   - The user programs' link for arm64 (`user.ld` at the same address; lld's default 64 KiB
+     segment alignment, or `-z max-page-size=4096`).
    - Step 4's contracts there: `BootInfo` and `Machine::cpus()` from the device tree (`/memory`,
      `/chosen`'s initrd, MPIDR values from `/cpus`), `InterruptController` on the GIC's
      distributor, `CpuInterrupts` on the generic timer and the GIC's CPU interface (an SGI for

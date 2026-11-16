@@ -28,6 +28,7 @@ mod platform;
 #[expect(unsafe_code)]
 mod sync;
 
+mod device;
 mod elf;
 mod fs;
 mod irq;

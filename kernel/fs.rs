@@ -18,8 +18,8 @@
 //! the terminal; reads and writes on it go to the console server instead.
 //!
 //! Paths are normalised before use: components are separated by any number of `/`, `.` is
-//! dropped and `..` goes up one level. There is no current directory: every path starts at the
-//! root.
+//! dropped and `..` goes up one level. There is no current directory: a path starts at the root,
+//! unless it is relative to an open directory (`openat`).
 
 use crate::arch::phys;
 use crate::sync::Lock;
@@ -69,7 +69,16 @@ impl Path {
 
     /// Normalises `raw` (see the module documentation).
     fn parse(raw: &[u8]) -> Result<Path, i64> {
-        let mut path = Path::ROOT;
+        Path::parse_from(Path::ROOT, raw)
+    }
+
+    /// Normalises `raw`, starting at directory `base` unless it is absolute.
+    fn parse_from(base: Path, raw: &[u8]) -> Result<Path, i64> {
+        let mut path = if raw.starts_with(b"/") {
+            Path::ROOT
+        } else {
+            base
+        };
         for component in raw.split(|&b| b == b'/') {
             match component {
                 b"" | b"." => {}
@@ -323,12 +332,14 @@ pub(crate) fn init(archive: &[u8]) -> usize {
 
 /// Opens `path` with `O_*` `flags` and returns a new open file description.
 ///
+/// A relative `path` starts at the directory that open file description `dir` refers to
+/// (`-ENOTDIR` if it is not a directory), or at the root without one.
+///
 /// As in POSIX: `O_CREAT` creates a missing file in an existing directory,
 /// `O_EXCL` fails if it exists, `O_TRUNC` empties it, `O_APPEND` makes every
 /// write go to its end and `O_DIRECTORY` insists on a directory. A directory
 /// can only be opened for reading (with `getdents64`).
-pub(crate) fn open(raw_path: &[u8], flags: u64) -> Result<usize, i64> {
-    let path = Path::parse(raw_path)?;
+pub(crate) fn open(dir: Option<usize>, raw_path: &[u8], flags: u64) -> Result<usize, i64> {
     let (read, write) = match flags & O_ACCMODE {
         O_RDONLY => (true, false),
         O_WRONLY => (false, true),
@@ -336,6 +347,19 @@ pub(crate) fn open(raw_path: &[u8], flags: u64) -> Result<usize, i64> {
         _ => return Err(-EINVAL),
     };
     let mut fs = FS.lock();
+    let base = match dir {
+        None => Path::ROOT,
+        // The terminal's description has no node of its own.
+        Some(ofd) if ofd == CONSOLE => return Err(-ENOTDIR),
+        Some(ofd) => {
+            let node = &fs.nodes[fs.open[ofd].node];
+            if node.kind != Kind::Dir {
+                return Err(-ENOTDIR);
+            }
+            node.path
+        }
+    };
+    let path = Path::parse_from(base, raw_path)?;
     let slot = (0..MAX_OPEN)
         .find(|&i| i != CONSOLE && fs.open[i].refs == 0)
         .ok_or(-ENFILE)?;

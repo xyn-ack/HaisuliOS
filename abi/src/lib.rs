@@ -2,13 +2,16 @@
 
 //! The HaisuliOS ABI.
 //!
-//! System call numbers, error numbers and IPC protocols shared by the kernel and all user programs.
+//! System call numbers, error numbers, IPC protocols and device descriptions shared by the kernel
+//! and all user programs.
 //!
-//! Sharing one crate means the two sides cannot drift apart. System calls use the `syscall`
-//! instruction: `rax` holds the number, the arguments are in `rdi rsi rdx r10 r8 r9` and the result
-//! comes back in `rax` (a negative errno on failure). File and memory calls use the Linux x86_64
-//! numbers; HaisuliOS-native calls start at 0x1000. POSIX processes are not system calls: they are
-//! the process server's protocol, [`proc`].
+//! Sharing one crate means the two sides cannot drift apart. The system call convention is the
+//! architecture's Linux one: on x86_64 the `syscall` instruction, with the number in `rax`, the
+//! arguments in `rdi rsi rdx r10 r8 r9` and the result in `rax`; on arm64 `svc #0`, with the
+//! number in `x8`, the arguments in `x0` to `x5` and the result in `x0`. A negative result is an
+//! error number. File, memory and thread calls use the architecture's Linux numbers (see [`nr`]);
+//! HaisuliOS-native calls start at 0x1000, the same on every architecture. POSIX processes are not
+//! system calls: they are the process server's protocol, [`proc`].
 //!
 //! A *task* is an address space with one or more *threads*. Both have ids from the same range: a
 //! task's id is the id of the thread it started with (its *leader*), and stays its id after that
@@ -17,74 +20,105 @@
 
 #![no_std]
 
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("HaisuliOS runs on x86_64 and arm64 (aarch64) only");
+
+/// The value of a constant on the architecture being built for, from a list of
+/// `"architecture" => value` pairs (one for every architecture that has the constant).
+macro_rules! per_arch {
+    ($($arch:literal => $value:expr),+ $(,)?) => {{
+        $(
+            #[cfg(target_arch = $arch)]
+            const VALUE: u64 = $value;
+        )+
+        VALUE
+    }};
+}
+
 /// System call numbers.
 ///
 /// The kernel implements mechanisms only. POSIX process management (`fork`, `exit`, `wait4`,
 /// `getpid`, process groups, signals...) is not a system call: the process server implements it,
 /// and programs reach it through the [`proc`] protocol.
+///
+/// The calls that Linux has too take its numbers, which differ between architectures: x86_64 has
+/// its own table, arm64 the generic one. Some x86_64 calls do not exist on arm64 at all: there,
+/// [`OPENAT`](nr::OPENAT) replaces `open` and [`DUP3`](nr::DUP3) replaces `dup2`, which
+/// HaisuliOS has on x86_64 only (so that a libc for x86_64 finds them). The HaisuliOS-native
+/// calls, from 0x1000 on, are the same everywhere.
 pub mod nr {
-    // Files and memory, with Linux x86_64 numbers.
+    // Files and memory, with Linux numbers.
 
     /// `(fd, buf, len)`: reads from a file, or from the terminal (the console server).
-    pub const READ: u64 = 0;
+    pub const READ: u64 = per_arch!("x86_64" => 0, "aarch64" => 63);
     /// `(fd, buf, len)`: writes to a file, or to the terminal (the console server).
-    pub const WRITE: u64 = 1;
-    /// `(path, flags, mode)`: opens a file and returns the lowest free descriptor.
+    pub const WRITE: u64 = per_arch!("x86_64" => 1, "aarch64" => 64);
+    /// `(path, flags, mode)`: opens a file and returns the lowest free descriptor; x86_64 only
+    /// (`openat(AT_FDCWD, path, flags, mode)` everywhere).
     ///
     /// `path` is NUL-terminated; `flags` take the [`O_*`](super::fcntl) values.
+    #[cfg(target_arch = "x86_64")]
     pub const OPEN: u64 = 2;
+    /// `(dirfd, path, flags, mode)`: opens a file and returns the lowest free descriptor.
+    ///
+    /// A relative `path` starts at directory `dirfd`, or at the root for
+    /// [`AT_FDCWD`](super::fcntl::AT_FDCWD) (there is no current directory); an absolute one
+    /// ignores `dirfd`. `path` is NUL-terminated; `flags` take the [`O_*`](super::fcntl) values.
+    pub const OPENAT: u64 = per_arch!("x86_64" => 257, "aarch64" => 56);
     /// `(fd)`: closes a file descriptor.
-    pub const CLOSE: u64 = 3;
+    pub const CLOSE: u64 = per_arch!("x86_64" => 3, "aarch64" => 57);
     /// `(addr, len, prot, flags, fd, offset)`: maps anonymous memory; the kernel picks the address.
-    pub const MMAP: u64 = 9;
+    pub const MMAP: u64 = per_arch!("x86_64" => 9, "aarch64" => 222);
     /// `()`: lets the other ready threads run.
-    pub const SCHED_YIELD: u64 = 24;
+    pub const SCHED_YIELD: u64 = per_arch!("x86_64" => 24, "aarch64" => 124);
     /// `(fd)`: duplicates `fd` onto the lowest free descriptor.
-    pub const DUP: u64 = 32;
-    /// `(fd, newfd)`: makes `newfd` a copy of `fd`, closing it first if needed.
+    pub const DUP: u64 = per_arch!("x86_64" => 32, "aarch64" => 23);
+    /// `(fd, newfd)`: makes `newfd` a copy of `fd`, closing it first if needed; x86_64 only
+    /// ([`DUP3`] everywhere).
+    #[cfg(target_arch = "x86_64")]
     pub const DUP2: u64 = 33;
+    /// `(fd, newfd, flags)`: as `dup2`, but `fd` and `newfd` must differ (`-EINVAL`), and
+    /// `flags` must be 0 (there is no `O_CLOEXEC` yet).
+    pub const DUP3: u64 = per_arch!("x86_64" => 292, "aarch64" => 24);
     /// `()`: returns from an upcall (a signal handler), restoring the interrupted context.
     ///
-    /// Only an upcall's restorer may call it, with the stack as the kernel left it (pointing at
-    /// the frame's `ucontext`; see [`TASK_UPCALL`]).
-    pub const RT_SIGRETURN: u64 = 15;
-    /// `(fd, cmd, arg)`: only `F_DUPFD` (duplicate onto the lowest free
-    /// descriptor that is at least `arg`).
-    pub const FCNTL: u64 = 72;
-    /// `(from, num, turn_on)`: grants (or revokes) I/O ports `from..from + num`.
-    ///
-    /// Only privileged tasks may use it, for ports below [`IO_PORTS`](super::IO_PORTS).
-    pub const IOPERM: u64 = 173;
+    /// Only an upcall's restorer may call it, with the stack as the kernel left it (see
+    /// [`upcall`](super::upcall) and [`TASK_UPCALL`]).
+    pub const RT_SIGRETURN: u64 = per_arch!("x86_64" => 15, "aarch64" => 139);
+    /// `(fd, cmd, arg)`: only `F_DUPFD` (duplicate onto the lowest free descriptor that is at
+    /// least `arg`) and `F_GETFD` (0 for an open descriptor: there are no descriptor flags yet).
+    pub const FCNTL: u64 = per_arch!("x86_64" => 72, "aarch64" => 25);
     /// `(fd, buf, len)`: reads directory entries (Linux `struct linux_dirent64`).
     ///
     /// Returns the number of bytes filled, 0 at the end of the directory.
-    pub const GETDENTS64: u64 = 217;
+    pub const GETDENTS64: u64 = per_arch!("x86_64" => 217, "aarch64" => 61);
 
-    // Threads and CPUs, with Linux x86_64 numbers.
+    // Threads and CPUs, with Linux numbers.
 
-    /// `(flags, stack, parent_tid, child_tid, tls)`: starts a thread in the caller's task.
+    /// `(flags, stack, ...)`: starts a thread in the caller's task.
     ///
     /// `flags` must be [`clone::THREAD_FLAGS`](super::clone::THREAD_FLAGS) (new processes come
-    /// from the process server's `fork`); the other arguments but `stack` are ignored. The new
-    /// thread shares the task's address space, file descriptors and everything else; it returns
-    /// 0 from this call on `stack`, with every other register as the caller had it. The caller
-    /// gets the new thread's id. Fails with `-EAGAIN` when no thread slot is free.
-    pub const CLONE: u64 = 56;
+    /// from the process server's `fork`); the other arguments but `stack` are ignored (their
+    /// order differs between the architectures, as on Linux). The new thread shares the task's
+    /// address space, file descriptors and everything else; it returns 0 from this call on
+    /// `stack`, with every other register as the caller had it. The caller gets the new thread's
+    /// id. Fails with `-EAGAIN` when no thread slot is free.
+    pub const CLONE: u64 = per_arch!("x86_64" => 56, "aarch64" => 220);
     /// `(status)`: ends the calling thread (Linux `exit`, not `exit_group`).
     ///
     /// When the last thread of a task ends, the task ends as with [`TASK_EXIT`]. Programs end
     /// their process through the process server instead (its `OP_EXIT`), which ends every thread.
-    pub const EXIT: u64 = 60;
+    pub const EXIT: u64 = per_arch!("x86_64" => 60, "aarch64" => 93);
     /// `()`: the calling thread's id.
-    pub const GETTID: u64 = 186;
+    pub const GETTID: u64 = per_arch!("x86_64" => 186, "aarch64" => 178);
     /// `(pid, len, mask)`: writes the set of CPUs the caller may run on (every online CPU, one
     /// bit each) to `mask[..len]`.
     ///
     /// `pid` must be 0 (the caller: the kernel knows no pids). Returns the bytes written (8).
-    pub const SCHED_GETAFFINITY: u64 = 204;
+    pub const SCHED_GETAFFINITY: u64 = per_arch!("x86_64" => 204, "aarch64" => 123);
     /// `(cpu, node, cache)`: stores the number of the CPU the caller runs on (from 0) in `*cpu`,
     /// and 0 in `*node`; either pointer may be null, `cache` is ignored.
-    pub const GETCPU: u64 = 309;
+    pub const GETCPU: u64 = per_arch!("x86_64" => 309, "aarch64" => 168);
 
     // HaisuliOS-native microkernel calls.
 
@@ -177,12 +211,25 @@ pub mod nr {
     /// `()`: powers the machine off. Privileged tasks only.
     pub const POWER_OFF: u64 = 0x1017;
     /// `(buf, len)`: sends `buf[..len]` as it is out of the serial line that the kernel's debug
-    /// log uses (COM1). Privileged tasks only.
+    /// log uses (the [`device::CONSOLE`](super::device::CONSOLE) device). Privileged tasks only.
     ///
     /// The kernel is the line's one transmitter: what one call sends never mixes with the
     /// kernel's log lines, nor with the output of other CPUs. The console server sends the
     /// terminal's output this way (it still drives the rest of the UART itself).
     pub const SERIAL_WRITE: u64 = 0x101A;
+    /// `(device, buf, len)`: fills `buf` with a [`DeviceInfo`](super::device::DeviceInfo) about
+    /// device `device` (one of the ids in [`device`](super::device)).
+    ///
+    /// Fails with `-ENODEV` if the machine has no such device.
+    pub const DEVICE_INFO: u64 = 0x101B;
+    /// `(device)`: gives the (privileged) caller the registers of device `device`, for a driver.
+    ///
+    /// For registers in the I/O port space (the PC's), the caller may use those ports from then
+    /// on, and gets the first one back; for memory-mapped registers, they are mapped into the
+    /// caller's address space (uncached), and it gets their address. The grant lasts until the
+    /// program ends (or `execve`s). Fails with `-EPERM` for an unprivileged caller, and with
+    /// `-ENODEV` if the machine has no such device.
+    pub const DEVICE_GRANT: u64 = 0x101C;
 }
 
 /// The flags of [`nr::CLONE`] (Linux values).
@@ -231,6 +278,8 @@ pub mod errno {
     pub const ENOEXEC: i64 = 8;
     /// Resource busy (e.g. an IRQ line or service that is already taken).
     pub const EBUSY: i64 = 16;
+    /// No such device.
+    pub const ENODEV: i64 = 19;
     /// File exists (`O_CREAT | O_EXCL`).
     pub const EEXIST: i64 = 17;
     /// Not a directory.
@@ -273,6 +322,7 @@ pub mod errno {
             EACCES => "Permission denied",
             EFAULT => "Bad address",
             EBUSY => "Device or resource busy",
+            ENODEV => "No such device",
             EEXIST => "File exists",
             ENOTDIR => "Not a directory",
             EISDIR => "Is a directory",
@@ -300,7 +350,7 @@ pub mod mman {
     pub const PROT_EXEC: u64 = 4;
 }
 
-/// File access: `OPEN` flags, `FCNTL` commands and directory entries (Linux values).
+/// File access: `OPENAT` flags, `FCNTL` commands and directory entries (Linux values).
 pub mod fcntl {
     /// Open for reading only.
     pub const O_RDONLY: u64 = 0;
@@ -318,11 +368,17 @@ pub mod fcntl {
     pub const O_TRUNC: u64 = 0o1000;
     /// Every write goes to the end of the file.
     pub const O_APPEND: u64 = 0o2000;
-    /// Fail with `ENOTDIR` unless the path is a directory.
-    pub const O_DIRECTORY: u64 = 0o200000;
+    /// Fail with `ENOTDIR` unless the path is a directory (arm64's value differs from x86_64's).
+    pub const O_DIRECTORY: u64 = per_arch!("x86_64" => 0o200000, "aarch64" => 0o40000);
+
+    /// `OPENAT`'s `dirfd` for paths relative to the current directory: HaisuliOS has none, so
+    /// they start at the root.
+    pub const AT_FDCWD: u64 = -100i64 as u64;
 
     /// `FCNTL`: duplicate onto the lowest free descriptor that is at least `arg`.
     pub const F_DUPFD: u64 = 0;
+    /// `FCNTL`: the descriptor's flags (always 0: there is no `FD_CLOEXEC` yet), or `EBADF`.
+    pub const F_GETFD: u64 = 1;
 
     /// Longest path, in bytes (without the terminating NUL).
     pub const PATH_MAX: usize = 127;
@@ -371,12 +427,13 @@ pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
 /// [`proc::OP_EXEC`].
 ///
 /// An *argument block* is `[argc: u64, envc: u64]` followed by NUL-terminated strings: the path
-/// of the program, then `argc` arguments, then `envc` environment strings. [`build`] makes one.
+/// of the program, then `argc` arguments, then `envc` environment strings.
+/// [`build`](exec::build) makes one.
 ///
-/// A program starts with the System V x86_64 initial stack, as on Linux: the stack pointer points
+/// A program starts with the System V initial stack, as on Linux: the stack pointer points
 /// at `argc`, followed by the `argv` pointers and a null pointer, the `envp` pointers and a null
 /// pointer, and an empty auxiliary vector (`AT_NULL`). The strings lie above them, below
-/// [`USER_STACK_TOP`](super::USER_STACK_TOP).
+/// [`USER_STACK_TOP`].
 pub mod exec {
     use super::errno::{E2BIG, EINVAL};
 
@@ -417,13 +474,14 @@ pub mod exec {
 
 /// Upcalls: the kernel mechanism under POSIX signal handlers.
 ///
-/// [`nr::TASK_UPCALL`] takes [`WORDS`] words: `[handler, restorer, arg, sender, mask, flags]`.
-/// When the task next returns to user mode, the kernel pushes a Linux x86_64 signal frame
-/// (`struct rt_sigframe`) below its stack pointer and enters `handler(arg, &siginfo, &ucontext)`,
-/// returning to `restorer`. `siginfo.si_signo` is `arg` and `si_pid` is `sender`. The kernel does
-/// not interpret `mask`: it stores it as the frame's `uc_sigmask`, for the restorer to hand back
-/// to whoever manages signal masks. The restorer ends with [`nr::RT_SIGRETURN`], which restores
-/// the registers saved in the frame.
+/// [`nr::TASK_UPCALL`] takes [`WORDS`](upcall::WORDS) words:
+/// `[handler, restorer, arg, sender, mask, flags]`. When the task next returns to user mode, the
+/// kernel pushes the architecture's Linux signal frame (`struct rt_sigframe`) below its stack
+/// pointer and enters `handler(arg, &siginfo, &ucontext)`, returning to `restorer`.
+/// `siginfo.si_signo` is `arg` and `si_pid` is `sender`. The kernel does not interpret `mask`: it
+/// stores it as the frame's `uc_sigmask`, for the restorer to hand back to whoever manages signal
+/// masks (it finds it at [`UC_SIGMASK`](upcall::UC_SIGMASK)). The restorer ends with
+/// [`nr::RT_SIGRETURN`], which restores the registers saved in the frame.
 ///
 /// Posting an upcall also ends an interruptible wait of the thread that takes it (`ipc_recv`,
 /// `svc_wait` or a terminal `read`) with `-EINTR`. The thread enters the handler when it next
@@ -437,10 +495,15 @@ pub mod upcall {
     /// Flag: `tid` names a thread of the task, the one to enter the handler. Otherwise the kernel
     /// picks one: a thread in an interruptible wait, else one that is running or ready, else any.
     pub const THREAD: u64 = 2;
-    /// Where `uc_sigmask` (the `mask` of the request) is, counted from the `ucontext`.
+    /// Where the frame's `uc_sigmask` (the `mask` of the request) is, counted from the stack
+    /// pointer that the restorer starts with.
     ///
-    /// When the handler returns to the restorer, the stack pointer points at the `ucontext`.
-    pub const UC_SIGMASK: usize = 296;
+    /// That is the frame's layout, which is the architecture's. On x86_64, the handler's return
+    /// took the restorer's address (`pretcode`) off the frame, and the stack pointer points at
+    /// the `ucontext`, whose `uc_sigmask` is 296 bytes in. On arm64, the handler returns through
+    /// the link register, and the stack pointer still points at the frame: `siginfo` (128 bytes),
+    /// then the `ucontext`, whose `uc_sigmask` is 40 bytes in.
+    pub const UC_SIGMASK: usize = per_arch!("x86_64" => 296, "aarch64" => 128 + 40) as usize;
 }
 
 /// What a task is doing, as [`TaskInfo::state`] reports it.
@@ -504,7 +567,7 @@ impl TaskInfo {
     }
 }
 
-/// Signal numbers and dispositions (the Linux x86_64 values).
+/// Signal numbers and dispositions (the Linux values, which are the same on x86_64 and arm64).
 pub mod signal {
     /// Hangup.
     pub const SIGHUP: u64 = 1;
@@ -736,22 +799,48 @@ impl ProcInfo {
     }
 }
 
-/// The 16550 UART of the serial console: registers and their bits.
+/// Declares an enum of flags (bits of one 8-bit register) with a `bits` function that combines
+/// several of them into the register value.
+macro_rules! flags {
+    ($(#[$meta:meta])* enum $name:ident: $ty:ty {
+        $($(#[$variant_meta:meta])* $variant:ident = $value:expr,)*
+    }) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        #[repr($ty)]
+        pub enum $name {
+            $($(#[$variant_meta])* $variant = $value,)*
+        }
+
+        impl $name {
+            /// The register value with exactly `flags` set.
+            pub const fn bits(flags: &[$name]) -> $ty {
+                let mut bits = 0;
+                let mut i = 0;
+                while i < flags.len() {
+                    bits |= flags[i] as $ty;
+                    i += 1;
+                }
+                bits
+            }
+        }
+    };
+}
+
+/// The 16550 UART: registers and their bits.
 ///
 /// Shared by the kernel's debug log and the user-space console driver, which
 /// program the same device (Linux likewise exports `serial_reg.h` to user
 /// space). Register values are written as `bits(&[...])` of their flags.
-pub mod uart {
-    /// The base I/O port of COM1.
-    pub const COM1: u16 = 0x3F8;
-    /// I/O ports of one UART, from its base.
-    pub const PORTS: u16 = 8;
-    /// The IRQ line of COM1.
-    pub const COM1_IRQ: u64 = 4;
+/// Where a 16550 is (the PC's COM1 is at I/O ports `0x3F8` to `0x3FF`) is the
+/// machine's business: see [`device`].
+pub mod uart16550 {
+    /// Registers of one UART, one byte apart.
+    pub const REGISTERS: u64 = 8;
     /// The divisor for 38400 baud (the UART's clock is 115200 Hz).
     pub const DIVISOR_38400: u16 = 3;
 
-    /// The UART's registers, by offset from the base port.
+    /// The UART's registers, by offset from the first.
     #[derive(Clone, Copy, PartialEq, Eq)]
     #[repr(u16)]
     pub enum Register {
@@ -776,35 +865,9 @@ pub mod uart {
         pub const DIVISOR_HIGH: Register = Register::InterruptEnable;
     }
 
-    macro_rules! flags {
-        ($(#[$meta:meta])* enum $name:ident {
-            $($(#[$variant_meta:meta])* $variant:ident = $value:expr,)*
-        }) => {
-            $(#[$meta])*
-            #[derive(Clone, Copy, PartialEq, Eq)]
-            #[repr(u8)]
-            pub enum $name {
-                $($(#[$variant_meta])* $variant = $value,)*
-            }
-
-            impl $name {
-                /// The register value with exactly `flags` set.
-                pub const fn bits(flags: &[$name]) -> u8 {
-                    let mut bits = 0;
-                    let mut i = 0;
-                    while i < flags.len() {
-                        bits |= flags[i] as u8;
-                        i += 1;
-                    }
-                    bits
-                }
-            }
-        };
-    }
-
     flags! {
         /// [`Register::InterruptEnable`] bits.
-        enum InterruptEnable {
+        enum InterruptEnable: u8 {
             /// A byte has been received.
             ReceivedData = 0x01,
         }
@@ -812,7 +875,7 @@ pub mod uart {
 
     flags! {
         /// [`Register::FifoControl`] bits.
-        enum FifoControl {
+        enum FifoControl: u8 {
             /// Use the FIFOs.
             Enable = 0x01,
             /// Empty the receive FIFO.
@@ -826,7 +889,7 @@ pub mod uart {
 
     flags! {
         /// [`Register::LineControl`] bits.
-        enum LineControl {
+        enum LineControl: u8 {
             /// 8 data bits (with no parity and one stop bit: "8N1").
             Word8 = 0x03,
             /// DLAB: registers 0 and 1 hold the baud-rate divisor.
@@ -836,7 +899,7 @@ pub mod uart {
 
     flags! {
         /// [`Register::ModemControl`] bits.
-        enum ModemControl {
+        enum ModemControl: u8 {
             /// DTR: data terminal ready.
             DataTerminalReady = 0x01,
             /// RTS: request to send.
@@ -848,7 +911,7 @@ pub mod uart {
 
     flags! {
         /// [`Register::LineStatus`] bits.
-        enum LineStatus {
+        enum LineStatus: u8 {
             /// A received byte is waiting in [`Register::Data`].
             DataReady = 0x01,
             /// The transmit holding register can take another byte.
@@ -857,8 +920,166 @@ pub mod uart {
     }
 }
 
-/// Number of legacy I/O ports (0..IO_PORTS) that `IOPERM` can grant.
-pub const IO_PORTS: u64 = 0x400;
+/// The ARM PrimeCell UART (PL011): registers and their bits.
+///
+/// The console device of arm64 machines such as QEMU's `virt`. Its registers are memory-mapped,
+/// 32 bits wide, at the offsets of [`Register`](pl011::Register).
+pub mod pl011 {
+    /// Bytes of its register block.
+    pub const REGISTERS: u64 = 0x1000;
+
+    /// The UART's registers, by byte offset.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[repr(u64)]
+    pub enum Register {
+        /// Data: the received byte (read), the byte to send (write).
+        Data = 0x00,
+        /// Flags (see [`Flag`]).
+        Flag = 0x18,
+        /// Line control: the word format and the FIFOs (see [`LineControl`]).
+        LineControl = 0x2C,
+        /// Control: enables (see [`Control`]).
+        Control = 0x30,
+        /// Interrupt mask: which events raise the interrupt (see [`Interrupt`]).
+        InterruptMask = 0x38,
+        /// Interrupt clear: write the [`Interrupt`] bits to clear.
+        InterruptClear = 0x44,
+    }
+
+    flags! {
+        /// [`Register::Flag`] bits.
+        enum Flag: u32 {
+            /// The receive FIFO is empty.
+            ReceiveEmpty = 1 << 4,
+            /// The transmit FIFO is full.
+            TransmitFull = 1 << 5,
+        }
+    }
+
+    flags! {
+        /// [`Register::LineControl`] bits.
+        enum LineControl: u32 {
+            /// Use the FIFOs.
+            Fifos = 1 << 4,
+            /// 8 data bits (with no parity and one stop bit: "8N1").
+            Word8 = 0b11 << 5,
+        }
+    }
+
+    flags! {
+        /// [`Register::Control`] bits.
+        enum Control: u32 {
+            /// The UART is enabled.
+            Enable = 1 << 0,
+            /// The transmitter is enabled.
+            Transmit = 1 << 8,
+            /// The receiver is enabled.
+            Receive = 1 << 9,
+        }
+    }
+
+    flags! {
+        /// Interrupt bits ([`Register::InterruptMask`], [`Register::InterruptClear`]).
+        enum Interrupt: u32 {
+            /// A byte was received (the receive FIFO reached its trigger level).
+            Receive = 1 << 4,
+            /// Received bytes have waited in the FIFO for a while.
+            ReceiveTimeout = 1 << 6,
+        }
+    }
+}
+
+/// Devices: what user-space drivers get from [`nr::DEVICE_INFO`] and [`nr::DEVICE_GRANT`].
+///
+/// The machine (the kernel's platform) describes its devices; a driver asks for one by a
+/// well-known id, learns what it is, where its registers are and which interrupt line it raises,
+/// and then gets its registers granted. So the console server runs the same on a PC (a 16550 in
+/// the I/O port space, IRQ 4) as on an arm64 machine (a PL011, memory-mapped).
+pub mod device {
+    use super::PROC_NAME_LEN;
+
+    /// The serial line of the console: the one the kernel's log goes out on, whose input the
+    /// console server handles.
+    pub const CONSOLE: u64 = 1;
+
+    /// [`DeviceInfo::kind`]: a 16550 UART (see [`uart16550`](super::uart16550)).
+    pub const KIND_UART_16550: u64 = 1;
+    /// [`DeviceInfo::kind`]: a PL011 UART (see [`pl011`](super::pl011)).
+    pub const KIND_UART_PL011: u64 = 2;
+
+    /// [`DeviceInfo::space`]: the registers are I/O ports (the PC's), one per register.
+    pub const SPACE_PORTS: u64 = 1;
+    /// [`DeviceInfo::space`]: the registers are memory-mapped.
+    pub const SPACE_MMIO: u64 = 2;
+
+    /// [`DeviceInfo::irq`] of a device that raises no interrupt.
+    pub const NO_IRQ: u64 = u64::MAX;
+
+    /// What [`nr::DEVICE_INFO`](super::nr::DEVICE_INFO) reports about a device.
+    ///
+    /// It is serialised as [`DEVICE_INFO_LEN`] bytes, so that neither side needs unsafe code to
+    /// move it across the system call boundary.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct DeviceInfo {
+        /// What the device is: one of the `KIND_*` values.
+        pub kind: u64,
+        /// Where its registers are: [`SPACE_PORTS`] or [`SPACE_MMIO`].
+        pub space: u64,
+        /// The first register: an I/O port, or a physical address.
+        pub base: u64,
+        /// The size of the register block: ports, or bytes.
+        pub len: u64,
+        /// The interrupt line it raises (for `IRQ_BIND`), or [`NO_IRQ`].
+        pub irq: u64,
+        /// The machine's name for it (such as `COM1`), NUL-padded.
+        pub name: [u8; PROC_NAME_LEN],
+    }
+
+    /// Serialised size of a [`DeviceInfo`].
+    pub const DEVICE_INFO_LEN: usize = 5 * 8 + PROC_NAME_LEN;
+
+    impl DeviceInfo {
+        /// Serialises the description.
+        pub fn to_bytes(&self) -> [u8; DEVICE_INFO_LEN] {
+            let mut b = [0u8; DEVICE_INFO_LEN];
+            let words = [self.kind, self.space, self.base, self.len, self.irq];
+            for (i, v) in words.iter().enumerate() {
+                b[i * 8..i * 8 + 8].copy_from_slice(&v.to_ne_bytes());
+            }
+            b[40..].copy_from_slice(&self.name);
+            b
+        }
+
+        /// Parses a description written by [`to_bytes`](Self::to_bytes).
+        pub fn from_bytes(b: &[u8; DEVICE_INFO_LEN]) -> DeviceInfo {
+            let word = |i: usize| {
+                let mut w = [0u8; 8];
+                w.copy_from_slice(&b[i * 8..i * 8 + 8]);
+                u64::from_ne_bytes(w)
+            };
+            let mut name = [0u8; PROC_NAME_LEN];
+            name.copy_from_slice(&b[40..]);
+            DeviceInfo {
+                kind: word(0),
+                space: word(1),
+                base: word(2),
+                len: word(3),
+                irq: word(4),
+                name,
+            }
+        }
+
+        /// The device's name as text.
+        pub fn name(&self) -> &str {
+            let n = self
+                .name
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(PROC_NAME_LEN);
+            core::str::from_utf8(&self.name[..n]).unwrap_or("?")
+        }
+    }
+}
 
 /// Well-known service identifiers for `SVC_REGISTER` / `SVC_LOOKUP`.
 pub mod svc {
@@ -905,8 +1126,8 @@ pub mod console {
 /// and signals. The user runtime turns the POSIX calls into these requests.
 ///
 /// The call buffer of a request is an array of native-endian `u64` words, whose meaning is listed
-/// with each operation (except for [`OP_LIST`] and [`OP_EXEC`]); words marked *out* are written by
-/// the server. The reply is the
+/// with each operation (except for [`OP_LIST`](proc::OP_LIST) and [`OP_EXEC`](proc::OP_EXEC));
+/// words marked *out* are written by the server. The reply is the
 /// POSIX call's result, or a negative errno. The calls take the same arguments as their Linux
 /// counterparts and follow the same rules; pids are the server's, not kernel task ids.
 pub mod proc {

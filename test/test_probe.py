@@ -80,6 +80,18 @@ def test_a_blocked_signal_waits_for_the_action_it_meets_when_unblocked(sh):
     probe(sh, "blocked-ignored")
 
 
+def test_files_openat_dup3_and_the_x86_only_calls(sh):
+    # arm64 has only `openat` and `dup3`; the runtime uses them everywhere, and x86_64 keeps its
+    # `open` and `dup2` for a libc.
+    probe(sh, "files")
+
+
+def test_devices_are_described_and_granted_to_privileged_programs_only(sh):
+    out = probe(sh, "devices")
+    # The PC's console: COM1, a 16550 (kind 1) in the I/O port space (space 1).
+    assert "console: COM1 kind 1 space 1 base 0x3f8 len 8 irq 4\n" in out, out
+
+
 def test_execve_keeps_and_resets_what_posix_says(sh):
     probe(sh, "exec")
 

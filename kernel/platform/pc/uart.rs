@@ -6,7 +6,7 @@
 //! to the user-space console server, which drives the rest of the UART itself.
 
 use crate::arch::x86_64::cpu::Device::Com1;
-use haisuli_abi::uart::{
+use haisuli_abi::uart16550::{
     FifoControl, LineControl, LineStatus, ModemControl, Register, DIVISOR_38400,
 };
 

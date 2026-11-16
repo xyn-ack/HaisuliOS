@@ -33,7 +33,7 @@ More documents:
 | `mmap` (anonymous)                                    | Shell redirections (`>`, `>>`, `<`, `2>&1`) |
 | RAM file system (the unpacked ramdisk), file descriptors | Programs in `/bin` (`user/coreutils`, and the test programs `user/probe_test` and `user/smp_test`) |
 | IPC: async notifications + synchronous calls with data transfer |                                   |
-| IRQ forwarding, per-task I/O-port permissions         |                                             |
+| IRQ forwarding, device grants to drivers (I/O ports)  |                                             |
 | ELF loader: boot modules, and programs from the file system (argv/envp on the stack) |             |
 | Well-known service registry                           |                                             |
 | Exceptions -> end the task, report it to the task manager |                                         |
@@ -57,8 +57,10 @@ behind a VFS; a libc (a musl port) and more drivers are planned too (see
 
 ```
 kernel/           the kernel: boot, CPUs, memory, tasks and threads, IPC, the RAM file system
-abi/              system call numbers, errno values and IPC protocols (kernel + user)
-user/rt/          user runtime: entry point, system calls, POSIX process calls, threads, print!
+abi/              system call numbers (per architecture), errno values, IPC protocols and
+                  device descriptions (kernel + user)
+user/rt/          user runtime: entry point, system calls, POSIX process calls, threads, print!,
+                  device access; all of user space's assembly, in src/arch/
 user/proc/        process server: POSIX processes, signals and execve
 user/console/     console server (/sbin/console)
 user/init/        init (pid 1): /etc/motd, then a job control shell
@@ -86,13 +88,18 @@ make          # build kernel + user programs, pack rootfs/ and the programs
               # for /sbin and /bin into build/initrd.tar
 make run      # boot in QEMU with an interactive console on your terminal
 make run CPUS=4   # the same, on four CPUs
+make portcheck    # check that the system stays portable to arm64: the user programs
+                  # build for aarch64-unknown-none (see below), and more
 ```
 
 In `make run`, keys (including Ctrl-C) go to HaisuliOS. Type `exit` or press
 Ctrl-D at the prompt to power off, or press **Ctrl-A X** to quit QEMU.
 
 `rust-toolchain.toml` pulls the `x86_64-unknown-none` target automatically and
-the Makefile builds for it (`--target x86_64-unknown-none`). Each image's
+the Makefile builds for it (`--target x86_64-unknown-none`). It also asks for
+`aarch64-unknown-none`, for `make portcheck`; if the stable release that rustup
+picks does not ship that target (rustup then warns that it skips it), give
+`portcheck` a toolchain that does: `make portcheck AARCH64_TOOLCHAIN=+1.98.0`. Each image's
 `build.rs` applies its linker script and links it as a static executable.
 `.cargo/config.toml` only makes plain `cargo build` / `cargo clippy` default to
 the bare-metal target too; outputs land in `target/x86_64-unknown-none/`.
@@ -247,9 +254,9 @@ By design for v0.3; [TODO.md](TODO.md) has the plans for them.
   (`CLONE_SETTLS`); no `munmap`, so a thread stack is reused by later threads
   of the process rather than freed. Signal masks and dispositions belong to the
   process, not to each thread, and a signal goes to a thread in `pause` or
-  `wait4` if there is one, otherwise to one the kernel picks. A thread that
-  calls `ioperm` changes the permissions of the other threads of its task only
-  the next time they are switched to.
+  `wait4` if there is one, otherwise to one the kernel picks. A device granted
+  by one thread becomes usable by the other threads of its task only the next
+  time they are switched to.
 * Programs are static ELF executables of up to 128 KiB (the file system's
   limit), with at most 4 KiB of arguments and environment. There is no
   `PATH`, no close-on-exec and no `#!` scripts. Boot-module memory is not

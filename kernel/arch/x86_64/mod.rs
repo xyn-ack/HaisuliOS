@@ -27,7 +27,7 @@ pub(crate) mod x86;
 use crate::arch::{CpuInterrupts, Processor};
 
 pub(crate) use entry::TrapFrame as UserContext;
-pub(crate) use gdt::{IoBitmap, IO_DENY_ALL};
+pub(crate) use gdt::IoPorts;
 pub(crate) use paging::Paging;
 
 /// `e_machine` of the programs this CPU runs: `EM_X86_64`.
@@ -63,7 +63,7 @@ impl Processor for Cpu {
 
     /// The thread's kernel stack, for interrupts (the TSS) and for `syscall` (the per-CPU
     /// block), and its task's I/O bitmap (the TSS).
-    fn prepare_thread(slot: usize, io: &IoBitmap) {
+    fn prepare_thread(slot: usize, io: &IoPorts) {
         let top = context::stack_top(slot);
         gdt::set_thread(top, io);
         percpu::set_syscall_stack(top);

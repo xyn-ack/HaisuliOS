@@ -3,10 +3,10 @@
 //! Starting the other CPUs.
 //!
 //! The boot CPU wakes every other CPU that the platform lists (by APIC id: on a PC, the ACPI
-//! tables' MADT) with the INIT / start-up IPI sequence. A CPU wakes up in 16-bit real mode at a page below 1 MiB, so the
-//! boot CPU first copies a *trampoline* there: it switches to protected mode and then to long
-//! mode with the boot page tables (the kernel half that every address space shares), and calls
-//! [`crate::ap_main`] on a stack of its own.
+//! tables' MADT) with the INIT / start-up IPI sequence. A CPU wakes up in 16-bit real mode at a
+//! page below 1 MiB, so the boot CPU first copies a *trampoline* there: it switches to protected
+//! mode and then to long mode with the boot page tables (the kernel half that every address space
+//! shares), and calls [`crate::ap_main`] on a stack of its own.
 //!
 //! The CPUs start one at a time: the trampoline's parameters (stack, CPU index) are shared, and
 //! the boot CPU waits until each one has reached Rust code before it starts the next. A CPU that

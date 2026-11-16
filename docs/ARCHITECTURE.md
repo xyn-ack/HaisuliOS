@@ -13,6 +13,7 @@ servers built on them. The [README](../README.md) has the overview and how to bu
 * [Processes](#processes)
 * [Programs](#programs)
 * [Files](#files)
+* [Devices](#devices)
 * [Console server](#console-server)
 * [Signals and job control](#signals-and-job-control)
 
@@ -45,6 +46,9 @@ The architecture's contract (`kernel/arch/mod.rs`):
   halting.
 * `CpuInterrupts`, for `Cpu`: the CPU's own interrupts: starting the tick, sending the
   reschedule IPI to a CPU (by the kernel's index for it, not a hardware id), end of interrupt.
+* `IoPermissions`, for `IoPorts`: the I/O ports a task may use, opaque to generic code (on x86_64
+  the TSS's bitmap); what a device grant does for registers in the I/O port space, which arm64
+  does not have.
   The architecture's interrupt entry tells the generic dispatch (`irq::dispatch`) where an
   interrupt came from as an `Interrupt`: the tick, a reschedule, a platform interrupt line, or
   nothing (spurious), so `irq` knows no vectors.
@@ -56,7 +60,8 @@ as `ELF_MACHINE`, the machine type of the programs the CPU runs.
 The platform's contract (`kernel/platform/mod.rs`), all for `Board`:
 
 * `Machine`: the early console (where the kernel's log goes), a busy-wait for the delays of
-  booting, the hardware ids of the CPUs the firmware lists (`CpuIds`), and powering off.
+  booting, the hardware ids of the CPUs the firmware lists (`CpuIds`), powering off, and the
+  devices that user-space drivers may be given (`Device`; see *Devices*).
 * `BootInfo`: what the boot loader left, in platform-neutral terms: the available memory, the
   memory its own data takes (which the kernel keeps out of the allocator), and the boot modules
   (`Module`: contents and name). Multiboot on the PC; a device tree on arm64.
@@ -69,8 +74,7 @@ boot entry speaks the boot loader's protocol (x86_64's takes the Multiboot hands
 `platform::pc`). So booting reads, in `main.rs`: the platform's early console, the architecture's
 `init_cpu` (with the platform's delays), the frame allocator from the platform's memory map, the
 platform's interrupt controller, the boot modules, then the architecture's `start_cpus` for the
-platform's `cpus()`. [TODO.md](../TODO.md) has the steps that remain (the ABI and user space,
-then arm64 itself).
+platform's `cpus()`. [TODO.md](../TODO.md) has what remains: arm64 itself.
 
 ```
 kernel/            the kernel
@@ -117,12 +121,16 @@ kernel/            the kernel
   task.rs          Tasks and threads, the scheduler of every CPU, task control, upcalls,
                    mmap, IPC, services
   upcall.rs        an upcall request (the handler to enter; the frame is the architecture's)
-  syscall.rs       Syscall dispatcher (Linux-compatible numbers)
+  device.rs        devices for user-space drivers: their descriptions, and granting them
+  syscall.rs       Syscall dispatcher (the architecture's Linux numbers)
   serial.rs        the kernel debug log (and the console's transmitter), print!/println!
-abi/               syscall numbers, errno values, IPC protocols, the 16550 UART's
-                   registers (kernel + user)
+abi/               syscall numbers (per architecture), errno values, IPC protocols,
+                   device descriptions, the 16550's and PL011's registers (kernel + user)
 user/rt/           user runtime: entry point, syscall wrappers, POSIX process calls
                    (requests to the process server), print!, panics
+  src/arch/        all of user space's assembly, one file per architecture: the
+                   system call, _start, the clone and sigreturn stubs, port I/O
+  src/device.rs    a granted device's registers (I/O ports or memory-mapped)
   src/thread.rs    threads: spawn and join, on the kernel's clone and exit
 user/proc/         process server: POSIX processes and signals
   src/signals.rs   dispositions, default actions, signal sets
@@ -168,15 +176,17 @@ make them safe:
   disabled, so only another CPU can hold it while this one waits; if the
   same CPU finds it held, that is re-entrant use, which panics instead of
   deadlocking (or creating aliased `&mut`).
-* `user/rt`: the `syscall` instruction and the start-up code, which reads
+* `user/rt`: all of user space's assembly, in `src/arch/` (one file per
+  architecture: the system call instruction, `_start`, the thread and
+  signal-return stubs, x86's port I/O), and the start-up code, which reads
   the arguments only within the initial stack area. The wrappers
   pass the kernel only pointers taken from borrows of the right length and
   mutability (`&mut` whenever the kernel or an IPC server may write). A
   `write()` buffer can be a shared borrow because the kernel enforces that
   the console server only reads it (see below). `thread` starts a thread
   with `clone` on a stack that no Rust object lives in, and ends it without
-  touching that stack once it has said so.
-* `user/console`: its UART's port I/O (its own 8 registers).
+  touching that stack once it has said so. `device` accesses a device's
+  registers only once the kernel has granted them, and only within them.
 * `user/proc`: handing out its process table, which is too big for the stack,
   as a `&'static mut` from a `static`: once, which an atomic flag enforces.
 
@@ -209,7 +219,7 @@ service to register.
 Before it starts any task, the boot CPU starts the others (see *CPUs and
 threads*) and logs how many run: `[kernel] 4 CPUs online`.
 
-Boot modules and system servers are *privileged*: they may use `ioperm`,
+Boot modules and system servers are *privileged*: they may use `device_grant`,
 `irq_bind`, `svc_register`, `serial_write` and `power_off`. Nothing else is:
 neither copies made with `task_fork` (forked children) nor programs started
 with `execve`.
@@ -300,31 +310,39 @@ ELF loader refuses segments that are both writable and executable.
 
 ## Syscall ABI
 
-`syscall` instruction; `rax` = number; args in `rdi rsi rdx r10 r8 r9`;
-return in `rax` (negative errno on failure). File and memory calls use
-**Linux x86_64 numbers**. All numbers and constants live in `abi/src/lib.rs`.
-There are no process calls: `fork`, `exit`, `wait4`, `getpid`, `kill`,
+The architecture's Linux convention: on x86_64 the `syscall` instruction, with the number in
+`rax`, the arguments in `rdi rsi rdx r10 r8 r9` and the result in `rax`; on arm64 `svc #0`, with
+the number in `x8`, the arguments in `x0` to `x5` and the result in `x0`. A negative result is an
+errno. File, memory and thread calls use **the architecture's Linux numbers**, which differ: x86_64
+has its own table, arm64 the generic one, which lacks `open` and `dup2` (only `openat` and
+`dup3`). The runtime makes the calls that both have; x86_64 keeps `open` and `dup2` for a libc.
+The HaisuliOS-native calls (0x1000 and up) are the same everywhere. All numbers and constants
+live in `abi/src/lib.rs`. There are no process calls: `fork`, `exit`, `wait4`, `getpid`, `kill`,
 `sigaction` and the rest are requests to the process server (see *Processes*).
+
+| x86_64 | arm64  | Call                              | Notes                                                   |
+|--------|--------|-----------------------------------|---------------------------------------------------------|
+| 0      | 63     | `read(fd,buf,len)`                | a file, or the terminal (one line per read)             |
+| 1      | 64     | `write(fd,buf,len)`               | a file, or the terminal                                 |
+| 2      |        | `open(path,flags,mode)`           | x86_64 only: `openat(AT_FDCWD, ...)`                    |
+| 257    | 56     | `openat(dirfd,path,flags,mode)`   | `O_CREAT`/`EXCL`/`TRUNC`/`APPEND`/`DIRECTORY`; no modes; a relative path starts at `dirfd`, or at the root (`AT_FDCWD`: there is no current directory) |
+| 3      | 57     | `close(fd)`                       |                                                         |
+| 9      | 222    | `mmap(_,len,prot,...)`            | anonymous only; kernel chooses the address              |
+| 15     | 139    | `rt_sigreturn()`                  | from an upcall's restorer; restores the saved registers |
+| 24     | 124    | `sched_yield()`                   | lets the other ready threads run                        |
+| 32     | 23     | `dup(fd)`                         | lowest free descriptor; shares the open file description |
+| 33     |        | `dup2(fd,newfd)`                  | x86_64 only                                             |
+| 292    | 24     | `dup3(fd,newfd,flags)`            | `fd` and `newfd` differ; `flags` 0 (no `O_CLOEXEC` yet) |
+| 72     | 25     | `fcntl(fd,cmd,arg)`               | `F_DUPFD` and `F_GETFD` only                            |
+| 56     | 220    | `clone(flags,stack,...)`          | a thread in the caller's task (`clone::THREAD_FLAGS` only) |
+| 60     | 93     | `exit(status)`                    | ends the calling thread (the last one ends the task)    |
+| 186    | 178    | `gettid()`                        | the calling thread's id                                 |
+| 204    | 123    | `sched_getaffinity(0,len,mask)`   | the online CPUs, one bit each                           |
+| 217    | 61     | `getdents64(fd,buf,len)`          | Linux `struct linux_dirent64` records                   |
+| 309    | 168    | `getcpu(&cpu,&node,_)`            | the CPU the caller runs on                              |
 
 | Nr     | Call                              | Notes                                                   |
 |--------|-----------------------------------|---------------------------------------------------------|
-| 0      | `read(fd,buf,len)`                | a file, or the terminal (one line per read)             |
-| 1      | `write(fd,buf,len)`               | a file, or the terminal                                 |
-| 2      | `open(path,flags,mode)`           | `O_CREAT`/`EXCL`/`TRUNC`/`APPEND`/`DIRECTORY`; no modes |
-| 3      | `close(fd)`                       |                                                         |
-| 9      | `mmap(_,len,prot,...)`            | anonymous only; kernel chooses the address              |
-| 15     | `rt_sigreturn()`                  | from an upcall's restorer; restores the saved registers |
-| 24     | `sched_yield()`                   | lets the other ready threads run                        |
-| 32     | `dup(fd)`                         | lowest free descriptor; shares the open file description |
-| 33     | `dup2(fd,newfd)`                  |                                                         |
-| 72     | `fcntl(fd,cmd,arg)`               | `F_DUPFD` only                                          |
-| 173    | `ioperm(from,num,on)`             | privileged; ports `0..0x400` only                       |
-| 56     | `clone(flags,stack,...)`          | a thread in the caller's task (`clone::THREAD_FLAGS` only) |
-| 60     | `exit(status)`                    | ends the calling thread (the last one ends the task)    |
-| 186    | `gettid()`                        | the calling thread's id                                 |
-| 204    | `sched_getaffinity(0,len,mask)`   | the online CPUs, one bit each                           |
-| 217    | `getdents64(fd,buf,len)`          | Linux `struct linux_dirent64` records                   |
-| 309    | `getcpu(&cpu,&node,_)`            | the CPU the caller runs on                              |
 | 0x1000 | `ipc_send(tid,a,b)`               | async; non-blocking; `-EAGAIN` if mailbox (8) is full   |
 | 0x1001 | `ipc_recv(&[u64;4])`              | blocking; `[sender, a, b, task]` (see below)            |
 | 0x1002 | `ipc_call(tid,op,buf,len)`        | synchronous; blocks until the server replies            |
@@ -349,6 +367,8 @@ There are no process calls: `fork`, `exit`, `wait4`, `getpid`, `kill`,
 | 0x1018 | `task_exec(thread,blk,len,flags)` | task manager; the task of a thread blocked in a call to it runs a program from the file system (its other threads end) |
 | 0x1019 | `task_spawn(blk,len,flags)`       | task manager; a program from the file system in a new task |
 | 0x101A | `serial_write(buf,len)`           | privileged; raw bytes out of the serial line, in one piece (the console's output) |
+| 0x101B | `device_info(id,buf,len)`         | a `DeviceInfo`: what the device is, where its registers are, its IRQ line |
+| 0x101C | `device_grant(id)`                | privileged; the device's registers for a driver (see *Devices*) |
 
 Task ids are the kernel's; pids are the process server's. IPC addresses
 tasks, and any thread of a server may receive its calls; a call is made by a
@@ -493,10 +513,26 @@ cat: /nope: no such file
 hello
 ```
 
+## Devices
+
+The kernel drives no devices for user space. The machine (the kernel's platform) describes the
+ones a driver may have, by well-known ids (`abi::device`; so far `CONSOLE`, the serial line):
+what each one is (a 16550 or a PL011), where its registers are (I/O ports, or memory-mapped) and
+which IRQ line it raises. `device_info` tells anyone; `device_grant` gives a privileged task the
+registers, for as long as its program runs: I/O ports become usable (x86's per-task I/O bitmap,
+loaded into the TSS whenever a thread of the task runs), and memory-mapped registers are to be
+mapped into the task's address space (the kernel side of that comes with arm64, the first
+machine that has such devices). Only the devices the machine lists can be granted, and only their
+registers. The runtime's `device` module turns a grant into register access that does not depend
+on where the registers are, so a driver does not depend on the architecture.
+
 ## Console server
 
-`user/console` gets ports `0x3F8..0x3FF` via `ioperm`, binds IRQ 4 and
-registers as the console service. It is a canonical-mode terminal: input is
+`user/console` asks the kernel for the machine's console device
+(`device_info`), gets its registers (`device_grant`), picks its driver by
+the kind of UART it is (a 16550, which the PC has at I/O ports
+`0x3F8..0x3FF`, or a PL011, memory-mapped, on arm64), binds its IRQ line (4
+on a PC) and registers as the console service. It is a canonical-mode terminal: input is
 echoed and can be edited (Backspace, Ctrl-U kills the line, Ctrl-C abandons
 it, cursor-key escape sequences are ignored) until Enter. A `read` then
 returns that line. Ctrl-D on an empty line is end-of-file. Output turns `\n`
@@ -546,7 +582,7 @@ thread on another CPU at once (as POSIX requires of `sigprocmask` and of a
 user mode, at the end of a system call or of an interrupt: a thread busy on
 another CPU is interrupted for it. It pushes a frame on the user stack and
 enters the handler with the signal number, a `siginfo_t` and a
-`ucontext_t`. The frame has the Linux x86_64 layout, so a libc ported later
+`ucontext_t`. The frame has the architecture's Linux layout, so a libc ported later
 finds things where it expects them. The handler returns to its
 `SA_RESTORER`, which hands the saved mask back to the process server and
 calls `rt_sigreturn` to restore the interrupted registers. The kernel treats

@@ -5,8 +5,8 @@
 //! Reads the memory map and boot modules that a Multiboot v1 boot loader left for the kernel.
 //!
 //! Everything it describes stays reserved for the kernel's lifetime (see [`reserved_ranges`]: the
-//! allocator never gets it and [`crate::arch::phys`] refuses it), so it is never written after boot and
-//! can be handed out as `&'static [u8]`.
+//! allocator never gets it and [`crate::arch::phys`] refuses it), so it is never written after
+//! boot and can be handed out as `&'static [u8]`.
 
 use crate::arch::x86_64::x86::flags;
 use core::sync::atomic::{AtomicU64, Ordering};

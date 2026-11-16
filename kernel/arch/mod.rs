@@ -13,7 +13,9 @@
 //!   ([`Cpu`]);
 //! - [`CpuInterrupts`]: the CPU's own interrupts, the scheduler's tick and the reschedule IPI
 //!   ([`Cpu`]). The architecture's interrupt entry tells the generic dispatch
-//!   ([`crate::irq::dispatch`]) where an interrupt came from, as an [`Interrupt`].
+//!   ([`crate::irq::dispatch`]) where an interrupt came from, as an [`Interrupt`];
+//! - [`IoPermissions`]: the I/O ports a task may use, for architectures that have an I/O port
+//!   space (x86's; arm64 has none) ([`IoPorts`]).
 //!
 //! Besides those, generic code uses the modules re-exported below, which every architecture
 //! provides with the same interface: [`context`] (kernel stacks and the context switch),
@@ -38,7 +40,7 @@ use x86_64 as imp;
 
 use core::ops::Range;
 pub(crate) use imp::{context, percpu, phys, upcall};
-pub(crate) use imp::{Cpu, IoBitmap, Paging, UserContext, ELF_MACHINE, IO_DENY_ALL};
+pub(crate) use imp::{Cpu, IoPorts, Paging, UserContext, ELF_MACHINE};
 
 /// What generic code may know about a thread's saved user registers ([`UserContext`]).
 ///
@@ -165,7 +167,7 @@ pub(crate) trait Processor {
     /// Prepares this CPU for running the thread of context slot `slot` (see [`context`]), whose
     /// task has the I/O permissions `io`: whatever the CPU must know before it switches to the
     /// thread, or after the permissions change, such as where the thread's kernel stack is.
-    fn prepare_thread(slot: usize, io: &IoBitmap);
+    fn prepare_thread(slot: usize, io: &IoPorts);
 
     /// Enables interrupts, sleeps until one has been handled, and disables them again (an
     /// interrupt that arrives in between is not missed).
@@ -192,12 +194,26 @@ pub(crate) trait CpuInterrupts {
     fn end_of_interrupt();
 }
 
+/// The I/O ports a task may use: the part of device grants that belongs to an architecture with
+/// an I/O port space (x86's). Opaque to generic code, which keeps one per task and hands it to
+/// [`Processor::prepare_thread`]; an architecture without ports allows none.
+pub(crate) trait IoPermissions: Copy {
+    /// No ports: what every task starts with.
+    const NONE: Self;
+
+    /// Lets the task use the ports in `ports`; `false` (and no change) if the architecture has
+    /// no such ports.
+    fn allow(&mut self, ports: Range<u64>) -> bool;
+}
+
 // The architecture's types must implement the contract.
 const _: () = {
     const fn regs<T: UserRegs>() {}
     const fn tables<T: PageTables>() {}
     const fn cpu<T: Processor + CpuInterrupts>() {}
+    const fn ports<T: IoPermissions>() {}
     regs::<UserContext>();
     tables::<Paging>();
     cpu::<Cpu>();
+    ports::<IoPorts>();
 };

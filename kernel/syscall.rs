@@ -2,21 +2,21 @@
 
 //! System calls.
 //!
-//! Dispatches the `syscall` instruction to the kernel's system call implementations.
+//! Dispatches system calls to the kernel's implementations.
 //!
-//! System calls use the Linux x86_64 register convention and, for files and memory, the Linux
-//! numbers, so that a future libc port is easy: `rax` holds the number, the arguments are in
-//! `rdi rsi rdx r10 r8 r9` and the result is returned in `rax` (a negative errno on error). POSIX
-//! process management is not here: the process server implements it on top of the task control
-//! calls.
+//! System calls use the architecture's Linux register convention (the architecture's
+//! [`UserRegs`] reads it) and, for files, memory and threads, the architecture's Linux numbers
+//! ([`haisuli_abi::nr`]), so that a future libc port is easy; the result is a negative errno on
+//! error. POSIX process management is not here: the process server implements it on top of the
+//! task control calls.
 
 use crate::arch::{UserContext, UserRegs};
 use crate::fs::{self, Transfer};
 use crate::task::{self, Access, Why};
-use crate::{irq, serial, vmm};
+use crate::{device, irq, serial, vmm};
 use haisuli_abi::console::{OP_READ, OP_WRITE};
 use haisuli_abi::errno::{EBADF, EFAULT, ENAMETOOLONG, ENOSYS, EPERM};
-use haisuli_abi::fcntl::PATH_MAX;
+use haisuli_abi::fcntl::{AT_FDCWD, PATH_MAX};
 use haisuli_abi::nr;
 
 /// Called by the architecture's system call entry with the saved user registers; the result
@@ -30,10 +30,14 @@ pub(crate) extern "C" fn syscall_dispatch(f: &mut UserContext) {
     let ret: i64 = match nr {
         nr::READ => sys_read(a0, a1, a2),
         nr::WRITE => sys_write(a0, a1, a2),
-        nr::OPEN => sys_open(a0, a1),
+        #[cfg(target_arch = "x86_64")]
+        nr::OPEN => sys_openat(AT_FDCWD, a0, a1),
+        nr::OPENAT => sys_openat(a0, a1, a2),
         nr::CLOSE => task::close(a0),
         nr::DUP => task::dup(a0, 0),
+        #[cfg(target_arch = "x86_64")]
         nr::DUP2 => task::dup2(a0, a1),
+        nr::DUP3 => task::dup3(a0, a1, a2),
         nr::FCNTL => task::fcntl(a0, a1, a2),
         nr::GETDENTS64 => sys_getdents64(a0, a1, a2),
         nr::MMAP => task::mmap(a1, a2),
@@ -44,7 +48,6 @@ pub(crate) extern "C" fn syscall_dispatch(f: &mut UserContext) {
         nr::GETCPU => task::getcpu(a0, a1),
         nr::SCHED_GETAFFINITY => task::sched_getaffinity(a0, a1, a2),
         nr::RT_SIGRETURN => task::rt_sigreturn(f),
-        nr::IOPERM => task::ioperm(a0, a1, a2),
         nr::IPC_SEND => task::ipc_send(a0, a1, a2),
         nr::IPC_RECV => task::ipc_recv(a0),
         nr::IPC_CALL => task::ipc_call(a0, a1, a2, a3, Access::ReadWrite, false),
@@ -69,6 +72,8 @@ pub(crate) extern "C" fn syscall_dispatch(f: &mut UserContext) {
         nr::TASK_EXEC => task::task_exec(a0, a1, a2, a3),
         nr::TASK_SPAWN => task::task_spawn(a0, a1, a2),
         nr::POWER_OFF => task::power_off(),
+        nr::DEVICE_INFO => device::info(a0, a1, a2),
+        nr::DEVICE_GRANT => device::grant(a0),
         _ => -ENOSYS,
     };
     f.set_return(ret);
@@ -118,11 +123,14 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
     }
 }
 
-/// Opens a file (the `open` system call); `path` is NUL-terminated.
-fn sys_open(path: u64, flags: u64) -> i64 {
+/// Opens a file (the `openat` system call, and x86_64's `open`); `path` is NUL-terminated.
+///
+/// A relative `path` starts at directory `dirfd`, or at the root for [`AT_FDCWD`]: there is no
+/// current directory.
+fn sys_openat(dirfd: u64, path: u64, flags: u64) -> i64 {
     let mut buf = [0u8; 2 * PATH_MAX];
     match user_string(path, &mut buf) {
-        Ok(len) => task::open(&buf[..len], flags),
+        Ok(len) => task::openat(dirfd, &buf[..len], flags),
         Err(e) => e,
     }
 }

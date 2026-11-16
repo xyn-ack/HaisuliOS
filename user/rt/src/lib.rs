@@ -5,13 +5,20 @@
 //! Everything a HaisuliOS program needs to start, make system calls, print and panic.
 //!
 //! It provides the program entry point ([`entry!`]), system calls ([`sys`]), threads
-//! ([`thread`]), buffered console output ([`print!`] / [`println!`]) and a panic handler. Programs are `#![no_std]`, `#![no_main]`
-//! static executables linked at `USER_BASE` by `user/user.ld`.
+//! ([`thread`]), buffered console output ([`print!`] / [`println!`]), device access for drivers
+//! ([`device`]) and a panic handler. Programs are `#![no_std]`, `#![no_main]` static executables
+//! linked at `USER_BASE` by `user/user.ld`.
+//!
+//! The runtime is the same on every architecture, but for `arch`, which holds all of user
+//! space's assembly: the system call instruction, `_start`, the thread and signal-return stubs,
+//! and port I/O.
 
 #![no_std]
 
 pub use haisuli_abi as abi;
 
+mod arch;
+pub mod device;
 pub mod io;
 pub mod sys;
 pub mod thread;
@@ -122,30 +129,16 @@ fn stack_string(sp: u64, addr: u64) -> Option<&'static [u8]> {
 /// Define the program's entry point: `entry!(main)` with
 /// `fn main(info: StartInfo) -> i32`; the return value is the exit status.
 ///
-/// The expansion contains no unsafe blocks, only the `_start` assembly: it
-/// sets up a proper SysV call frame (the kernel starts us with an aligned
-/// stack and no return address) and passes the address of `main` and the
-/// initial stack pointer (where the arguments are) to `__start`.
+/// The expansion contains no unsafe blocks, only the architecture's `_start` (see `arch`): it
+/// sets up a proper call frame and passes the address of `main` and the initial stack pointer
+/// (where the arguments are) to `__start`.
 #[macro_export]
 macro_rules! entry {
     ($main:path) => {
         // Compile-time check that `main` has the signature `__start` expects.
         const _: fn($crate::StartInfo) -> i32 = $main;
 
-        core::arch::global_asm!(
-            ".pushsection .text._start, \"ax\"",
-            ".global _start",
-            "_start:",
-            "    xor ebp, ebp",
-            "    mov rsi, rsp",
-            "    and rsp, -16",
-            "    lea rdi, [rip + {main}]",
-            "    call {start}",
-            "    ud2",
-            ".popsection",
-            main = sym $main,
-            start = sym $crate::__start,
-        );
+        $crate::__haisuli_start!($main);
     };
 }
 

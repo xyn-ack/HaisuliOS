@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * HaisuliOS user programs: static executables at USER_BASE (PML4[1]).
+ * HaisuliOS user programs: static executables at USER_BASE, the start of user
+ * space's program image region (the same on every architecture).
  * Every section starts on its own page so the kernel's ELF loader can give
  * each segment exact permissions (R-X text, R-- rodata, RW- data/bss).
  */

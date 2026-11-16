@@ -21,6 +21,10 @@
 //! - `blocked-ignored`: a signal that is ignored but blocked when it is sent stays pending, and
 //!   the action at the time it is unblocked decides (what a shell's job relies on between `fork`
 //!   and resetting the shell's actions); making it ignored discards it.
+//! - `files`: `openat` relative to a directory, `dup3` and `dup2`'s special cases, and on x86_64
+//!   the calls that arm64 does not have (`open`, `dup2`).
+//! - `devices`: what `device_info` says about the console, and that an ordinary program is not
+//!   granted devices.
 //! - `exec`: what `execve` keeps and what it resets, and that a failed `execve` returns.
 //! - `exec-loop N`: `N` `execve`s in a row: a leak would run out of memory.
 
@@ -31,12 +35,13 @@
 
 use core::fmt;
 use core::sync::atomic::{AtomicU32, Ordering};
-use haisuli_rt::abi::errno::{E2BIG, EACCES, EINTR, ENOENT, ENOEXEC, EPERM};
-use haisuli_rt::abi::fcntl::{O_CREAT, O_RDONLY, O_RDWR, O_TRUNC};
+use haisuli_rt::abi::errno::{E2BIG, EACCES, EBADF, EINTR, ENODEV, ENOENT, ENOEXEC};
+use haisuli_rt::abi::errno::{ENOTDIR, EPERM};
+use haisuli_rt::abi::fcntl::{AT_FDCWD, O_CREAT, O_DIRECTORY, O_RDONLY, O_RDWR, O_TRUNC};
 use haisuli_rt::abi::signal::{
     bit, NSIG, SA_RESTART, SIGHUP, SIGSEGV, SIGTERM, SIGUSR1, SIGUSR2, SIG_BLOCK, SIG_SETMASK,
 };
-use haisuli_rt::abi::{proc_state, ProcInfo, Termination};
+use haisuli_rt::abi::{device, proc_state, ProcInfo, Termination};
 use haisuli_rt::println;
 use haisuli_rt::sys::{self, Errno, SigHandler, WaitStatus};
 
@@ -132,6 +137,8 @@ fn main(info: haisuli_rt::StartInfo) -> i32 {
         "two-signals" => two_signals(&mut c),
         "pause-race" => pause_race(&mut c),
         "blocked-ignored" => blocked_ignored(&mut c),
+        "files" => files(&mut c),
+        "devices" => devices(&mut c),
         "exec" => exec(&mut c),
         "exec-stage2" => exec_stage2(&mut c, info),
         "exec-loop" => {
@@ -318,6 +325,156 @@ fn blocked_ignored(c: &mut Checks) {
         c.check(
             r == Ok((child, expected)),
             format_args!("{}: {:?}", what, r),
+        );
+    }
+}
+
+/// The first bytes of the file open at `fd` (at most 32), as a buffer and its length.
+fn head(fd: Result<u64, Errno>) -> Option<([u8; 32], usize)> {
+    let fd = fd.ok()?;
+    let mut buf = [0u8; 32];
+    let n = sys::read(fd, &mut buf);
+    let _ = sys::close(fd);
+    Some((buf, n.ok()?))
+}
+
+/// `files`: the file calls that differ between the architectures.
+fn files(c: &mut Checks) {
+    let motd = head(sys::open("/etc/motd", O_RDONLY));
+    c.check(motd.is_some(), format_args!("open /etc/motd"));
+    let relative = head(sys::openat(AT_FDCWD, "etc/motd", O_RDONLY));
+    c.check(
+        relative == motd,
+        format_args!("openat(AT_FDCWD) starts a relative path at the root"),
+    );
+    let etc = sys::open("/etc", O_RDONLY | O_DIRECTORY);
+    c.check(etc.is_ok(), format_args!("open /etc: {:?}", etc));
+    let etc = etc.unwrap_or(u64::MAX);
+    let in_etc = head(sys::openat(etc, "motd", O_RDONLY));
+    c.check(
+        in_etc == motd,
+        format_args!("openat(/etc, \"motd\") opens /etc/motd"),
+    );
+    let up = head(sys::openat(etc, "../etc/./motd", O_RDONLY));
+    c.check(up == motd, format_args!("openat(/etc, \"../etc/./motd\")"));
+    let absolute = head(sys::openat(etc, "/etc/motd", O_RDONLY));
+    c.check(
+        absolute == motd,
+        format_args!("an absolute path ignores the directory"),
+    );
+    let file = sys::open("/etc/motd", O_RDONLY).unwrap_or(u64::MAX);
+    for (dirfd, what, expected) in [
+        (file, "a file", ENOTDIR),
+        (0, "the terminal", ENOTDIR),
+        (13, "a descriptor that is not open", EBADF),
+    ] {
+        let r = sys::openat(dirfd, "motd", O_RDONLY);
+        c.check(
+            r == Err(Errno(expected)),
+            format_args!("openat relative to {}: {:?}", what, r),
+        );
+    }
+    let _ = sys::close(etc);
+
+    // `dup2`'s special case, which `dup3` does not have.
+    let same = sys::dup2(file, file);
+    c.check(
+        same == Ok(file),
+        format_args!("dup2(fd, fd) returns fd: {:?}", same),
+    );
+    let closed = sys::dup2(13, 13);
+    c.check(
+        closed == Err(Errno(EBADF)),
+        format_args!("dup2(fd, fd) of a closed fd: {:?}", closed),
+    );
+    let copy = sys::dup2(file, 12);
+    c.check(copy == Ok(12), format_args!("dup2 onto 12: {:?}", copy));
+    let _ = sys::close(12);
+    let _ = sys::close(file);
+    legacy_calls(c);
+}
+
+/// Calls a system call by number (for the calls that the runtime does not make).
+#[cfg(target_arch = "x86_64")]
+#[expect(unsafe_code)]
+fn raw_call(n: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+    // SAFETY: Only used below, with pointers to live, NUL-terminated buffers where the call reads
+    // a path, and nothing the kernel writes.
+    unsafe { sys::syscall(n, a0, a1, a2, 0, 0, 0) }
+}
+
+/// On x86_64: `open`, `dup2` and `dup3`'s checks by number; `ioperm` is gone (devices are granted
+/// instead).
+#[cfg(target_arch = "x86_64")]
+fn legacy_calls(c: &mut Checks) {
+    use haisuli_rt::abi::errno::{EINVAL, ENOSYS};
+    use haisuli_rt::abi::nr;
+    let path = b"/etc/motd\0";
+    let fd = raw_call(nr::OPEN, path.as_ptr() as u64, O_RDONLY, 0);
+    c.check(fd >= 0, format_args!("x86_64's open: {}", fd));
+    let copy = raw_call(nr::DUP2, fd as u64, 11, 0);
+    c.check(copy == 11, format_args!("x86_64's dup2: {}", copy));
+    let same = raw_call(nr::DUP3, fd as u64, fd as u64, 0);
+    c.check(
+        same == -EINVAL,
+        format_args!("dup3(fd, fd) fails with EINVAL: {}", same),
+    );
+    let flags = raw_call(nr::DUP3, fd as u64, 10, 1);
+    c.check(
+        flags == -EINVAL,
+        format_args!("dup3 with flags fails with EINVAL: {}", flags),
+    );
+    let ioperm = raw_call(173, 0x3F8, 8, 1);
+    c.check(
+        ioperm == -ENOSYS,
+        format_args!("there is no ioperm: {}", ioperm),
+    );
+    for fd in [fd as u64, 11] {
+        let _ = sys::close(fd);
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn legacy_calls(_: &mut Checks) {}
+
+/// `devices`: the console's description, and what an unprivileged program may not do.
+fn devices(c: &mut Checks) {
+    use device::{KIND_UART_16550, KIND_UART_PL011, NO_IRQ, SPACE_MMIO, SPACE_PORTS};
+    match sys::device_info(device::CONSOLE) {
+        Ok(info) => {
+            println!(
+                "console: {} kind {} space {} base {:#x} len {} irq {}",
+                info.name(),
+                info.kind,
+                info.space,
+                info.base,
+                info.len,
+                info.irq
+            );
+            c.check(
+                [KIND_UART_16550, KIND_UART_PL011].contains(&info.kind)
+                    && [SPACE_PORTS, SPACE_MMIO].contains(&info.space)
+                    && info.len > 0
+                    && info.irq != NO_IRQ
+                    && !info.name().is_empty(),
+                format_args!("the console is a UART with registers and an interrupt"),
+            );
+        }
+        Err(e) => c.check(false, format_args!("device_info(CONSOLE): {:?}", e)),
+    }
+    let none = sys::device_info(99);
+    c.check(
+        none == Err(Errno(ENODEV)),
+        format_args!("no device 99: {:?}", none),
+    );
+    for id in [device::CONSOLE, 99] {
+        let grant = sys::device_grant(id);
+        c.check(
+            grant == Err(Errno(EPERM)),
+            format_args!(
+                "an ordinary program is granted no device ({}): {:?}",
+                id, grant
+            ),
         );
     }
 }
@@ -519,10 +676,10 @@ fn exec_stage2(c: &mut Checks, info: haisuli_rt::StartInfo) {
         &buf[..n] == EXEC_FILE_TEXT,
         format_args!("the open descriptor is kept"),
     );
-    let io = sys::ioperm(0x3f8, 8, true);
+    let grant = sys::device_grant(device::CONSOLE);
     c.check(
-        io == Err(Errno(EPERM)),
-        format_args!("no privileges: ioperm fails: {:?}", io),
+        grant == Err(Errno(EPERM)),
+        format_args!("no privileges: device_grant fails: {:?}", grant),
     );
     // The dispositions, by what the signals do to a child that inherits them:
     // the handler of SIGUSR1 is gone (it would run in the new image, and the

@@ -26,9 +26,8 @@
 use crate::abi::clone::THREAD_FLAGS;
 use crate::abi::errno::EAGAIN;
 use crate::abi::mman::{PROT_READ, PROT_WRITE};
-use crate::abi::nr;
+use crate::arch;
 use crate::sys::{self, Errno, Result};
-use core::arch::global_asm;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// The most threads a process can start with [`spawn`] that have not been joined yet.
@@ -46,76 +45,15 @@ static STACK: [AtomicU64; MAX_THREADS] = [const { AtomicU64::new(0) }; MAX_THREA
 const FREE: u32 = 0;
 const RUNNING: u32 = 1;
 /// Stored by the ending thread itself once it no longer touches its stack (see
-/// `__haisuli_thread_exit`), so that [`Thread::join`] may hand the stack out again.
+/// `arch::thread_exit`), so that [`Thread::join`] may hand the stack out again.
 const FINISHED: u32 = 2;
-
-extern "C" {
-    /// Starts a thread on the stack below `stack_top` that calls `start(slot, job, arg)`.
-    ///
-    /// Returns its thread id, or a negative errno.
-    fn __haisuli_clone(
-        flags: u64,
-        stack_top: u64,
-        start: extern "C" fn(u64, Job, u64) -> !,
-        slot: u64,
-        job: Job,
-        arg: u64,
-    ) -> i64;
-
-    /// Stores `finished` into `*state` and ends the calling thread.
-    fn __haisuli_thread_exit(state: *const AtomicU32, finished: u32) -> !;
-}
-
-// `__haisuli_clone` leaves what the new thread needs on its stack: after `clone`, the new thread
-// has no other memory of its own and only `rsp` tells it apart from its creator. Its frame is
-// [start][slot][job][arg] from `stack_top - 32` up; popping it leaves `rsp` 16-byte aligned, as
-// the System V ABI wants it before a `call`.
-//
-// `__haisuli_thread_exit` writes nothing to the stack after marking it finished: from then on,
-// the stack may be handed to the next thread while this one is still on its way out.
-global_asm!(
-    ".pushsection .text.__haisuli_clone, \"ax\"",
-    ".global __haisuli_clone",
-    "__haisuli_clone:",
-    "    sub rsi, 32",
-    "    mov [rsi], rdx",
-    "    mov [rsi + 8], rcx",
-    "    mov [rsi + 16], r8",
-    "    mov [rsi + 24], r9",
-    "    mov eax, {clone}",
-    "    xor edx, edx",
-    "    xor r10d, r10d",
-    "    xor r8d, r8d",
-    "    syscall",
-    "    test rax, rax",
-    "    jz 2f",
-    "    ret",
-    "2:",
-    "    pop rax",
-    "    pop rdi",
-    "    pop rsi",
-    "    pop rdx",
-    "    xor ebp, ebp",
-    "    call rax",
-    "    ud2",
-    ".global __haisuli_thread_exit",
-    "__haisuli_thread_exit:",
-    "    mov [rdi], esi",
-    "    mov eax, {exit}",
-    "    xor edi, edi",
-    "    syscall",
-    "    ud2",
-    ".popsection",
-    clone = const nr::CLONE,
-    exit = const nr::EXIT,
-);
 
 /// The first Rust code of a new thread.
 extern "C" fn thread_start(slot: u64, job: Job, arg: u64) -> ! {
     job(arg);
     // SAFETY: `slot` is the slot that `spawn` reserved for this thread, so `STATE[slot]` is a
     // live atomic; the thread ends inside the call and its stack is not used again.
-    unsafe { __haisuli_thread_exit(&STATE[slot as usize], FINISHED) }
+    unsafe { arch::thread_exit(&STATE[slot as usize], FINISHED) }
 }
 
 /// A thread started by [`spawn`].
@@ -171,10 +109,11 @@ pub fn spawn(job: Job, arg: u64) -> Result<Thread> {
     };
     // SAFETY: The slot is reserved for this thread, so nothing else uses its stack, which is
     // mapped memory that no Rust object lives in; the new thread only runs `thread_start`,
-    // which takes everything it uses from the frame that `__haisuli_clone` writes. The flags
-    // share the address space, so the statics it uses are the ones this thread sees.
+    // which takes everything it uses from the frame that `arch::clone_thread` writes, and never
+    // returns. The flags share the address space, so the statics it uses are the ones this
+    // thread sees.
     let tid =
-        unsafe { __haisuli_clone(THREAD_FLAGS, stack_top, thread_start, slot as u64, job, arg) };
+        unsafe { arch::clone_thread(THREAD_FLAGS, stack_top, thread_start, slot as u64, job, arg) };
     if tid <= 0 {
         STATE[slot].store(FREE, Ordering::Release);
         return Err(Errno(if tid == 0 { EAGAIN } else { -tid }));

@@ -12,8 +12,9 @@
 //! share the one GDT.
 //!
 //! The TSS carries an I/O-permission bitmap for ports `0..IO_PORTS`, loaded per task on every
-//! context switch: this is how user-space drivers get access to exactly the device registers they
-//! were granted (`ioperm`). Ports at or above `IO_PORTS` lie beyond the TSS limit and always fault.
+//! context switch ([`IoPorts`]): this is how user-space drivers get access to exactly the device
+//! registers they were granted (`device_grant`). Ports at or above `IO_PORTS` lie beyond the TSS
+//! limit and always fault.
 
 use super::cpu;
 use super::percpu::{self, MAX_CPUS};
@@ -21,18 +22,39 @@ use super::x86::{
     segment_descriptor, system_descriptor, PrivilegeLevel, SegmentAccess, SegmentFlag,
     SystemSegment,
 };
+use crate::arch::IoPermissions;
 use crate::sync::Lock;
 use core::mem::size_of;
+use core::ops::Range;
 use core::sync::atomic::{AtomicU64, Ordering};
-use haisuli_abi::IO_PORTS;
 
+/// The I/O ports that can be granted: the legacy devices' (`0..IO_PORTS`).
+const IO_PORTS: u64 = 0x400;
 /// Size of the per-task I/O bitmap: one bit per port, 1 = access denied.
-pub(crate) const IO_BITMAP_BYTES: usize = (IO_PORTS / 8) as usize;
-pub(crate) type IoBitmap = [u8; IO_BITMAP_BYTES];
+const IO_BITMAP_BYTES: usize = (IO_PORTS / 8) as usize;
+type IoBitmap = [u8; IO_BITMAP_BYTES];
 /// A bitmap byte denying all of its 8 ports.
 const DENY_8_PORTS: u8 = 0xFF;
 /// Bitmap denying every port (the default for each task).
-pub(crate) const IO_DENY_ALL: IoBitmap = [DENY_8_PORTS; IO_BITMAP_BYTES];
+const IO_DENY_ALL: IoBitmap = [DENY_8_PORTS; IO_BITMAP_BYTES];
+
+/// A task's I/O permissions: the bitmap that the TSS gets while its threads run.
+#[derive(Clone, Copy)]
+pub(crate) struct IoPorts(IoBitmap);
+
+impl IoPermissions for IoPorts {
+    const NONE: IoPorts = IoPorts(IO_DENY_ALL);
+
+    fn allow(&mut self, ports: Range<u64>) -> bool {
+        if ports.start > ports.end || ports.end > IO_PORTS {
+            return false;
+        }
+        for port in ports {
+            self.0[(port / 8) as usize] &= !(1 << (port % 8)); // 0 means allowed.
+        }
+        true
+    }
+}
 
 /// The GDT's descriptors, by selector (byte offset in the GDT).
 ///
@@ -184,11 +206,11 @@ static DOUBLE_FAULT_STACKS: [Stack; MAX_CPUS] =
     [const { Stack([const { AtomicU64::new(0) }; 1024]) }; MAX_CPUS];
 
 /// Prepares this CPU's TSS for a thread: `top` is its kernel stack, which the CPU switches to on
-/// an interrupt or exception from user mode, and `bitmap` its task's I/O permissions.
-pub(crate) fn set_thread(top: u64, bitmap: &IoBitmap) {
+/// an interrupt or exception from user mode, and `io` its task's I/O permissions.
+pub(crate) fn set_thread(top: u64, io: &IoPorts) {
     let mut tss = TSS[percpu::index()].lock();
     tss.rsp0 = top;
-    tss.io_bitmap = *bitmap;
+    tss.io_bitmap = io.0;
 }
 
 /// Loads the GDT and this CPU's TSS; every CPU calls it once, with its own index.

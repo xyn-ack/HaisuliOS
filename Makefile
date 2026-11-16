@@ -35,7 +35,13 @@ QEMU_FLAGS := -kernel $(IMG) -initrd "$(MODULES)" -m 128M -smp $(CPUS) $(SERIAL)
 
 PYTHON ?= python3
 
-.PHONY: all build run debug check rustfmt rustfmtcheck clean
+# The user crates, which build for every architecture (the kernel, for x86_64 only so far).
+USER_CRATES := haisuli-abi haisuli-rt init proc console coreutils probe_test smp_test
+# The toolchain for the arm64 build, as cargo's `+toolchain`, for when the one rust-toolchain.toml
+# picks lacks the aarch64-unknown-none target (e.g. AARCH64_TOOLCHAIN=+1.98.0).
+AARCH64_TOOLCHAIN ?=
+
+.PHONY: all build run debug check portcheck rustfmt rustfmtcheck clean
 
 all: $(IMG) $(PROGRAMS) $(RAMDISK)
 
@@ -81,6 +87,20 @@ debug: all
 check: all
 	$(PYTHON) test/run_tests.py --qemu $(QEMU) --kernel $(IMG) --modules "$(MODULES)" \
 		$(foreach name,$(TEST_EXPLICIT),--explicit "$(name)") $(TEST_ARGS)
+
+# What keeps the system portable to a second architecture: every user crate builds for arm64,
+# user space has no assembly outside its runtime's arch/ directory, and the kernel's generic files
+# use the hardware layer through its contracts only (docs/ARCHITECTURE.md#source-layout).
+portcheck:
+	RUSTFLAGS="-D warnings" cargo $(AARCH64_TOOLCHAIN) build --release --target aarch64-unknown-none \
+		$(addprefix -p ,$(USER_CRATES))
+	@! grep -rnE 'asm!|global_asm|naked_asm|core::arch::' --include='*.rs' user \
+		| grep -v '^user/rt/src/arch/' \
+		|| { echo "assembly outside user/rt/src/arch/"; false; }
+	@! grep -nE 'arch::(x86_64|apic|idt|gdt|smp|entry|cpu|x86|boot)\b|platform::(pc|multiboot|acpi|pic|pit|power|uart)\b' \
+		$$(find kernel -maxdepth 1 -name '*.rs') \
+		|| { echo "a generic kernel file names the hardware layer's insides"; false; }
+	@echo "portcheck: ok"
 
 # Formatting, as in the Linux kernel (Documentation/rust/coding-guidelines.rst).
 rustfmt:

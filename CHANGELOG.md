@@ -6,13 +6,29 @@ roadmap are in [TODO.md](TODO.md).
 
 ## Unreleased
 
-The fourth step toward a second CPU architecture: the machine and the CPU's own devices are behind
-contracts too. Generic kernel code no longer names the local APIC, the IDT, the GDT, the SMP
-start-up or the entry stubs, nor any module of the PC platform; it boots, schedules and takes
-interrupts through traits that the compiler checks, like `UserRegs` and `PageTables`.
+The fourth and fifth steps toward a second CPU architecture. The machine and the CPU's own devices
+are behind contracts too: generic kernel code no longer names the local APIC, the IDT, the GDT,
+the SMP start-up or the entry stubs, nor any module of the PC platform; it boots, schedules and
+takes interrupts through traits that the compiler checks, like `UserRegs` and `PageTables`. And
+the ABI and user space are ready for arm64: system call numbers per architecture, devices granted
+to drivers instead of `ioperm`, and all of user space's assembly in the runtime's `arch/`; every
+user program builds for `aarch64-unknown-none` (`make portcheck`).
 
 ### Added
 
+- `openat` (257 on x86_64, 56 on arm64), `dup3` (292, 24) and `fcntl(F_GETFD)`: the calls that
+  arm64 has instead of `open` and `dup2`, which the runtime now uses everywhere. A relative path
+  of `openat` starts at a directory descriptor (or at the root for `AT_FDCWD`).
+- Devices for drivers: `device_info` (0x101B) describes a device the machine has (what it is,
+  where its registers are, its IRQ line; `abi::device`, so far `CONSOLE`), and `device_grant`
+  (0x101C) gives a privileged task its registers. The runtime's `device` module reads and writes
+  granted registers, in the I/O port space or memory-mapped alike.
+- The console server picks its UART driver by the device's kind: the 16550 (the PC's COM1), or
+  the PL011 (arm64), and takes its IRQ line from the description.
+- `make portcheck`: every user crate builds for `aarch64-unknown-none`, no assembly outside
+  `user/rt/src/arch/`, and no generic kernel file names the hardware layer's insides.
+- The architecture's `IoPermissions` trait (for `arch::IoPorts`): a task's I/O ports, opaque to
+  generic code (the TSS's bitmap on x86_64).
 - The architecture's `Processor` trait (for `arch::Cpu`): `init_cpu(boot_cpu, wait)` sets up a
   CPU (on x86_64 the GDT and TSS, the IDT, the local APIC and its timer, `syscall`),
   `start_cpus` starts the others from the hardware ids the platform lists, `prepare_thread` is
@@ -30,6 +46,14 @@ interrupts through traits that the compiler checks, like `UserRegs` and `PageTab
 
 ### Changed
 
+- `abi::nr` has the architecture's Linux numbers, declared side by side for x86_64 and arm64;
+  `open` and `dup2` are x86_64's only. `UC_SIGMASK` (now counted from the restorer's stack
+  pointer) and `O_DIRECTORY` are per architecture too; the native calls are shared.
+- `user/rt/src/arch/{x86_64,aarch64}.rs` hold all of user space's assembly: the system call,
+  `_start` (which `entry!` expands to), the `clone` and thread-exit stubs, the signal restorer,
+  and x86's port I/O. The console server has no unsafe code any more.
+- `abi::uart` is `abi::uart16550`, without the PC's COM1 constants (the PC platform describes
+  COM1 now); `abi::pl011` has the PL011's registers.
 - Booting (`main.rs`) goes through the contracts only. The boot CPU sets itself up before the
   frame allocator and the 8259s rather than around them (interrupts are off throughout, so the
   order does not matter to the hardware).
@@ -68,6 +92,9 @@ TEST_ARGS="--cpus 4"`), and that two new tests now provoke on purpose:
 
 - `probe_test blocked-ignored` (`test_probe.py`): what happens to a signal that is blocked when
   it is sent, whether or not it is ignored then and when it is unblocked.
+- `probe_test files` and `probe_test devices` (`test_probe.py`): `openat` relative to a
+  directory, `dup3`'s and `dup2`'s special cases, x86_64's `open` and `dup2`, the console's
+  description, and that an ordinary program is granted no device.
 - `test_a_job_signalled_as_soon_as_it_starts_gets_the_default_action` (`test_process.py`): types
   `kill` together with `pause &`, so that the signal arrives while the job still resets the
   shell's actions.
@@ -79,6 +106,7 @@ TEST_ARGS="--cpus 4"`), and that two new tests now provoke on purpose:
 - `user/init/src/jobs.rs`, `signals.rs` and `ustar.rs`, which the shell no longer included.
 - `user/proctest/`, a test program outside the workspace that nothing built (`probe_test`
   replaced it).
+- `ioperm` (173), `IO_PORTS` and `abi::uart::{COM1, PORTS, COM1_IRQ}`: devices are granted.
 
 ## 0.3.1
 

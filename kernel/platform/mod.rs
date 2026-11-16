@@ -12,7 +12,7 @@
 //! [`Board`], through the traits that make the compiler check the contract:
 //!
 //! - [`Machine`]: the early console (the kernel's log), start-up delays, the CPUs the firmware
-//!   lists, and powering off;
+//!   lists, powering off, and the devices that user-space drivers may be given;
 //! - [`BootInfo`]: what the boot loader left, in platform-neutral terms: the memory, the memory
 //!   its own data takes, and the boot modules;
 //! - [`InterruptController`]: the platform's interrupt lines, which [`crate::irq`] forwards to
@@ -55,6 +55,9 @@ pub(crate) trait Machine {
     /// Powers the machine off, with `code` as its exit status where it has one (an emulator's),
     /// or failing that, stops this CPU.
     fn power_off(code: u32) -> !;
+
+    /// The device with well-known id `id` (see [`haisuli_abi::device`]), if the machine has it.
+    fn device(id: u64) -> Option<Device>;
 }
 
 /// What the boot loader left for the kernel.
@@ -108,6 +111,33 @@ const _: () = {
     const fn board<T: Machine + BootInfo + InterruptController>() {}
     board::<Board>();
 };
+
+/// A device that a user-space driver may be given (see [`crate::device`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Device {
+    /// What it is: one of the `KIND_*` values of [`haisuli_abi::device`].
+    pub(crate) kind: u64,
+    /// Where its registers are.
+    pub(crate) registers: Registers,
+    /// The interrupt line it raises, if any (see [`InterruptController`]).
+    pub(crate) irq: Option<usize>,
+    /// The machine's name for it (such as `COM1`).
+    pub(crate) name: &'static str,
+}
+
+/// Where a device's registers are.
+///
+/// (Memory-mapped registers come with the first machine that has such devices: arm64's.)
+#[derive(Clone, Copy)]
+pub(crate) enum Registers {
+    /// I/O ports `base..base + count`, on an architecture that has an I/O port space.
+    Ports {
+        /// The first port.
+        base: u64,
+        /// How many.
+        count: u64,
+    },
+}
 
 /// A boot module: a file that the boot loader loaded next to the kernel (GRUB's `module`, QEMU's
 /// `-initrd`).

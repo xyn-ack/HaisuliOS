@@ -2,10 +2,13 @@
 
 //! The HaisuliOS console server.
 //!
-//! Drives the COM1 UART and provides a terminal with line editing to the rest of the system.
+//! Drives the machine's console UART and provides a terminal with line editing to the rest of the
+//! system.
 //!
-//! The server owns the UART (I/O ports granted with `ioperm`, receive interrupts delivered as IPC
-//! notifications) and implements a small canonical-mode line discipline on top of it: input is
+//! The server owns the UART: the machine says which device it is (`device_info` for
+//! [`CONSOLE`]: a 16550 on a PC, a PL011 on arm64, see [`uart`]), the kernel grants its registers
+//! (`device_grant`) and delivers its receive interrupts as IPC notifications. On top of it, the
+//! server implements a small canonical-mode line discipline: input is
 //! echoed and edited (Backspace, Ctrl-U, Ctrl-C) until Enter, then becomes readable as one line;
 //! Ctrl-D on an empty line is end-of-file. The kernel's debug log goes out of the same line, so
 //! the server sends its output through the kernel's transmitter (`serial_write`): then neither
@@ -26,67 +29,90 @@
 
 #![no_std]
 #![no_main]
-// The only unsafe code is the port I/O in `uart`.
-#![deny(unsafe_code)]
+// Device access goes through the runtime's granted registers (`haisuli_rt::device`).
+#![forbid(unsafe_code)]
 
 use haisuli_rt::abi::console::{OP_READ, OP_SET_FG_PGRP, OP_WRITE};
-use haisuli_rt::abi::errno::{EAGAIN, EFAULT, EINVAL, ENOSYS};
+use haisuli_rt::abi::device::{CONSOLE, NO_IRQ};
+use haisuli_rt::abi::errno::{EAGAIN, EFAULT, EINVAL, ENODEV, ENOSYS};
 use haisuli_rt::abi::signal::SIGINT;
 use haisuli_rt::abi::{svc, KMSG_IRQ, PID_KERNEL};
-use haisuli_rt::sys;
+use haisuli_rt::{device, sys};
 
 haisuli_rt::entry!(main);
 
 /// Longest input line, including its terminating newline.
 const LINE_MAX: usize = 256;
 
-#[expect(unsafe_code)]
 mod uart {
-    //! 16550 UART on COM1: interrupt-driven input; output through the kernel's transmitter.
-    use core::arch::asm;
-    use haisuli_rt::abi::uart::{
-        FifoControl, InterruptEnable, LineControl, LineStatus, ModemControl, Register, COM1,
-        DIVISOR_38400,
-    };
-    pub(crate) use haisuli_rt::abi::uart::{COM1 as BASE, COM1_IRQ as IRQ, PORTS};
+    //! The UART drivers: interrupt-driven input; output goes through the kernel's transmitter
+    //! (see [`crate::output`]), so a driver only sets the device up and reads what it received.
+    use haisuli_rt::abi::device::{DeviceInfo, KIND_UART_16550, KIND_UART_PL011};
+    use haisuli_rt::abi::{pl011, uart16550};
+    use haisuli_rt::device::Registers;
 
-    /// The port of UART register `reg`: one of the UART's own registers.
-    fn port(reg: Register) -> u16 {
-        COM1 + reg as u16
+    /// The console's UART, with the driver for the kind of device it is.
+    pub(crate) enum Uart {
+        /// A 16550 (a PC's COM ports).
+        Ns16550(Registers),
+        /// An ARM PL011.
+        Pl011(Registers),
     }
 
-    fn outb(reg: Register, v: u8) {
-        let port = port(reg);
-        // SAFETY: Port I/O on the UART's registers (granted to us by
-        // ioperm) touches no memory; the UART does no DMA.
-        unsafe {
-            asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack, preserves_flags))
+    impl Uart {
+        /// The driver for device `info`, whose registers are `regs`; `None` for a device this
+        /// server has no driver for.
+        pub(crate) fn new(info: &DeviceInfo, regs: Registers) -> Option<Uart> {
+            match info.kind {
+                KIND_UART_16550 => Some(Uart::Ns16550(regs)),
+                KIND_UART_PL011 => Some(Uart::Pl011(regs)),
+                _ => None,
+            }
+        }
+
+        /// Sets the device up: 8N1, an interrupt for received bytes.
+        pub(crate) fn init(&self) {
+            match self {
+                Uart::Ns16550(regs) => ns16550_init(regs),
+                Uart::Pl011(regs) => pl011_init(regs),
+            }
+        }
+
+        /// The next byte received, if there is one.
+        pub(crate) fn read_byte(&self) -> Option<u8> {
+            match self {
+                Uart::Ns16550(regs) => {
+                    let status = regs.read8(uart16550::Register::LineStatus as u64);
+                    (status & uart16550::LineStatus::DataReady as u8 != 0)
+                        .then(|| regs.read8(uart16550::Register::Data as u64))
+                }
+                Uart::Pl011(regs) => {
+                    let flags = regs.read32(pl011::Register::Flag as u64);
+                    (flags & pl011::Flag::ReceiveEmpty as u32 == 0)
+                        .then(|| regs.read32(pl011::Register::Data as u64) as u8)
+                }
+            }
+        }
+    }
+
+    /// Sets up a 16550: 38400 baud, 8N1, an interrupt for every byte received.
+    fn ns16550_init(regs: &Registers) {
+        use uart16550::{
+            FifoControl, InterruptEnable, LineControl, ModemControl, Register, DIVISOR_38400,
         };
-    }
-
-    fn inb(reg: Register) -> u8 {
-        let port = port(reg);
-        let v: u8;
-        // SAFETY: As in `outb`.
-        unsafe {
-            asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack, preserves_flags))
-        };
-        v
-    }
-
-    /// Sets up COM1: 38400 baud, 8N1, an interrupt for every byte received.
-    pub(crate) fn init() {
-        outb(Register::InterruptEnable, 0); // Interrupts off while configuring.
-        outb(Register::LineControl, LineControl::DivisorLatch as u8);
+        let write = |reg: Register, value: u8| regs.write8(reg as u64, value);
+        write(Register::InterruptEnable, 0); // Interrupts off while configuring.
+        write(Register::LineControl, LineControl::DivisorLatch as u8);
         let [low, high] = DIVISOR_38400.to_le_bytes();
-        outb(Register::DIVISOR_LOW, low);
-        outb(Register::DIVISOR_HIGH, high);
-        outb(Register::LineControl, LineControl::Word8 as u8); // Also ends DLAB.
-                                                               // FIFOs on, interrupt per received byte. Not `ClearReceive`: anything
-                                                               // already received is real (early) typeahead.
-        outb(Register::FifoControl, FifoControl::Enable as u8);
+        write(Register::DIVISOR_LOW, low);
+        write(Register::DIVISOR_HIGH, high);
+        // 8N1, which also ends DLAB.
+        write(Register::LineControl, LineControl::Word8 as u8);
+        // FIFOs on, interrupt per received byte. Not `ClearReceive`: anything already received
+        // is real (early) typeahead.
+        write(Register::FifoControl, FifoControl::Enable as u8);
         // OUT2 connects the UART's interrupt line to the PIC.
-        outb(
+        write(
             Register::ModemControl,
             ModemControl::bits(&[
                 ModemControl::DataTerminalReady,
@@ -94,26 +120,41 @@ mod uart {
                 ModemControl::Out2,
             ]),
         );
-        outb(
+        write(
             Register::InterruptEnable,
             InterruptEnable::ReceivedData as u8,
         );
     }
 
-    fn line_status(status: LineStatus) -> bool {
-        inb(Register::LineStatus) & status as u8 != 0
+    /// Sets up a PL011: its receiver, and an interrupt for received bytes.
+    ///
+    /// The kernel's log already uses it (8N1, at whatever rate the firmware chose), and may be
+    /// sending while this runs: so the UART and its transmitter are left as they are, and only
+    /// switched on if they were not.
+    fn pl011_init(regs: &Registers) {
+        use pl011::{Control, Interrupt, Register};
+        let receive = Interrupt::bits(&[Interrupt::Receive, Interrupt::ReceiveTimeout]);
+        regs.write32(Register::InterruptClear as u64, receive);
+        regs.write32(Register::InterruptMask as u64, receive);
+        let control = regs.read32(Register::Control as u64);
+        regs.write32(
+            Register::Control as u64,
+            control | Control::bits(&[Control::Enable, Control::Transmit, Control::Receive]),
+        );
     }
+}
 
-    pub(crate) fn read_byte() -> Option<u8> {
-        line_status(LineStatus::DataReady).then(|| inb(Register::Data))
-    }
+mod output {
+    //! Terminal output, through the kernel's transmitter (`serial_write`): then neither the
+    //! kernel's log nor this can cut into the other's output, even on several CPUs at once.
 
+    /// Sends one byte as it is.
     pub(crate) fn write_byte(b: u8) {
         let _ = haisuli_rt::sys::serial_write(&[b]);
     }
 
-    /// Terminal output: newline becomes CR LF. Sent in one piece (see the module documentation),
-    /// in chunks of this many bytes of output.
+    /// Terminal output: newline becomes CR LF. Sent in one piece, in chunks of this many bytes
+    /// of output.
     pub(crate) fn write(bytes: &[u8]) {
         const CHUNK: usize = 512;
         let mut out = [0u8; CHUNK];
@@ -314,7 +355,7 @@ impl Tty {
             // CR LF from the terminal: one newline.
             Some(Control::LineFeed) if after_cr => {}
             Some(Control::CarriageReturn | Control::LineFeed) => {
-                uart::write(b"\n");
+                output::write(b"\n");
                 self.line[self.line_len] = b'\n';
                 self.line_len += 1;
                 self.finish_line();
@@ -324,7 +365,7 @@ impl Tty {
             }
             Some(Control::Kill) => while self.erase_char() {},
             Some(Control::Interrupt) => {
-                uart::write(b"^C\n");
+                output::write(b"^C\n");
                 self.line_len = 0;
                 self.interrupt();
             }
@@ -336,9 +377,9 @@ impl Tty {
                 if self.line_len < LINE_MAX - 1 {
                     self.line[self.line_len] = b;
                     self.line_len += 1;
-                    uart::write_byte(b);
+                    output::write_byte(b);
                 } else {
-                    uart::write_byte(Control::Bell as u8); // Line full.
+                    output::write_byte(Control::Bell as u8); // Line full.
                 }
             }
         }
@@ -353,7 +394,7 @@ impl Tty {
         while self.line_len > 0 && is_utf8_continuation(self.line[self.line_len]) {
             self.line_len -= 1; // The rest of a multi-byte character.
         }
-        uart::write(&ERASE);
+        output::write(&ERASE);
         true
     }
 
@@ -362,7 +403,7 @@ impl Tty {
         let n = self.line_len;
         self.line_len = 0;
         if self.cooked.free() < n || self.lines.free() == 0 {
-            uart::write_byte(Control::Bell as u8); // Nobody is reading: input dropped.
+            output::write_byte(Control::Bell as u8); // Nobody is reading: input dropped.
             return;
         }
         for &b in &self.line[..n] {
@@ -470,7 +511,7 @@ fn write_request(client: u64, len: usize) {
         match sys::ipc_read(client, done, &mut chunk) {
             Ok(0) => break,
             Ok(n) => {
-                uart::write(&chunk[..n]);
+                output::write(&chunk[..n]);
                 done += n;
             }
             Err(e) => {
@@ -493,21 +534,36 @@ fn fail(what: &str, e: sys::Errno) -> i32 {
 }
 
 fn main(_: haisuli_rt::StartInfo) -> i32 {
-    if let Err(e) = sys::ioperm(uart::BASE as u64, uart::PORTS as u64, true) {
-        return fail("ioperm", e);
+    let (info, regs) = match device::grant(CONSOLE) {
+        Ok(granted) => granted,
+        Err(e) => return fail("device_grant", e),
+    };
+    let Some(uart) = uart::Uart::new(&info, regs) else {
+        return fail("no driver for the console device", sys::Errno(ENODEV));
+    };
+    if info.irq == NO_IRQ {
+        return fail(
+            "no interrupt line for the console device",
+            sys::Errno(ENODEV),
+        );
     }
-    uart::init();
-    if let Err(e) = sys::irq_bind(uart::IRQ) {
+    uart.init();
+    if let Err(e) = sys::irq_bind(info.irq) {
         return fail("irq_bind", e);
     }
     if let Err(e) = sys::svc_register(svc::CONSOLE) {
         return fail("svc_register", e);
     }
-    sys::debug_log(b"[console] serving COM1 (IRQ 4)\n");
+    let mut w = haisuli_rt::io::BufWriter::new(haisuli_rt::io::Sink::DebugLog);
+    let _ = core::fmt::Write::write_fmt(
+        &mut w,
+        format_args!("[console] serving {} (IRQ {})\n", info.name(), info.irq),
+    );
+    w.flush();
 
     let mut tty = Tty::new();
     // Keys typed before we were running are still in the UART: keep them.
-    while let Some(b) = uart::read_byte() {
+    while let Some(b) = uart.read_byte() {
         tty.input(b);
     }
     loop {
@@ -517,10 +573,10 @@ fn main(_: haisuli_rt::StartInfo) -> i32 {
         };
         match (m.sender, m.a) {
             (PID_KERNEL, KMSG_IRQ) => {
-                while let Some(b) = uart::read_byte() {
+                while let Some(b) = uart.read_byte() {
                     tty.input(b);
                 }
-                let _ = sys::irq_ack(uart::IRQ);
+                let _ = sys::irq_ack(info.irq);
             }
             (PID_KERNEL, _) => {}
             (client, OP_WRITE) => write_request(client, m.b as usize),

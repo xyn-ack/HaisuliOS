@@ -54,8 +54,8 @@
 
 use crate::arch::percpu::{self, MAX_CPUS};
 use crate::arch::upcall::{Frame, SavedContext};
-use crate::arch::{self, context, CpuInterrupts, Processor, UserContext, UserRegs};
-use crate::arch::{IoBitmap, IO_DENY_ALL};
+use crate::arch::{self, context, CpuInterrupts, IoPermissions, IoPorts, Processor};
+use crate::arch::{UserContext, UserRegs};
 use crate::platform::{Board, BootInfo, Machine, Module};
 use crate::program::{self, Args};
 use crate::sync::{Guard, Lock};
@@ -67,8 +67,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use haisuli_abi::clone::THREAD_FLAGS;
 use haisuli_abi::errno::*;
 use haisuli_abi::exec::{self, ARG_MAX};
-use haisuli_abi::fcntl::{F_DUPFD, OPEN_MAX};
-use haisuli_abi::{svc, task_state, upcall, TaskInfo, IO_PORTS, TASK_INFO_LEN};
+use haisuli_abi::fcntl::{AT_FDCWD, F_DUPFD, F_GETFD, OPEN_MAX};
+use haisuli_abi::{svc, task_state, upcall, TaskInfo, TASK_INFO_LEN};
 use haisuli_abi::{KMSG_IRQ, KMSG_TASK_EXIT, KMSG_TASK_FAULT, PID_KERNEL};
 
 /// Thread slots: every thread of every task. A task's id is its leader's slot + 1.
@@ -276,11 +276,12 @@ struct Task {
     mb_head: usize,
     mb_len: usize,
     name: Name,
-    /// Whether the task may use `ioperm`, bind IRQs and register services.
+    /// Whether the task may be granted devices, bind IRQs and register services.
     ///
     /// Boot modules may; a copy made with `task_fork` may not.
     privileged: bool,
-    io_bitmap: IoBitmap,
+    /// The I/O ports that devices granted to the task have (on an architecture with ports).
+    io: IoPorts,
     /// IRQ lines that fired and have not been delivered by `ipc_recv` yet, one bit each.
     irq_pending: u64,
 }
@@ -305,7 +306,7 @@ impl Task {
         mb_len: 0,
         name: Name([0; NAME_LEN]),
         privileged: false,
-        io_bitmap: IO_DENY_ALL,
+        io: IoPorts::NONE,
         irq_pending: 0,
     };
 
@@ -826,7 +827,7 @@ fn install(
 struct Next {
     slot: usize,
     space: AddressSpace,
-    io_bitmap: IoBitmap,
+    io: IoPorts,
 }
 
 /// Picks the next runnable thread for this CPU after the one it ran last, and makes it the
@@ -846,7 +847,7 @@ fn pick(t: &mut Table) -> Next {
         return Next {
             slot: IDLE,
             space: AddressSpace::kernel(),
-            io_bitmap: IO_DENY_ALL,
+            io: IoPorts::NONE,
         };
     };
     c.current = slot;
@@ -857,7 +858,7 @@ fn pick(t: &mut Table) -> Next {
     Next {
         slot,
         space: task.space,
-        io_bitmap: task.io_bitmap,
+        io: task.io,
     }
 }
 
@@ -872,7 +873,7 @@ fn switch(next: Next) {
     if next.slot == IDLE {
         context::switch_to(context::idle(percpu::index()));
     } else {
-        arch::Cpu::prepare_thread(next.slot, &next.io_bitmap);
+        arch::Cpu::prepare_thread(next.slot, &next.io);
         context::switch_to(context::thread(next.slot));
     }
 }
@@ -1307,9 +1308,20 @@ fn install_fd(ofd: usize, min: u64) -> i64 {
     }
 }
 
-/// Opens a file (the `open` system call), given the path the caller passed.
-pub(crate) fn open(path: &[u8], flags: u64) -> i64 {
-    match fs::open(path, flags) {
+/// Opens a file (the `openat` system call), given the path the caller passed.
+///
+/// A relative path starts at directory `dirfd` (which must be open: `-EBADF`), or at the root
+/// for [`AT_FDCWD`]; an absolute path ignores `dirfd`.
+pub(crate) fn openat(dirfd: u64, path: &[u8], flags: u64) -> i64 {
+    let dir = if path.starts_with(b"/") || dirfd == AT_FDCWD {
+        None
+    } else {
+        match description(dirfd) {
+            Some(dir) => Some(dir),
+            None => return -EBADF,
+        }
+    };
+    match fs::open(dir.as_ref().map(Description::index), path, flags) {
         Ok(ofd) => install_fd(ofd, 0),
         Err(e) => e,
     }
@@ -1340,8 +1352,19 @@ pub(crate) fn dup(fd: u64, min: u64) -> i64 {
     install_fd(ofd.into_fd_reference(), min)
 }
 
+/// Makes `newfd` refer to what `fd` refers to, closing it first (the `dup3` system call).
+///
+/// Unlike `dup2`, `fd` and `newfd` must differ, and `flags` must be 0: there is no `O_CLOEXEC`
+/// yet.
+pub(crate) fn dup3(fd: u64, newfd: u64, flags: u64) -> i64 {
+    if fd == newfd || flags != 0 {
+        return -EINVAL;
+    }
+    dup2(fd, newfd)
+}
+
 /// Makes `newfd` refer to what `fd` refers to, closing it first (the `dup2`
-/// system call).
+/// system call, and [`dup3`]).
 pub(crate) fn dup2(fd: u64, newfd: u64) -> i64 {
     let Some(ofd) = description(fd) else {
         return -EBADF;
@@ -1360,10 +1383,14 @@ pub(crate) fn dup2(fd: u64, newfd: u64) -> i64 {
     newfd as i64
 }
 
-/// The `fcntl` system call: only `F_DUPFD`.
+/// The `fcntl` system call: only `F_DUPFD`, and `F_GETFD` (a descriptor has no flags yet).
 pub(crate) fn fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
     match cmd {
         F_DUPFD => dup(fd, arg),
+        F_GETFD => match description(fd) {
+            Some(_) => 0,
+            None => -EBADF,
+        },
         _ => -EINVAL,
     }
 }
@@ -1624,7 +1651,7 @@ fn load_program(
 /// `client` must be blocked in a call to the caller, the task manager, that it has
 /// received; the call is abandoned. The program replaces the task's address
 /// space, and the task's other threads end. The task keeps its id and its file descriptors;
-/// it loses its privileges (unless `flags` has [`exec::PRIVILEGED`]), I/O permissions, IRQs,
+/// it loses its privileges (unless `flags` has [`exec::PRIVILEGED`]), granted devices, IRQs,
 /// services, messages and upcalls, and the calls it was serving fail. On error
 /// the task is left as it was.
 pub(crate) fn task_exec(client: u64, block: u64, len: u64, flags: u64) -> i64 {
@@ -1905,32 +1932,24 @@ pub(crate) fn mmap(len: u64, prot: u64) -> i64 {
     base as i64
 }
 
-/// Grants or revokes access to I/O ports `[from, from + num)` (the `ioperm` system call).
+/// Lets the running, privileged task use the I/O ports `ports`, of a device granted to it (see
+/// [`crate::device`]).
 ///
-/// Only privileged tasks may use it, and only for ports below `IO_PORTS`. Other threads of the
-/// task get the new permissions the next time they are switched to.
-pub(crate) fn ioperm(from: u64, num: u64, turn_on: u64) -> i64 {
+/// Fails with `-ENODEV` on an architecture without I/O ports. Other threads of the task get the
+/// new permissions the next time they are switched to.
+pub(crate) fn allow_ports(ports: core::ops::Range<u64>) -> Result<(), i64> {
     let mut t = table();
     let me = t.me();
     let p = t.cur_mut();
     if !p.privileged {
-        return -EPERM;
+        return Err(-EPERM);
     }
-    match from.checked_add(num) {
-        Some(end) if end <= IO_PORTS => {}
-        _ => return -EINVAL,
-    }
-    for port in from..from + num {
-        let (byte, bit) = ((port / 8) as usize, port % 8);
-        if turn_on != 0 {
-            p.io_bitmap[byte] &= !(1 << bit); // 0 means allowed.
-        } else {
-            p.io_bitmap[byte] |= 1 << bit;
-        }
+    if !p.io.allow(ports) {
+        return Err(-ENODEV);
     }
     // Takes effect on return to user mode.
-    arch::Cpu::prepare_thread(me, &p.io_bitmap);
-    0
+    arch::Cpu::prepare_thread(me, &p.io);
+    Ok(())
 }
 
 // ---- IPC: asynchronous per-task mailbox (microkernel message passing) ----
