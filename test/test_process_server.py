@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Process server tests: POSIX process management moves out of the kernel.
 
 These tests were written before the process server existed (test first). They are explicit tests:

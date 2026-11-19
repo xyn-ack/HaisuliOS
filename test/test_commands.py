@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Shell command tests.
 
 Checks the shell's built-in commands (help, echo, ls, cat) and its error handling.

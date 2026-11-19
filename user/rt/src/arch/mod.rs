@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 
 //! The CPU architecture's part of the runtime: all the assembly of user space.
 //!

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Program tests: execve runs programs from the file system.
 
 The shell runs a command that is not built in as a program: the file it names, or the file of that

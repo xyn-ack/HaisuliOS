@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: MIT */
 /*
  * HaisuliOS kernel image: loaded at 1 MiB by a Multiboot (v1) loader and
  * identity mapped.

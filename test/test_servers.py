@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """System server tests: the process server keeps the system servers running.
 
 The system servers are the programs that the process server starts from /etc/servers: today the

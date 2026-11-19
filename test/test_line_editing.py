@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Line editing tests.
 
 Checks the echo and line editing of the console server's line discipline, as seen by the shell.

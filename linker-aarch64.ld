@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: MIT */
 /*
  * HaisuliOS kernel image for arm64: a Linux arm64 Image (a flat binary made
  * with objcopy), which the boot loader puts at text_offset (0x80000) above the

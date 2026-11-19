@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 
 //! x86_64: the `syscall` instruction, the program and thread entry points, the signal restorer,
 //! and port I/O.

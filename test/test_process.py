@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """POSIX process tests: signals, process groups and sessions, waitpid semantics.
 
 POSIX processes are implemented in user space, by the process server (`user/proc`); the kernel

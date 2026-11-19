@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Boot tests.
 
 Checks that the kernel starts init and the process server, that the process server starts the

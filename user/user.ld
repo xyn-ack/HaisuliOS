@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: MIT */
 /*
  * HaisuliOS user programs: static executables at USER_BASE, the start of user
  * space's program image region (the same on every architecture).

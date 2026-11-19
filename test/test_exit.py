@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Shell exit tests.
 
 Checks that leaving the shell makes init exit and the process server power the machine off.

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Shell redirection tests.
 
 Checks the POSIX redirections of the shell, which the kernel backs with per-process file

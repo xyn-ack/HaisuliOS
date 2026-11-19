@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """HaisuliOS test runner.
 
 Runs every test in `test/`, each on its own freshly booted QEMU machine.

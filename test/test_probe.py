@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Probe tests: process and signal mechanisms that the shell cannot reach.
 
 The shell only catches signals without SA_RESTART, never faults, never ends a task behind the

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 
 //! arm64: the `svc` instruction, the program and thread entry points, and the signal restorer.
 //!

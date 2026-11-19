@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """SMP and thread tests: more than one CPU, and more than one thread per process.
 
 These tests were written before the kernel supported either (test first), and now pass. They are

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """HaisuliOS test harness.
 
 Boots HaisuliOS in QEMU and drives its serial console like a user at a terminal.

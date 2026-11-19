@@ -235,7 +235,7 @@ The code follows the Linux kernel's Rust coding guidelines
   follow it with a module header:
 
   ```rust
-  // SPDX-License-Identifier: GPL-2.0
+  // SPDX-License-Identifier: MIT
 
   //! Module name.
   //!
@@ -246,8 +246,8 @@ The Python tests follow PEP 8 with the same 100-column limit.
 
 ## License
 
-HaisuliOS is licensed under the GNU General Public License, version 2 only
-(`SPDX-License-Identifier: GPL-2.0`). See `COPYING` for the full text.
+HaisuliOS is licensed under the MIT License
+(`SPDX-License-Identifier: MIT`). See `LICENSE` for the full text.
 
 ## Known limitations
 
